@@ -24,12 +24,15 @@ import { DisplaySettingsW400 } from '@material-symbols-svg/react/icons/display-s
 import { DraftW400 } from '@material-symbols-svg/react/icons/draft';
 import { ErrorW400 } from '@material-symbols-svg/react/icons/error';
 import { FolderW400 } from '@material-symbols-svg/react/icons/folder';
+import { GraphicEqW400 } from '@material-symbols-svg/react/icons/graphic-eq';
+import { HourglassEmptyW400 } from '@material-symbols-svg/react/icons/hourglass-empty';
 import { HubW400 } from '@material-symbols-svg/react/icons/hub';
 import { InboxW400 } from '@material-symbols-svg/react/icons/inbox';
 import { KeyboardReturnW400 } from '@material-symbols-svg/react/icons/keyboard-return';
 import { MenuW400 } from '@material-symbols-svg/react/icons/menu';
 import { MenuBookW400 } from '@material-symbols-svg/react/icons/menu-book';
 import { ModelTrainingW400 } from '@material-symbols-svg/react/icons/model-training';
+import { MovieW400 } from '@material-symbols-svg/react/icons/movie';
 import { OpenInNewW400 } from '@material-symbols-svg/react/icons/open-in-new';
 import { PendingW400 } from '@material-symbols-svg/react/icons/pending';
 import { ProgressActivityW400 } from '@material-symbols-svg/react/icons/progress-activity';
@@ -114,12 +117,15 @@ const ICON_MAP: Record<string, SvgIcon> = {
   draft: DraftW400,
   error: ErrorW400,
   folder: FolderW400,
+  graphic_eq: GraphicEqW400,
+  hourglass_empty: HourglassEmptyW400,
   hub: HubW400,
   inbox: InboxW400,
   keyboard_return: KeyboardReturnW400,
   menu: MenuW400,
   menu_book: MenuBookW400,
   model_training: ModelTrainingW400,
+  movie: MovieW400,
   open_in_new: OpenInNewW400,
   pending: PendingW400,
   progress_activity: ProgressActivityW400,
