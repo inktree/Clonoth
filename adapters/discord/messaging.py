@@ -11,16 +11,18 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import discord  # type: ignore[import-untyped]
+import httpx
 
 
 _CST = datetime.timezone(datetime.timedelta(hours=8))
-logger = logging.getLogger("ereuna_v2")
+logger = logging.getLogger("discord_bot")
 
 
 _IMAGE_EXT_MAP: dict[str, str] = {
@@ -42,6 +44,24 @@ _TEXT_EXT_MAP: dict[str, str] = {
     ".rb": "text/x-ruby", ".sql": "text/x-sql",
 }
 
+_AUDIO_EXT_MAP: dict[str, str] = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".opus": "audio/ogg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+    ".webm": "audio/webm", ".flac": "audio/flac", ".amr": "audio/amr",
+    ".silk": "audio/silk",
+}
+_AUDIO_SUFFIXES = set(_AUDIO_EXT_MAP)
+_TTS_SEGMENT_RE = re.compile(
+    r"<tts\b(?P<attrs>[^>]*)>(?P<html_text>[\s\S]*?)</tts>"
+    r"|\[\[tts\]\](?P<legacy_text>[\s\S]*?)\[\[/tts\]\]",
+    re.IGNORECASE,
+)
+_TTS_ATTR_RE = re.compile(
+    r"(?P<name>[A-Za-z_][\w-]*)\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))"
+)
+_TTS_BACKENDS = {"mimo", "ryza_onnx"}
+_TTS_PRESETS = {"normal_cn", "normal_ja", "whisper_cn", "whisper_ja"}
+
 
 def _extract_reactions(rt: Any, text: str) -> tuple[str, list[str]]:
     """从文本中提取 [REACT:emoji] 标记，返回 (剥离后文本, emoji列表)。"""
@@ -62,6 +82,13 @@ def _resolve_text_mime(att_content_type: str | None, filename: str) -> str | Non
         return att_content_type
     ext = Path(filename).suffix.lower() if filename else ""
     return _TEXT_EXT_MAP.get(ext)
+
+
+def _resolve_audio_mime(att_content_type: str | None, filename: str) -> str | None:
+    if att_content_type and att_content_type.startswith("audio/"):
+        return att_content_type
+    ext = Path(filename).suffix.lower() if filename else ""
+    return _AUDIO_EXT_MAP.get(ext)
 
 
 async def _collect_attachments(
@@ -96,13 +123,17 @@ async def _collect_attachments(
         mime = _resolve_image_mime(att.content_type, att.filename or "")
         att_type = "image"
         if not mime:
+            mime = _resolve_audio_mime(att.content_type, att.filename or "")
+            att_type = "file"
+        if not mime:
             mime = _resolve_text_mime(att.content_type, att.filename or "")
             att_type = "file"
         if not mime:
             continue
         try:
             file_bytes = await att.read()
-            filename = att.filename or f"{os.urandom(16).hex()}{'.png' if att_type == 'image' else '.txt'}"
+            fallback_ext = ".png" if att_type == "image" else (Path(att.filename or "").suffix or ".bin")
+            filename = att.filename or f"{os.urandom(16).hex()}{fallback_ext}"
             if rt.clonoth_client:
                 # Upload via Supervisor API (Docker-safe)
                 uploaded = await rt.clonoth_client.upload_attachment(
@@ -120,7 +151,7 @@ async def _collect_attachments(
                 # Fallback: direct write (SDK not yet initialized)
                 att_dir = rt.workspace / "data" / "attachments" / conversation_key.replace(":", "_")
                 att_dir.mkdir(parents=True, exist_ok=True)
-                ext = Path(filename).suffix.lower() or (".png" if att_type == "image" else ".txt")
+                ext = Path(filename).suffix.lower() or (".png" if att_type == "image" else ".bin")
                 fname = f"{os.urandom(16).hex()}{ext}"
                 fpath = att_dir / fname
                 fpath.write_bytes(file_bytes)
@@ -149,9 +180,15 @@ def _current_message_media_text(message: discord.Message) -> str:
             1 for a in atts
             if _resolve_image_mime(getattr(a, "content_type", None), getattr(a, "filename", "") or "")
         )
-        other_count = max(0, len(atts) - img_count)
+        audio_count = sum(
+            1 for a in atts
+            if _resolve_audio_mime(getattr(a, "content_type", None), getattr(a, "filename", "") or "")
+        )
+        other_count = max(0, len(atts) - img_count - audio_count)
         if img_count:
             parts.append(f"[图片×{img_count}]")
+        if audio_count:
+            parts.append(f"[语音×{audio_count}]")
         if other_count:
             parts.append(f"[附件×{other_count}]")
     if getattr(message, "embeds", None):
@@ -163,6 +200,39 @@ def _truncate(text: str, limit: int = 2000) -> str:
     if len(text) > limit:
         return text[:limit - 4] + "..."
     return text
+
+
+def _split_long_text(text: str, limit: int = 2000) -> list[str]:
+    """把超长文本按段落/句子边界切成多条消息，避免直接截断丢内容。
+
+    [2026-10-06 fix] Why: 模型忘写 [SPLIT] 标记时，长回复会被 _truncate 硬砍掉
+    后半段，Discord 端只能看到带 "..." 的半截内容。How: 优先按空行、再按单换行、
+    再按中文句末标点、最后按空格寻找切点，逐段切分。Purpose: 长回复完整送达，
+    不再依赖模型主动加标记。
+    """
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            for punct in ("。", "！", "？", "；", "…", ".", "!", "?"):
+                pos = window.rfind(punct)
+                if pos > cut:
+                    cut = pos + 1
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 async def _send_split_text(
@@ -193,11 +263,23 @@ async def _send_split_text(
                 except Exception:
                     await asyncio.sleep(delay)
     else:
-        text = _truncate(text)
-        if reply_to:
-            sent.append(await reply_to.reply(content=text, files=files or [], suppress_embeds=True))
-        else:
-            sent.append(await channel.send(content=text, files=files or [], suppress_embeds=True))
+        # [2026-10-06 fix] 无 [SPLIT] 标记时按长度自动分段，避免超长回复被截断丢内容。
+        chunks = _split_long_text(text)
+        for i, chunk in enumerate(chunks):
+            if len(chunk) > 2000:
+                chunk = _truncate(chunk)
+            chunk_files = files if (i == 0 and files) else None
+            if i == 0 and reply_to:
+                sent.append(await reply_to.reply(content=chunk, files=chunk_files or [], suppress_embeds=True))
+            else:
+                sent.append(await channel.send(content=chunk, files=chunk_files or [], suppress_embeds=True))
+            if i < len(chunks) - 1:
+                delay = min(0.8 + len(chunks[i + 1]) / 80, 3.5)
+                try:
+                    async with channel.typing():
+                        await asyncio.sleep(delay)
+                except Exception:
+                    await asyncio.sleep(delay)
     return sent
 
 
@@ -223,14 +305,274 @@ def _record_bot_reply(rt: Any, channel_id: int, text: str, *, msg_id: int | None
         q.pop(0)
 
 
+def _resolve_attachment_path(rt: Any, attachment: dict[str, Any]) -> Path | None:
+    """把 Clonoth 附件描述解析为本地路径。"""
+    raw_path = attachment.get("original_path") or attachment.get("path") or attachment.get("file")
+    if not raw_path:
+        return None
+    raw_text = str(raw_path)
+    if raw_text.startswith("file://"):
+        raw_text = raw_text[7:]
+    path = Path(raw_text)
+    return path if path.is_absolute() else rt.workspace / path
+
+
 def _atts_to_discord_files(rt: Any, attachments: list[dict[str, Any]]) -> list[discord.File]:
     """将 Clonoth 附件列表转换为 discord.File 列表。"""
     files: list[discord.File] = []
     for att in attachments:
-        att_path = rt.workspace / (att.get("original_path") or att.get("path", ""))
-        if att_path.exists():
+        att_path = _resolve_attachment_path(rt, att)
+        if att_path and att_path.exists():
             files.append(discord.File(str(att_path), filename=att.get("name", att_path.name)))
     return files
+
+
+def _is_audio_attachment(attachment: dict[str, Any]) -> bool:
+    """判断附件是否为 Discord 音频附件。"""
+    mime_type = str(attachment.get("mime_type") or "").lower()
+    name = str(attachment.get("name") or attachment.get("filename") or "").lower()
+    path = str(attachment.get("path") or "").lower()
+    return mime_type.startswith("audio/") or Path(name).suffix.lower() in _AUDIO_SUFFIXES or Path(path).suffix.lower() in _AUDIO_SUFFIXES
+
+
+def _delete_audio_file_quietly(rt: Any, path: Path | None) -> None:
+    """按配置删除临时音频文件。失败只记日志，不影响主流程。"""
+    if not path or not getattr(rt, "discord_delete_audio_after_use", True):
+        return
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception as exc:
+        logger.warning("delete Discord temporary audio failed: path=%s error=%s", path, exc)
+
+
+async def _transcribe_discord_audio_attachments(
+    rt: Any,
+    attachments: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str], bool]:
+    """把 Discord 音频附件转写为文本，并从入站附件中移除已转写音频。"""
+    if not attachments or not getattr(rt, "discord_voice_input", True):
+        return attachments, [], False
+
+    kept: list[dict[str, Any]] = []
+    transcripts: list[str] = []
+    had_audio = False
+
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for attachment in attachments:
+            if not _is_audio_attachment(attachment):
+                kept.append(attachment)
+                continue
+
+            had_audio = True
+            path = _resolve_attachment_path(rt, attachment)
+            try:
+                if path is None or not path.exists():
+                    transcripts.append("（语音文件不存在，无法识别。）")
+                    continue
+                content = path.read_bytes()
+                if not content:
+                    transcripts.append("（语音文件为空，无法识别。）")
+                    continue
+                filename = str(attachment.get("name") or path.name)
+                mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+                files = {"file": (filename, content, mime_type)}
+                response = await client.post(f"{rt.base_url.rstrip('/')}/v1/audio/transcribe", files=files, headers={"Authorization": f"Bearer {rt.clonoth_client._resolve_admin_token()}"})
+                response.raise_for_status()
+                payload = response.json()
+                text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+                transcripts.append(text or "（语音识别没有返回文字。）")
+            except Exception as exc:
+                logger.warning("Discord voice transcription failed: attachment=%s error=%s", attachment, exc)
+                transcripts.append(f"（语音识别失败：{exc}）")
+            finally:
+                _delete_audio_file_quietly(rt, path)
+
+    return kept, transcripts, had_audio
+
+
+def _strip_voice_placeholders(text: str) -> str:
+    """清理媒体占位符，避免和语音转写内容重复。"""
+    out = re.sub(r"\s*\[语音(?:×\d+)?\]\s*", " ", text or "")
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _compose_discord_user_text(raw_text: str, transcripts: list[str], had_audio: bool) -> tuple[str, str, str]:
+    """生成 Discord 入站文本、历史文本和输入类型。"""
+    clean_text = _strip_voice_placeholders(raw_text)
+    transcript_text = "\n".join(t for t in (s.strip() for s in transcripts) if t).strip()
+    if had_audio and clean_text and transcript_text:
+        base = f"【输入方式】Discord 文字加语音消息\n【用户文字】\n{clean_text}\n\n【语音转写】\n{transcript_text}"
+        history = f"{clean_text} [语音转写] {transcript_text}"
+        return base, history, "voice"
+    if had_audio and transcript_text:
+        base = f"【输入方式】Discord 语音消息\n【语音转写】\n{transcript_text}"
+        history = f"[语音转写] {transcript_text}"
+        return base, history, "voice"
+    if had_audio:
+        base = "【输入方式】Discord 语音消息\n【语音转写】\n（语音未能识别出可用文本。）"
+        return base, "[语音未能识别出可用文本]", "voice"
+    base = clean_text or raw_text.strip() or "你好"
+    return base, base, "text"
+
+
+def append_discord_reply_modality_hint(rt: Any, inbound_text: str, input_modality: str, is_dm: bool) -> str:
+    """按运行配置给模型加入 Discord TTS 协议提示。"""
+    if not getattr(rt, "discord_voice_reply", True):
+        return inbound_text
+    protocol = (
+        "Discord 适配器已接入语音合成；这不是需要调用或搜索的模型工具。"
+        "需要语音时输出带明确参数的标签。使用本地参考音频时，格式为 "
+        "<tts backend=\"ryza_onnx\" preset=\"normal_cn\">正文</tts>；preset 可选 "
+        "normal_cn、normal_ja、whisper_cn、whisper_ja，应按语言和说话情景选择。"
+        "使用 Mimo 时，格式为 <tts backend=\"mimo\" voice=\"音色名\">正文</tts>，voice 可省略以使用配置的默认音色。"
+        "每个 TTS 段都可以独立选择；适配器会原样传给合成后端，不会用语言检测覆盖明确选择。"
+        "正常文字必须包含完整回复，TTS 只能作为附加语音；不要发送纯 TTS。"
+    )
+    if input_modality == "voice" and getattr(rt, "discord_voice_reply_on_voice_input", True):
+        hint = (
+            "【Discord 回复方式提示】\n"
+            f"{protocol}本轮用户通过 Discord 语音消息发来请求，请优先附加简短、自然的语音版本。"
+        )
+    elif input_modality == "text":
+        hint = (
+            "【Discord 回复方式提示】\n"
+            f"{protocol}本轮用户通过 Discord 文字消息发来请求。只有用户明确要求语音，"
+            "或确实适合附加语音时，才使用 TTS 标记；否则不要使用。"
+        )
+    else:
+        return inbound_text
+    if not is_dm:
+        hint += " 群聊中应保持克制，只有确实适合时才标出语音内容。"
+    marker = "请根据以上上下文，执行当前用户的指令并给出回复。"
+    if marker in inbound_text:
+        return inbound_text.replace(marker, f"{hint}\n\n{marker}")
+    return f"{inbound_text}\n\n{hint}"
+
+
+def _parse_tts_attributes(raw: str) -> dict[str, str]:
+    """Parse the small, allow-listed attribute surface accepted by ``<tts>``."""
+    attributes: dict[str, str] = {}
+    for match in _TTS_ATTR_RE.finditer(raw or ""):
+        name = match.group("name").lower()
+        value = next((item for item in (match.group("double"), match.group("single"), match.group("bare")) if item is not None), "").strip()
+        if name in {"backend", "preset", "voice", "instruction"} and value:
+            attributes[name] = value
+    backend = attributes.get("backend", "").lower()
+    if backend and backend not in _TTS_BACKENDS:
+        attributes.pop("backend", None)
+    preset = attributes.get("preset", "").lower()
+    if preset:
+        if preset in _TTS_PRESETS:
+            attributes["preset"] = preset
+        else:
+            attributes.pop("preset", None)
+    return attributes
+
+
+def _extract_tts_segments(text: str) -> tuple[str, list[dict[str, str]]]:
+    """提取 TTS 段及其逐段合成参数，并返回去掉标记后的展示文本。"""
+    segments: list[dict[str, str]] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        segment = (match.group("html_text") or match.group("legacy_text") or "").strip()
+        if segment:
+            item = {"text": segment}
+            item.update(_parse_tts_attributes(match.group("attrs") or ""))
+            segments.append(item)
+        return ""
+
+    display_text = _TTS_SEGMENT_RE.sub(_replace, text or "")
+    display_text = re.sub(r"[ \t]{2,}", " ", display_text)
+    display_text = re.sub(r"[ \t]+\n", "\n", display_text)
+    display_text = re.sub(r"\n[ \t]+", "\n", display_text)
+    display_text = re.sub(r"\n{3,}", "\n\n", display_text).strip()
+    return display_text, segments
+
+
+def _fallback_spoken_text(display_text: str) -> str:
+    """语音输入需要回复但模型没有显式标记时，取一段短文本合成。"""
+    text = re.sub(r"```[\s\S]*?```", "", display_text or "")
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 600:
+        text = text[:600].rstrip() + "。"
+    return text
+
+
+def _discord_voice_reply_allowed(rt: Any, input_modality: str, has_tts_segments: bool) -> bool:
+    """根据配置和输入方式判断是否发送 Discord 语音回复。"""
+    if not getattr(rt, "discord_voice_reply", True):
+        return False
+    if input_modality == "voice" and getattr(rt, "discord_voice_reply_on_voice_input", True):
+        return True
+    return bool(has_tts_segments)
+
+
+async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation_key: str) -> Path | None:
+    """调用 Supervisor 的统一 TTS 接口，并保留模型为该段指定的合成参数。"""
+    spoken = (segment.get("text") or "").strip()
+    if not spoken:
+        return None
+    body: dict[str, Any] = {
+        "text": spoken,
+        "conversation_key": conversation_key or "discord_audio",
+        "format": getattr(rt, "discord_tts_format", "wav") or "wav",
+    }
+    # Segment parameters are authoritative. Runtime values are only fallbacks.
+    backend = (segment.get("backend") or getattr(rt, "discord_tts_backend", "") or "").strip().lower()
+    preset = (segment.get("preset") or "").strip().lower()
+    voice = (segment.get("voice") or getattr(rt, "discord_tts_voice", "") or "").strip()
+    instruction = (segment.get("instruction") or getattr(rt, "discord_tts_instruction", "") or "").strip()
+    if backend in _TTS_BACKENDS:
+        body["backend"] = backend
+    if preset in _TTS_PRESETS:
+        body["preset"] = preset
+    if voice:
+        body["voice"] = voice
+    if instruction:
+        body["instruction"] = instruction
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            response = await client.post(f"{rt.base_url.rstrip('/')}/v1/audio/synthesize", json=body, headers={"Authorization": f"Bearer {rt.clonoth_client._resolve_admin_token()}"})
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.warning("Discord TTS synthesize failed: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    attachment = payload.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    return _resolve_attachment_path(rt, attachment)
+
+
+async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: str, segments: list[dict[str, str]]) -> None:
+    """逐段合成并发送 Discord 语音附件。"""
+    for index, segment in enumerate(segments, start=1):
+        path: Path | None = None
+        try:
+            path = await _synthesize_discord_tts(rt, segment, conversation_key)
+            if path is None or not path.exists():
+                continue
+            await channel.send(file=discord.File(str(path), filename=path.name), suppress_embeds=True)
+        except Exception as exc:
+            logger.warning("send Discord TTS audio failed: segment=%s error=%s", index, exc)
+        finally:
+            _delete_audio_file_quietly(rt, path)
+
+
+def prepare_discord_tts_reply(rt: Any, text: str, input_modality: str) -> tuple[str, list[dict[str, str]]]:
+    """准备展示文本和需要发送的 TTS 段。"""
+    display_text, tts_segments = _extract_tts_segments(text or "")
+    should_send_voice = _discord_voice_reply_allowed(rt, input_modality, bool(tts_segments))
+    voice_segments = list(tts_segments)
+    if should_send_voice and not voice_segments:
+        fallback = _fallback_spoken_text(display_text)
+        if fallback:
+            voice_segments = [{"text": fallback}]
+    return display_text, voice_segments if should_send_voice else []
 
 
 def _format_progress_log(

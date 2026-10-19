@@ -73,6 +73,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
+        self._skip_merge_sessions: set[str] = set()
         self._tools_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self.session_last_entry_node: dict[str, str] = {}  # session_id -> last used entry node

@@ -181,6 +181,28 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
 
         input_json = json.dumps(args or {}, ensure_ascii=False)
 
+        # [2026-10-19] Why: on Windows the child interpreter inherits the console
+        # code page (GBK) for stdout, so `json.dumps(..., ensure_ascii=False)`
+        # emitted non-UTF-8 bytes. The reader below decodes with utf-8, turning
+        # Chinese error text into mojibake (`\xa1\xaa` instead of an em dash).
+        # How: force the child to use UTF-8 for stdio. Purpose: external tools
+        # have a documented UTF-8 JSON stdout contract; make it actually hold.
+        tool_env = _safe_subprocess_env()
+        tool_env["PYTHONIOENCODING"] = "utf-8"
+        tool_env["PYTHONUTF8"] = "1"
+        # [2026-10-19] Why: a script tool that mutates supervisor state (e.g.
+        # clear_context) has no way to tell the supervisor which task is calling
+        # it, so the reset logic cancelled the very task that requested the
+        # reset and the status message ended up as "task cancelled".
+        # How: expose the execution identity to the child process via env vars.
+        # Purpose: the tool can pass its own task/session back for exclusion.
+        tool_env["CLONOTH_TASK_ID"] = ctx.task_id
+        tool_env["CLONOTH_SESSION_ID"] = ctx.session_id
+        tool_env["CLONOTH_PARENT_SESSION_ID"] = ctx.parent_session_id
+        tool_env["CLONOTH_CONVERSATION_KEY"] = ctx.conversation_key
+        tool_env["CLONOTH_SUPERVISOR_URL"] = ctx.supervisor_url
+        tool_env["CLONOTH_WORKSPACE"] = str(ctx.workspace_root)
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),
@@ -188,7 +210,7 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=_safe_subprocess_env(),
+                env=tool_env,
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.

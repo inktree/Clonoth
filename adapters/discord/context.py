@@ -164,8 +164,15 @@ def _build_context_text(
     *,
     reply_context: str = "",
     exclude_last: bool = False,
+    is_dm: bool = False,
 ) -> str:
-    """组装发送给 Clonoth 的完整文本。"""
+    """组装发送给 Clonoth 的完整文本。
+
+    [2026-10-19 fix] Why: the history header was hardcoded as 【群聊上下文记录】,
+    so private messages were labelled as group chat and the model treated the
+    conversation as a public channel. How: pick the header by is_dm.
+    Purpose: the inbound text matches the real conversation type.
+    """
     q = _ensure_channel(rt, channel_id)
     if exclude_last and q:
         history_entries = q[:-1]
@@ -197,9 +204,10 @@ def _build_context_text(
     role_str = f"（身份组: {', '.join(roles)}）" if roles else ""
     now_str = datetime.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
 
+    history_title = "【私聊上下文记录】" if is_dm else "【群聊上下文记录】"
     parts = []
     if history_block:
-        parts.append(f"【群聊上下文记录】\n{history_block}")
+        parts.append(f"{history_title}\n{history_block}")
     if reply_context:
         parts.append(f"【当前消息引用】\n{reply_context}")
     parts.append(f"当前时间: {now_str}")

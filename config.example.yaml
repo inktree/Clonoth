@@ -19,3 +19,24 @@ openai:
   # Default model
   # If empty, Kernel will fallback to gpt-4o-mini
   model: "${OPENAI_MODEL}"
+
+# Optional Mimo audio service settings.
+# The Supervisor audio API reads these values from environment variables.
+# Keep MIMO_API_KEY local and do not commit real credentials.
+# Official V2.5 defaults:
+#   MIMO_BASE_URL=https://api.xiaomimimo.com
+#   MIMO_ASR_PATH=/v1/chat/completions
+#   MIMO_TTS_PATH=/v1/chat/completions
+#   MIMO_ASR_MODEL=mimo-v2.5-asr
+#   MIMO_TTS_MODEL=mimo-v2.5-tts
+mimo_audio:
+  base_url: "${MIMO_BASE_URL}"
+  api_key: "${MIMO_API_KEY}"
+  asr_path: "${MIMO_ASR_PATH}"
+  asr_model: "${MIMO_ASR_MODEL}"
+  asr_language: "${MIMO_ASR_LANGUAGE}"
+  tts_path: "${MIMO_TTS_PATH}"
+  tts_model: "${MIMO_TTS_MODEL}"
+  tts_voice: "${MIMO_TTS_VOICE}"
+  tts_format: "${MIMO_TTS_FORMAT}"
+  ffmpeg_path: "${FFMPEG_PATH}"

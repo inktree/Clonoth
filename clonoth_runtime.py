@@ -105,12 +105,53 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "process_manager": {
             "stop_wait_timeout_sec": 5.0,
             "engine_workers": 2,
+            "spawn_onebot_adapter": False,
+            "spawn_napcat": False,
+            "spawn_discord_adapter": False,
+            "discord_entry_node": "ereuna_main",
+            "discord_bridge_port": 8768,
+            "discord_history_len": 15,
+            "discord_log_channel": "",
+            "discord_superusers": "",
+            "discord_proxy": "",
+            "discord_retry_delay": 10,
+            "discord_voice_input": True,
+            "discord_voice_reply": True,
+            "discord_voice_reply_on_voice_input": True,
+            "discord_tts_format": "wav",
+            "discord_tts_voice": "",
+            "discord_tts_instruction": "",
+            "discord_delete_audio_after_use": True,
+            "tts_backend": "ryza_onnx",
+            "local_onnx_tts_path": "",
+            "local_onnx_tts_provider": "hybrid",
+            "local_onnx_tts_validate_hashes": False,
+            "local_onnx_tts_default_preset": "normal_cn",
+            "local_onnx_tts_seed": 1234,
+            "local_onnx_tts_idle_unload_seconds": 30,
+            "onebot_host": "127.0.0.1",
+            "onebot_port": 18080,
+            "onebot_entry_node": "qq_assistant",
+            "napcat_quick_login": "",
+            "onebot_superusers": "",
+            "onebot_owner_id": "",
+            "onebot_owner_name": "",
+            "onebot_voice_input": True,
+            "onebot_voice_reply": True,
+            "onebot_voice_reply_on_voice_input": True,
+            "onebot_voice_reply_auto_on_text": True,
+            "onebot_voice_reply_private": True,
+            "onebot_voice_reply_group": True,
+            "onebot_delete_audio_after_use": True,
+            "onebot_tts_format": "wav",
+            "onebot_tts_voice": "",
+            "onebot_tts_instruction": "",
         },
     },
 }
 
 
-_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
 
 
 def runtime_config_path(workspace_root: Path) -> Path:
@@ -128,28 +169,21 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_runtime_config(workspace_root: Path) -> dict[str, Any]:
-    path = runtime_config_path(workspace_root)
-    try:
-        mtime = path.stat().st_mtime if path.exists() else -1.0
-    except Exception:
-        mtime = -1.0
-
-    key = str(path.resolve())
+    paths = (runtime_config_path(workspace_root), workspace_root / "config" / "runtime.local.yaml")
+    mtimes = tuple(path.stat().st_mtime_ns if path.exists() else -1 for path in paths)
+    key = str(paths[0].resolve())
     cached = _CACHE.get(key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == mtimes:
         return copy.deepcopy(cached[1])
 
-    user_cfg: dict[str, Any] = {}
-    if path.exists():
-        try:
+    merged = copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
+    for path in paths:
+        if path.exists():
             loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            if isinstance(loaded, dict):
-                user_cfg = loaded
-        except Exception:
-            user_cfg = {}
-
-    merged = _deep_merge(DEFAULT_RUNTIME_CONFIG, user_cfg)
-    _CACHE[key] = (mtime, merged)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"Runtime config must be a mapping: {path}")
+            merged = _deep_merge(merged, loaded)
+    _CACHE[key] = (mtimes, merged)
     return copy.deepcopy(merged)
 
 

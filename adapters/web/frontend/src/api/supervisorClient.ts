@@ -30,7 +30,7 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   return resp;
 }
 
-function authHeaders(token: string): Record<string, string> {
+function authHeaders(token: string = getStoredAdminToken()): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
@@ -105,6 +105,35 @@ export async function uploadAttachment(
     try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
     throw new Error(`Upload failed: ${resp.status}${detail ? ` ${detail}` : ''}`);
   }
+  return resp.json();
+}
+
+export async function transcribeAudio(file: File | Blob, filename = 'recording.webm'): Promise<{ text: string; raw?: unknown }> {
+  const form = new FormData();
+  form.append('file', file, filename);
+  const resp = await fetch(`${API}/audio/transcribe`, { method: 'POST', headers: authHeaders(), body: form });
+  if (!resp.ok) {
+    let detail = '';
+    try { const j = await resp.json(); detail = j.detail || ''; } catch { /* ignore */ }
+    throw new Error(`Transcribe failed: ${resp.status}${detail ? ` ${detail}` : ''}`);
+  }
+  return resp.json();
+}
+
+export async function synthesizeSpeech(params: {
+  text: string;
+  conversation_key?: string;
+  voice?: string;
+  preset?: string;
+  backend?: 'mimo' | 'ryza_onnx';
+  model?: string;
+  response_format?: string;
+}): Promise<{ ok: boolean; attachment: UploadedAttachment; attachments: UploadedAttachment[] }> {
+  const resp = await apiFetch('/audio/synthesize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
   return resp.json();
 }
 
@@ -512,6 +541,49 @@ export interface ProvidersResponse {
   providers: Record<string, ProviderConfigPublic>;
   fallbacks: Array<Record<string, any>>;
   registered: string[];
+}
+
+export interface MimoAudioConfigPublic {
+  base_url: string;
+  api_key_present: boolean;
+  api_key: string;
+  asr_path: string;
+  asr_model: string;
+  asr_language: string;
+  tts_path: string;
+  tts_model: string;
+  tts_voice: string;
+  tts_format: string;
+  timeout: string;
+  ffmpeg_path: string;
+}
+
+export type MimoAudioConfigUpdate = Partial<{
+  base_url: string;
+  api_key: string;
+  asr_path: string;
+  asr_model: string;
+  asr_language: string;
+  tts_path: string;
+  tts_model: string;
+  tts_voice: string;
+  tts_format: string;
+  timeout: string;
+  ffmpeg_path: string;
+}>;
+
+export async function getMimoAudioConfig(token: string): Promise<MimoAudioConfigPublic> {
+  const resp = await apiFetch('/config/mimo-audio', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function updateMimoAudioConfig(token: string, data: MimoAudioConfigUpdate): Promise<MimoAudioConfigPublic> {
+  const resp = await apiFetch('/config/mimo-audio', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(data),
+  });
+  return resp.json();
 }
 
 export async function getProviders(token: string): Promise<ProvidersResponse> {

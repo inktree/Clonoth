@@ -291,16 +291,61 @@ class OpenAIConfigPublic(BaseModel):
     api_key: str
 
 
+class MimoAudioConfigSecret(BaseModel):
+    base_url: str = "https://api.xiaomimimo.com"
+    api_key: str = ""
+    asr_path: str = "/v1/chat/completions"
+    asr_model: str = "mimo-v2.5-asr"
+    asr_language: str = "auto"
+    tts_path: str = "/v1/chat/completions"
+    tts_model: str = "mimo-v2.5-tts"
+    tts_voice: str = "mimo_default"
+    tts_format: str = "wav"
+    timeout: str = "60"
+    ffmpeg_path: str = ""
+
+
+class MimoAudioConfigUpdateIn(BaseModel):
+    base_url: str | None = None
+    api_key: str | None = None
+    asr_path: str | None = None
+    asr_model: str | None = None
+    asr_language: str | None = None
+    tts_path: str | None = None
+    tts_model: str | None = None
+    tts_voice: str | None = None
+    tts_format: str | None = None
+    timeout: str | None = None
+    ffmpeg_path: str | None = None
+
+
+class MimoAudioConfigPublic(BaseModel):
+    base_url: str
+    api_key_present: bool
+    api_key: str
+    asr_path: str
+    asr_model: str
+    asr_language: str
+    tts_path: str
+    tts_model: str
+    tts_voice: str
+    tts_format: str
+    timeout: str
+    ffmpeg_path: str
+
+
 class AppConfigSecret(BaseModel):
     version: int = 1
     provider: str = "openai"
     openai: OpenAIConfigSecret = Field(default_factory=OpenAIConfigSecret)
+    mimo_audio: MimoAudioConfigSecret = Field(default_factory=MimoAudioConfigSecret)
 
 
 class AppConfigPublic(BaseModel):
     version: int = 1
     provider: str = "openai"
     openai: OpenAIConfigPublic
+    mimo_audio: MimoAudioConfigPublic
     # [2026-06-07] Why: the frontend Header needs to resolve the default model
     # for any provider (not just the active one) when a node sets provider but
     # leaves model empty. How: include a mapping of provider name → model.

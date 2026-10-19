@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import sys
+import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -36,7 +38,7 @@ from .context import (
     record_reaction_add,
     record_reaction_remove,
 )
-from .messaging import _current_message_media_text, _resolve_image_mime
+from .messaging import (_collect_attachments, _compose_discord_user_text, _current_message_media_text, _resolve_image_mime, _transcribe_discord_audio_attachments)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +56,8 @@ CLONOTH_WORKSPACE: Path = Path(
 AGENT_LOG_CHANNEL_ID = int(os.environ.get("DISCORD_LOG_CHANNEL", "0"))
 BRIDGE_PORT = int(os.environ.get("DISCORD_BRIDGE_PORT", "8768"))
 HISTORY_MAX_LEN = int(os.environ.get("DISCORD_HISTORY_LEN", "15"))
+# Discord gateway/API 代理。仅传给 discord.py，不影响本地 Supervisor 请求。
+DISCORD_PROXY = os.environ.get("DISCORD_PROXY", "").strip()
 _RESTART_SIGNAL = "[BOT_RESTART]"
 _SPLIT_SIGNAL = "[SPLIT]"
 _REACT_PATTERN = re.compile(r'\[REACT:(.*?)\]')
@@ -86,6 +90,13 @@ def _parse_superusers(raw: str) -> set[int]:
 SUPERUSERS: set[int] = _parse_superusers(os.environ.get("DISCORD_SUPERUSERS", ""))
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass
 class DiscordRuntime:
     """Shared Discord adapter state passed into all split modules."""
@@ -99,6 +110,14 @@ class DiscordRuntime:
     child_node_display_names: dict[str, str]
     base_url: str
     history_max_len: int
+    discord_voice_input: bool = True
+    discord_voice_reply: bool = True
+    discord_voice_reply_on_voice_input: bool = True
+    discord_tts_format: str = "wav"
+    discord_tts_backend: str = ""
+    discord_tts_voice: str = ""
+    discord_tts_instruction: str = ""
+    discord_delete_audio_after_use: bool = True
     restart_signal: str = _RESTART_SIGNAL
     split_signal: str = _SPLIT_SIGNAL
     react_pattern: re.Pattern[str] = _REACT_PATTERN
@@ -125,7 +144,10 @@ def _create_discord_client() -> discord.Client:
     intents.message_content = True
     intents.members = True
     intents.reactions = True
-    return discord.Client(intents=intents)
+    proxy = os.environ.get("DISCORD_PROXY", DISCORD_PROXY).strip() or None
+    if proxy:
+        print(f"[bot] Discord proxy enabled: {proxy}")
+    return discord.Client(intents=intents, proxy=proxy)
 
 
 def create_runtime() -> DiscordRuntime:
@@ -145,6 +167,14 @@ def create_runtime() -> DiscordRuntime:
         child_node_display_names=dict(_NODE_DISPLAY_NAMES),
         base_url=os.environ.get("CLONOTH_URL", CLONOTH_BASE_URL),
         history_max_len=int(os.environ.get("DISCORD_HISTORY_LEN", str(HISTORY_MAX_LEN))),
+        discord_voice_input=_env_bool("CLONOTH_DISCORD_VOICE_INPUT", True),
+        discord_voice_reply=_env_bool("CLONOTH_DISCORD_VOICE_REPLY", True),
+        discord_voice_reply_on_voice_input=_env_bool("CLONOTH_DISCORD_VOICE_REPLY_ON_VOICE_INPUT", True),
+        discord_tts_format=os.environ.get("CLONOTH_DISCORD_TTS_FORMAT", "wav"),
+        discord_tts_backend=os.environ.get("CLONOTH_DISCORD_TTS_BACKEND", ""),
+        discord_tts_voice=os.environ.get("CLONOTH_DISCORD_TTS_VOICE", ""),
+        discord_tts_instruction=os.environ.get("CLONOTH_DISCORD_TTS_INSTRUCTION", ""),
+        discord_delete_audio_after_use=_env_bool("CLONOTH_DISCORD_DELETE_AUDIO_AFTER_USE", True),
     )
     rt.approval_view_factory = lambda approval_id: ApprovalView(rt, approval_id)
     rt.bot_restart_view_factory = lambda channel_id: BotRestartConfirmView(rt, channel_id)
@@ -296,10 +326,33 @@ def register_events(rt: DiscordRuntime) -> None:
                 return
 
         user_input = clean_text or _current_message_media_text(message)
+        conversation_key = f"discord:{channel_id}"
+        inbound_attachments = await _collect_attachments(rt, message, conversation_key)
+        inbound_attachments, transcripts, had_audio = await _transcribe_discord_audio_attachments(rt, inbound_attachments)
+        if had_audio:
+            user_input, history_text, input_modality = _compose_discord_user_text(user_input, transcripts, True)
+            if history_text:
+                for entry in reversed(rt.channel_history.get(channel_id, [])):
+                    if entry.get("msg_id") == message.id:
+                        entry["text"] = _format_member_entry(
+                            message.author, history_text, msg_time=message.created_at, reply_author=reply_author_name,
+                        )
+                        break
+        else:
+            input_modality = "text"
         if not user_input:
             user_input = _previous_history_text(rt, channel_id, exclude_msg_id=message.id) or "[空消息]"
 
-        asyncio.create_task(handle_agent(rt, message, user_input, channel_id))
+        asyncio.create_task(
+            handle_agent(
+                rt,
+                message,
+                user_input,
+                channel_id,
+                inbound_attachments=inbound_attachments,
+                input_modality=input_modality,
+            )
+        )
 
 
 def main() -> None:
@@ -314,9 +367,33 @@ def main() -> None:
         print("请设置环境变量 DISCORD_TOKEN")
         return
 
-    rt = create_runtime()
-    register_events(rt)
-    rt.dc_client.run(token)
+    reconnect_delay = float(os.environ.get("DISCORD_RETRY_DELAY", os.environ.get("DISCORD_RESTART_DELAY", "10")))
+    while True:
+        rt = create_runtime()
+        register_events(rt)
+        try:
+            rt.dc_client.run(token, reconnect=True)
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            exc_name = type(exc).__name__
+            print(f"[bot] Discord client exited with {exc_name}: {exc}", flush=True)
+            traceback.print_exc()
+            if exc_name in {"LoginFailure", "PrivilegedIntentsRequired"}:
+                return
+            try:
+                if rt.router_task and not rt.router_task.done():
+                    rt.router_task.cancel()
+            except Exception:
+                pass
+            try:
+                if rt.bridge_runner:
+                    asyncio.run(rt.bridge_runner.cleanup())
+            except Exception:
+                pass
+            print(f"[bot] {reconnect_delay:.1f}s 后重启 Discord client", flush=True)
+            time.sleep(reconnect_delay)
 
 
 if __name__ == "__main__":

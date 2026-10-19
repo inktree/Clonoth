@@ -37,9 +37,11 @@ import type { ChatStoreState, StoreSetter, StoreGetter } from './chatTypes';
 import {
   createConversationMeta,
   createStoreBase,
+  stripClientOnlyTtsInstruction,
   getActiveConversation,
   getChildConversationId,
   getConversationIdFromHash,
+  getConversationKey,
   getInitialTitleFromClientPrefs,
   getStringValue,
   isEntryBranchSessionId,
@@ -127,6 +129,8 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   const userSessions = (serverSessions || []).filter((session) =>
     !isEntryBranchSessionId(session.session_id)
     && !session.parent_session_id
+    && session.channel !== 'system'
+    && !session.conversation_key?.startsWith('system:')
   );
   if (userSessions.length === 0) {
     startEventPump(set, get);
@@ -142,6 +146,7 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
     return [{
       id: conversationId,
       sessionId: session.session_id,
+      conversationKey: session.conversation_key,
       title: titleCache[conversationId] || titleFromSession(session.conversation_key, session.session_id),
       workspaceName: session.workspace_name || undefined,
       updatedAt: session.updated_at || session.created_at || new Date().toISOString(),
@@ -218,7 +223,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     set({
       activeConversationId: id,
       viewingChildSessionId: null,
+      viewingChildTitle: null,
       viewingChildConversationKey: null,
+      viewingChildTaskId: null,
       contextUsage: target?.sessionId ? state.contextUsageBySession[target.sessionId] || null : null,
       isGenerating: targetIsGenerating,
       historyFullyLoaded: false,
@@ -255,13 +262,14 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     return selectHasActiveChildNodesFromState(get(), conversationId);
   },
 
-  viewChildSession: (sessionId, taskId, conversationKey) => {
+  viewChildSession: (sessionId, taskId, conversationKey, title) => {
     const trimmed = sessionId.trim();
     if (!trimmed) return;
     const trimmedTaskId = taskId?.trim() || null;
     const trimmedConversationKey = conversationKey?.trim() || null;
     set((state) => ({
       viewingChildSessionId: trimmed,
+      viewingChildTitle: title?.trim() || null,
       viewingChildConversationKey: trimmedConversationKey,
       viewingChildTaskId: trimmedTaskId,
       childSessionMessages: {
@@ -293,6 +301,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     const active = getActiveConversation(get());
     set({
       viewingChildSessionId: null,
+      viewingChildTitle: null,
       viewingChildConversationKey: null,
       viewingChildTaskId: null,
       contextUsage: active?.sessionId ? get().contextUsageBySession[active.sessionId] || null : null,
@@ -322,6 +331,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       conversations: upsertConversationMeta(state.conversations, meta),
       activeConversationId: meta.id,
       viewingChildSessionId: null,
+      viewingChildTitle: null,
       viewingChildConversationKey: null,
     }));
     return meta.id;
@@ -390,6 +400,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
   sendMessage: async (text, attachments, entryNodeId, providerOverride) => {
     const trimmed = text.trim();
+    const displayText = stripClientOnlyTtsInstruction(trimmed);
     if (!trimmed && (!attachments || attachments.length === 0)) return;
 
     const state = get();
@@ -449,7 +460,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
                   blocks: [{
                     id: `${optimisticId}|block:text:optimistic`,
                     kind: 'text' as const,
-                    text: trimmed,
+                    text: displayText,
                     delivery: 'final' as const,
                     streaming: false,
                     createdAt: now,
@@ -518,15 +529,16 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     const conversationId = state.activeConversationId || state.createConversation();
     saveLastActiveConversationId(conversationId);
-    const conversationKey = `web:${conversationId}`;
     const existingConversation = get().conversations.find((conversation) => conversation.id === conversationId);
+    const conversationKey = getConversationKey(existingConversation || { id: conversationId });
 
     set((current) => ({
       conversations: upsertConversationMeta(current.conversations, {
         id: conversationId,
         sessionId: existingConversation?.sessionId || '',
-        title: (existingConversation?.title === '新对话' || existingConversation?.title === 'New conversation') && trimmed
-          ? getInitialTitleFromClientPrefs(trimmed, existingConversation?.title)
+        conversationKey,
+        title: (existingConversation?.title === '新对话' || existingConversation?.title === 'New conversation') && displayText
+          ? getInitialTitleFromClientPrefs(displayText, existingConversation?.title)
           : existingConversation?.title,
         updatedAt: new Date().toISOString(),
       }),
@@ -570,7 +582,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
                 blocks: [{
                   id: `${optimisticId}|block:text:optimistic`,
                   kind: 'text' as const,
-                  text: trimmed,
+                  text: displayText,
                   delivery: 'final' as const,
                   streaming: false,
                   createdAt: now,
@@ -731,7 +743,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     if (!sessionId) return;
     const taskId = state.activeTaskBySession[sessionId];
     if (!taskId) return;
-    const conversationKey = state.viewingChildConversationKey || (state.activeConversationId ? `web:${state.activeConversationId}` : activeConversation?.id || sessionId);
+    const conversationKey = state.viewingChildConversationKey || (activeConversation ? getConversationKey(activeConversation) : sessionId);
     try {
       const uploadedAttachments = await uploadMessageAttachments(attachments, conversationKey);
       await preemptTask(taskId, message, uploadedAttachments);

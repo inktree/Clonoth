@@ -8,6 +8,18 @@ python-dotenv>=1.0.0
 PyYAML>=6.0.1
 mcp>=1.9.0,<2
 
+# SDK WebSocket event stream (clonoth_sdk.client.ws_connect). The SDK handles
+# both <14 and >=14 releases, so no upper pin is needed here.
+websockets>=12.0
+
+# QQ / OneBot adapter.
+nonebot2>=2.5.0
+nonebot-adapter-onebot>=2.4.6
+
+# Optional local Ryza v2ProPlus ONNX TTS dependencies are installed from
+# BotTTS/ryza_v2proplus_onnx_deploy/requirements.txt. Keep them in a separate
+# environment when version pins conflict with the Supervisor runtime.
+
 # Web first-deployment setup and login support.
 bcrypt>=4.1.0
 PyJWT>=2.8.0
@@ -20,4 +32,4 @@ brotlicffi>=1.1.0          # aiohttp C parser needs this for Brotli (br) decodin
 # Optional platform adapters are documented separately:
 # - Discord: adapters/discord/README.md
 # - OneBot 11 / QQ: adapters/onebot/README.md
-# Web frontend dependencies are managed by platform/web/frontend/package-lock.json.
+# Web frontend dependencies are managed by adapters/web/frontend/package-lock.json.

@@ -182,9 +182,13 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         for nodes_dir, source in dirs:
             if not nodes_dir.exists():
                 continue
-            for f in nodes_dir.glob("*.yaml"):
+            files = sorted(
+                nodes_dir.glob("*.yaml"),
+                key=lambda p: (not p.name.endswith(".local.yaml"), p.name),
+            )
+            for f in files:
                 data = _read_yaml(f)
-                nid = data.get("id", f.stem)
+                nid = data.get("id", f.stem.removesuffix(".local"))
                 if nid in seen_ids:
                     continue
                 seen_ids.add(nid)
@@ -209,6 +213,9 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         sys_path = _safe_path(workspace_root / "engine" / "system_nodes", node_id, ".yaml")
         if sys_path.exists():
             return sys_path
+        local_path = _safe_path(workspace_root / "config" / "nodes", node_id, ".local.yaml")
+        if local_path.exists():
+            return local_path
         return _safe_path(workspace_root / "config" / "nodes", node_id, ".yaml")
 
     @router.get("/nodes/{node_id}/raw")

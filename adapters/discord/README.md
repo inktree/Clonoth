@@ -7,7 +7,7 @@
 ```
 adapters/discord/
 ├── app.py           # 入口：配置常量、DiscordRuntime、SDK 初始化、事件注册
-├── main.py          # 入口（调用 app.main()）
+├── main.py   # 兼容性入口（调用 app.main()）
 ├── agent.py         # Bridge Server、消息处理主逻辑、审批/取消 View
 ├── callbacks.py     # EventRouter 回调实现（发送 Discord 消息、编辑、React）
 ├── context.py       # 群聊上下文构建（历史记录、成员信息、提及解析）
@@ -41,6 +41,9 @@ pip install discord.py aiohttp pyyaml python-dotenv
 | `DISCORD_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
 | `DISCORD_NODE_NAMES` | 否 | `{}` | 节点显示名映射，JSON 格式 |
 | `DISCORD_HISTORY_LEN` | 否 | `15` | 每个频道保留的历史消息条数 |
+| `CLONOTH_DISCORD_VOICE_INPUT` | 否 | `true` | 是否启用 Discord 音频附件转写 |
+| `CLONOTH_DISCORD_VOICE_REPLY` | 否 | `true` | 是否允许 Discord 音频附件回复 |
+| `CLONOTH_DISCORD_VOICE_REPLY_ON_VOICE_INPUT` | 否 | `true` | 用户发送音频附件时是否自动生成音频回复 |
 
 ## 部署步骤
 
@@ -74,7 +77,7 @@ Discord Bot 依赖 Supervisor API。启动 Bot 前确认 Supervisor 已在 `CLON
 ```bash
 # 方式一：直接运行
 cd /path/to/clonoth
-python -m platform.discord.app
+python -m adapters.discord.app
 
 # 方式二：通过兼容性入口
 python adapters/discord/main.py
@@ -92,7 +95,7 @@ Type=simple
 User=www
 WorkingDirectory=/path/to/clonoth
 EnvironmentFile=/path/to/clonoth/.env
-ExecStart=/usr/local/bin/python3.11 -m platform.discord.app
+ExecStart=/usr/local/bin/python3.11 -m adapters.discord.app
 Restart=always
 RestartSec=5
 
@@ -123,6 +126,12 @@ Bot 启动后会在 `127.0.0.1:{DISCORD_BRIDGE_PORT}` 开启一个 HTTP 服务�
 ### 附件处理
 
 附件通过 `_collect_attachments()` 从 Discord CDN 下载并保存到 `data/attachments/` 目录。如果 SDK client 已初始化且 Supervisor 提供了上传端点，会优先走 API 上传。
+
+### 音频消息处理
+
+Discord 用户发送音频附件时，适配器会保存附件并调用 Supervisor 的 `/v1/audio/transcribe` 进行转写。后端音频接口统一接入 Mimo ASR。转写成功后，文本会以语音输入模式提交给 Clonoth。
+
+回复中显式标记的 `<tts>...</tts>` 或 `[[tts]]...[[/tts]]` 片段会调用 Supervisor 的 `/v1/audio/synthesize` 合成音频附件。后端音频接口统一接入 Mimo TTS。
 
 ## Docker 注意事项
 

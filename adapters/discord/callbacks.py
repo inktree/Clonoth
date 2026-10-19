@@ -25,6 +25,8 @@ from .messaging import (
     _record_bot_reply,
     _safe_restart,
     _send_split_text,
+    _send_discord_tts_segments,
+    prepare_discord_tts_reply,
 )
 
 
@@ -271,14 +273,29 @@ class DiscordCallbacks:
                     pass
 
         ch = msg.channel
+        voice_segments: list[dict[str, str]] = []
+        if text:
+            text, voice_segments = prepare_discord_tts_reply(
+                self.rt,
+                text,
+                str(pd.get("_discord_input_modality") or "text"),
+            )
+
         if text or attachments:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
+            # [2026-10-19 fix] Why: DM replies were still sent with reply_to=msg,
+            # producing a quoted-reply block in a one-to-one conversation. How:
+            # drop the reply reference when the trigger is a DM. Purpose: private
+            # replies read as plain messages while guild replies keep threading.
+            reply_target = None if trigger.is_dm else msg
             try:
-                await _send_split_text(self.rt, ch, text or "", reply_to=msg, files=files or None)
+                await _send_split_text(self.rt, ch, text or "", reply_to=reply_target, files=files or None)
             except Exception:
                 pass
             if text:
                 _record_bot_reply(self.rt, channel_id, text)
+        if voice_segments:
+            await _send_discord_tts_segments(self.rt, ch, trigger.conversation_key, voice_segments)
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)
@@ -306,6 +323,7 @@ class DiscordCallbacks:
         channel_id: int = pd.get("channel_id", 0)
 
         dc_files = _atts_to_discord_files(self.rt, attachments or [])
+        voice_segments: list[dict[str, str]] = []
 
         if text or dc_files:
             if text:
@@ -315,12 +333,15 @@ class DiscordCallbacks:
                         await msg.add_reaction(r.strip())
                     except Exception:
                         pass
+                text, voice_segments = prepare_discord_tts_reply(self.rt, text, str(pd.get("_discord_input_modality") or "text"))
             if text or dc_files:
                 int_sent_id = None
+                # [2026-10-19 fix] Same DM rule for interim messages: no quoted reply.
+                int_reply_target = None if trigger.is_dm else msg
                 try:
                     int_sent = await _send_split_text(
                         self.rt, msg.channel, text or "",
-                        reply_to=msg, files=dc_files or None,
+                        reply_to=int_reply_target, files=dc_files or None,
                     )
                     if int_sent:
                         int_sent_id = int_sent[0].id
@@ -328,6 +349,8 @@ class DiscordCallbacks:
                     pass
                 if text:
                     _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
+                if voice_segments:
+                    await _send_discord_tts_segments(self.rt, msg.channel, trigger.conversation_key, voice_segments)
 
         logger.info("send_intermediate_reply ch=%s atts=%d", channel_id, len(dc_files))
 
@@ -348,8 +371,10 @@ class DiscordCallbacks:
             poller_restart = True
             text = text.rstrip()[:-len(self.rt.restart_signal)].strip()
 
+        voice_segments: list[dict[str, str]] = []
         if text:
             text, _ = _extract_reactions(self.rt, text)
+            text, voice_segments = prepare_discord_tts_reply(self.rt, text, "text")
 
         if text and node_id and node_id != self.rt.entry_node_id:
             prefix = self.rt.child_node_display_names.get(node_id, f"🔧 [{node_id}]")
@@ -360,6 +385,8 @@ class DiscordCallbacks:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
             try:
                 await _send_split_text(self.rt, ch, text or "", files=files or None)
+                if voice_segments:
+                    await _send_discord_tts_segments(self.rt, ch, conversation_key, voice_segments)
             except Exception as e:
                 logger.error("send_to_channel failed: %s", e)
         else:

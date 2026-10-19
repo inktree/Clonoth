@@ -56,7 +56,24 @@ def _empty_error_response(message: Any) -> dict[str, Any]:
 
 
 # Default directories to ignore
-_DEFAULT_IGNORE_DIRS = frozenset({".git"})
+# [2026-10-19] Why: recursive listing of platform/ walked into
+# web/frontend/node_modules and produced a 9.2M-char result (50k chars inlined),
+# which bloated the request payload and made upstream gateways return
+# MALFORMED_RESPONSE. How: extend the default ignore set with dependency and
+# build output directories. Purpose: keep recursive listings bounded without
+# requiring callers to pass a manual ignore list.
+_DEFAULT_IGNORE_DIRS = frozenset({
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    ".pnpm",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".next",
+    "dist",
+    "build",
+})
 
 
 def _should_ignore(rel_parts: tuple[str, ...], ignore_dirs: frozenset[str]) -> bool:

@@ -1,0 +1,22 @@
+# 动态上下文变量定义
+#
+# 这里定义的每个变量都会作为 {{变量名}} 注入节点 prompt。
+# value 是 Python 表达式，可用的名字：
+#   task_context       - dict，本轮任务上下文（含 conversation_key / channel 等）
+#   session_id, node_id
+#   prompt_tokens      - 当前上下文已用 token 估算值
+#   compact_threshold  - 压缩阈值 token
+#   datetime, timezone, timedelta  - 已导入
+#
+# 注意：task_context 里的每个 key 也会展开到顶层，可直接写 conversation_key。
+
+variables:
+  # 北京时间，格式 2026-10-19 16:30 CST
+  beijing_time: "datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M CST')"
+
+  # 当前频道/会话键
+  conversation_key: "str(task_context.get('conversation_key') or '')"
+
+  # 上下文使用率，超过阈值会被压缩
+  context_utilization: |-
+    (str(min(999, prompt_tokens * 100 // compact_threshold)) + '% (' + str(prompt_tokens) + '/' + str(compact_threshold) + ' tokens)') if compact_threshold else 'N/A'

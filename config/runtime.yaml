@@ -125,3 +125,75 @@ supervisor:
   process_manager:
     stop_wait_timeout_sec: 5.0
     engine_workers: 2
+
+    # Discord 本地集成。
+    # 启用后，Supervisor 会启动 platform/discord/app.py。
+    # 需要在环境变量或本地 .env 中配置 DISCORD_TOKEN。
+    spawn_discord_adapter: false
+    discord_entry_node: "ereuna_main"
+    discord_bridge_port: 8768
+    discord_history_len: 15
+    discord_log_channel: ""
+    discord_superusers: ""
+    # Discord gateway/API 通过本机 Clash HTTP 代理转发。
+    discord_proxy: ""
+    # Gateway 连接偶发失败时，在 Bot 进程内等待后重试。
+    discord_retry_delay: 10
+
+    # Discord 语音输入与语音回复。
+    # 用户发语音附件时自动转写，处理完成后删除临时音频。
+    # 用户发语音时默认用语音附件回复；文字输入时只解析显式 TTS 标记。
+    discord_voice_input: true
+    discord_voice_reply: true
+    discord_voice_reply_on_voice_input: true
+    discord_delete_audio_after_use: true
+    discord_tts_format: "wav"
+    # 留空表示由本地 TTS 根据文本自动选择中文或日语预设。
+    # 固定为 normal_cn 会使日语也使用中文参考音频。
+    discord_tts_voice: ""
+    discord_tts_instruction: ""
+
+    # 网页端、Discord 和 QQ 共用 Supervisor 的 TTS 后端。
+    # ryza_onnx 支持 normal_cn、normal_ja、whisper_cn、whisper_ja，固定输出 32 kHz WAV。
+    # 首次请求时才加载模型，后续请求复用同一个引擎并串行合成。
+    tts_backend: "ryza_onnx"
+    local_onnx_tts_path: ""
+    local_onnx_tts_provider: "hybrid"
+    local_onnx_tts_validate_hashes: false
+    local_onnx_tts_default_preset: "normal_cn"
+    local_onnx_tts_seed: 1234
+    # 空闲多少秒后卸载 TTS 引擎，释放显存/内存。TTS 需求是突发式的，长期常驻纯属浪费。
+    # 设为 0 或负数则永久常驻。冷启动仅数秒，远短于一次 LLM 回合。
+    local_onnx_tts_idle_unload_seconds: 30
+
+    # QQ / OneBot 本地集成。
+    # spawn_onebot_adapter 启动项目内 NoneBot2 适配层。
+    # spawn_napcat 启动项目内 NapCat OneBot 实现端。
+    # 启用后，NapCat 仍需要在首次运行时扫码登录 QQ。
+    spawn_onebot_adapter: false
+    spawn_napcat: false
+    onebot_host: "127.0.0.1"
+    onebot_port: 18080
+    onebot_entry_node: "qq_assistant"
+    # 首次扫码登录后，可填机器人 QQ 号用于 NapCat 快速登录。
+    # 留空时，项目会优先启动 NapCat 安装器或登录界面。
+    napcat_quick_login: ""
+
+    # QQ 最高权限用户。多个 QQ 号用逗号分隔。
+    onebot_superusers: ""
+    onebot_owner_id: ""
+    onebot_owner_name: ""
+
+    # QQ 语音输入与语音回复。
+    # 用户发语音时自动转写，处理完成后删除临时音频。
+    # 用户发语音时默认用语音回复；文字输入时由模型判断是否需要额外语音回复。
+    onebot_voice_input: true
+    onebot_voice_reply: true
+    onebot_voice_reply_on_voice_input: true
+    onebot_voice_reply_auto_on_text: true
+    onebot_voice_reply_private: true
+    onebot_voice_reply_group: true
+    onebot_delete_audio_after_use: true
+    onebot_tts_format: "wav"
+    onebot_tts_voice: ""
+    onebot_tts_instruction: ""

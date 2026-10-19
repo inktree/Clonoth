@@ -4,6 +4,7 @@
 // tables and keep stable ids for turns, blocks, and tool executions. Purpose: WebSocket replay
 // and reconnect catch-up can rebuild the same UI state without relying on live component state.
 // [AutoC 2026-06-16] Shared reducer helpers live in eventReducerHelpers.ts.
+import { stripClientOnlyTtsInstruction } from './chatTypes';
 import type { SupervisorEvent } from '../types/chat';
 import type {
   Attachment,
@@ -332,12 +333,14 @@ export function replaySupervisorEvents(
   return events.reduce((currentState, event) => reduceChatEvent(currentState, event), initialState);
 }
 
+
+
 function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatState {
   const payload = getPayload(event);
   const conversationId = getConversationId(state, event);
   const inboundSeq = event.seq;
   const messageId = getUserMessageId(conversationId, inboundSeq);
-  const text = getString(payload.text);
+  const text = stripClientOnlyTtsInstruction(getString(payload.text));
   const attachments = getAttachments(payload.attachments);
   const now = event.ts;
   if (getString(payload.message_type) === 'compact_request') {

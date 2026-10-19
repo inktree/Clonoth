@@ -2,6 +2,8 @@
 
 NoneBot2 插件，通过 OneBot 11 协议（NapCat / go-cqhttp 等实现）将 QQ 消息接入 Clonoth。
 
+当前项目已经提供项目内集成模式：Supervisor 可以自动拉起 OneBot 适配层和 NapCat。详细运行说明见 `adapters/onebot/INTEGRATED.md`。
+
 ## 目录结构
 
 ```
@@ -29,10 +31,13 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `CLONOTH_BASE_URL` | 否 | `http://127.0.0.1:8765` | Supervisor API 地址 |
-| `CLONOTH_WORKSPACE` | 否 | 项目根目录 | 工作区路径，用于 SDK 导入和附件存储 |
+| `CLONOTH_WORKSPACE` | 否 | `/www/wwwroot/Clonoth` | 工作区路径，用于 SDK 导入和附件存储 |
 | `CLONOTH_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
 | `CLONOTH_BQBS_PATH` | 否 | 空 | QQ 自定义表情名称索引文件路径 |
 | `CLONOTH_ALLOWED_GROUPS` | 否 | 空 | 允许接入的 QQ 群号，逗号分隔。为空时允许全部群 |
+| `CLONOTH_QQ_SUPERUSERS` | 否 | 空 | QQ 最高权限用户，多个 QQ 号用逗号分隔 |
+| `CLONOTH_QQ_OWNER_ID` | 否 | 空 | 项目所有者 QQ 号 |
+| `CLONOTH_QQ_OWNER_NAME` | 否 | 空 | 项目所有者显示名称 |
 
 ## 部署步骤
 
@@ -41,7 +46,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 以 NapCat 为例：
 
 1. 安装 NapCat 并登录 QQ 账号。
-2. 配置反向 WebSocket 连接地址，指向 NoneBot2 监听端口（默认 `ws://127.0.0.1:8080/onebot/v11/ws`）。
+2. 配置反向 WebSocket 连接地址，指向 NoneBot2 监听端口。项目内集成模式使用 `ws://127.0.0.1:18080/onebot/v11/ws`。
 3. 确认连接建立后 NoneBot2 能收到消息事件。
 
 ### 2. 配置 NoneBot2 项目
@@ -50,7 +55,7 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 
 ```python
 # bot.py 或 pyproject.toml
-nonebot.load_plugin("platform.onebot")
+nonebot.load_plugin("adapters.onebot")
 ```
 
 或将目录放入 NoneBot2 插件目录，使其自动发现。
@@ -64,6 +69,9 @@ CLONOTH_BASE_URL=http://127.0.0.1:8765
 CLONOTH_WORKSPACE=/path/to/clonoth
 CLONOTH_ENTRY_NODE=main
 CLONOTH_ALLOWED_GROUPS=123456789,987654321
+CLONOTH_QQ_SUPERUSERS=2659937476
+CLONOTH_QQ_OWNER_ID=2659937476
+CLONOTH_QQ_OWNER_NAME=墨树（LB菌）
 ```
 
 ### 4. 确保 Supervisor 已启动
@@ -72,8 +80,61 @@ CLONOTH_ALLOWED_GROUPS=123456789,987654321
 
 ### 5. 启动 NoneBot2
 
+如果已经有自己的 NoneBot2 项目，可以继续使用 `nb run`。
+
+如果只需要启动本项目内置的 OneBot 入口，可以直接运行：
+
 ```bash
-nb run
+python -m adapters.onebot.app
+```
+
+如果当前环境中 `platform` 与 Python 标准库同名模块冲突，可以使用文件路径启动：
+
+```bash
+python adapters/onebot/app.py
+```
+
+默认监听地址为：
+
+```text
+ws://127.0.0.1:8080/onebot/v11/ws
+```
+
+NapCat、Lagrange 或其他 OneBot 11 实现端需要配置反向 WebSocket 连接到这个地址。
+
+### 6. 项目内集成模式
+
+本项目可以由 Supervisor 自动管理 QQ 接入。当前集成配置位于：
+
+```yaml
+supervisor:
+  process_manager:
+    spawn_onebot_adapter: true
+    spawn_napcat: true
+    onebot_host: "127.0.0.1"
+    onebot_port: 18080
+    onebot_entry_node: "qq_assistant"
+    napcat_quick_login: "3944289651"
+```
+
+项目内集成模式下，正常启动 `python main.py` 后会自动拉起 OneBot 适配层和 NapCat。
+
+当前已验证的连接地址为：
+
+```text
+ws://127.0.0.1:18080/onebot/v11/ws
+```
+
+如果 NapCat 登录成功但没有连接 OneBot，应检查账号专用配置：
+
+```text
+data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_3944289651.json
+```
+
+更多说明见：
+
+```text
+adapters/onebot/INTEGRATED.md
 ```
 
 ## 功能说明
@@ -91,6 +152,14 @@ nb run
 ### QQ 表情
 
 支持 QQ 自定义表情（face segment）的文本化。如果配置了 `CLONOTH_BQBS_PATH`，可将表情 ID 映射为可读名称。
+
+### QQ 语音输入与语音回复
+
+QQ 语音输入会自动调用 Supervisor 的 `/v1/audio/transcribe` 转写为文本。转写完成后，本地语音临时文件会被删除，会话中只保留转写文本。
+
+如果用户本轮发送的是 QQ 语音消息，适配器会提示模型生成适合语音发送的 `<tts>...</tts>` 段，并在最终回复时调用 `/v1/audio/synthesize` 合成音频，再优先用 QQ `record` 消息发送。
+
+如果用户本轮发送的是文字消息，默认仍发送文字回复。模型判断适合语音回复时，可以主动输出 `<tts>...</tts>` 段。用户不需要手动输入 `[TTS:auto]`。
 
 ### 任务状态反馈
 

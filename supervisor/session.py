@@ -244,8 +244,15 @@ class SessionMixin:
         )
         return branch_session_id, fork_meta
 
-    def _merge_branch_locked(self, parent_session_id: str, branch_session_id: str, base_count: int) -> int:
-        """Merge a completed entry branch back into its parent ConversationStore."""
+    def _merge_branch_locked(
+        self,
+        parent_session_id: str,
+        branch_session_id: str,
+        base_count: int,
+        *,
+        event_type: str = "branch_merged",
+    ) -> int:
+        """Incrementally merge an entry branch tail into its parent ConversationStore."""
         from engine.conversation_store import ConversationStore
 
         parent = str(parent_session_id or "").strip()
@@ -286,7 +293,7 @@ class SessionMixin:
         self.eventlog.append(
             session_id=parent,
             component="supervisor",
-            type_="branch_merged",
+            type_=event_type,
             payload={
                 "parent_session_id": parent,
                 "branch_session_id": branch,
@@ -297,8 +304,17 @@ class SessionMixin:
         )
         return count
 
-    def _cleanup_branch_locked(self, branch_session_id: str) -> None:
-        """Delete one entry branch session and its derived child sessions."""
+    def _cleanup_branch_locked(
+        self,
+        branch_session_id: str,
+        *,
+        exclude_task_id: str = "",
+    ) -> None:
+        """Delete one entry branch session and its derived child sessions.
+
+        [2026-10-19] exclude_task_id: the task that triggered this cleanup is
+        allowed to keep running so it can finish its own turn normally.
+        """
         self._ensure_entry_branch_indexes_locked()
         branch = str(branch_session_id or "").strip()
         if not branch:
@@ -333,7 +349,10 @@ class SessionMixin:
         # 做法：把这些任务标记为 cancelled 并写快照，不递归 finalize。目的：避免任务继续
         # 写入已清理的 branch session。
         now = _now()
+        _exclude_task = str(exclude_task_id or "").strip()
         for task in self.tasks.values():
+            if _exclude_task and task.task_id == _exclude_task:
+                continue
             if task.session_id != branch or self._task_terminal(task):
                 continue
             task.cancel_requested = True
@@ -777,7 +796,13 @@ class SessionMixin:
 
             return {"ok": True, "deduped": False, "event_seq": int(evt.get("seq", 0) or 0)}
 
-    def reset_conversation(self, *, conversation_key: str) -> dict[str, Any]:
+    def reset_conversation(
+        self,
+        *,
+        conversation_key: str,
+        exclude_session_id: str = "",
+        exclude_task_id: str = "",
+    ) -> dict[str, Any]:
         """Reset a conversation by removing the conversation_map entry.
 
         Next inbound message with this conversation_key will create a fresh session.
@@ -810,11 +835,42 @@ class SessionMixin:
             # 原因：branch session 可能已从内存索引丢失，但仍存在于 parent_children 或
             # sessions.json。做法：把 parent_children 和 entry_branch 索引合并后逐个判断。
             # 目的：清理对话时不会留下未 merge 的 branch JSONL 和派生 child session。
-            child_ids = set(self.parent_children.pop(old_session_id, set()))
-            child_ids.update(self._entry_branch_ids_for_parent_locked(old_session_id))
+            #
+            # [2026-10-19] 修复两处会导致 branch 残留的缺陷：
+            #   1) 原实现先 pop(parent_children) 再调 _entry_branch_ids_for_parent_locked，
+            #      而后者内部正是查 parent_children，pop 之后必然返回空集。
+            #      改为先收集、后 pop。
+            #   2) 内存索引（parent_entry_branches / parent_children）在 supervisor 重启后
+            #      可能不完整，导致 reset 漏掉已持久登记的 entry branch。
+            #      改为额外扫描 sessions.json registry 中 node_id="__entry_branch__"
+            #      且 parent_session_id 指向本会话的记录，作为兜底。
+            #   效果：clear_context 能真正删掉 branch_*.jsonl，不再出现「清了等于没清」。
+            child_ids = set(self._entry_branch_ids_for_parent_locked(old_session_id))
+            child_ids.update(self.parent_children.pop(old_session_id, set()))
+            for registered_id, entry in self._session_store._registry.items():
+                if (entry.get("node_id") == "__entry_branch__"
+                        and entry.get("parent_session_id") == old_session_id):
+                    child_ids.add(registered_id)
+            # [2026-10-19] Why: when the reset is requested from inside a
+            # running task, that task lives in one of the entry branches above;
+            # cleaning it cancelled the caller and the UI showed "task
+            # cancelled" instead of "context reset".
+            # How: skip the branch that owns the calling session.
+            # Purpose: the caller survives its own cleanup and can finish
+            # normally.
+            _exclude_sid = str(exclude_session_id or "").strip()
+            if _exclude_sid:
+                # [2026-10-19] The excluded branch keeps running for this turn.
+                # It must NOT be merged back into a parent that was just wiped,
+                # otherwise the merge recreates the old conversation JSONL with
+                # half a turn of content. Mark it so finalize skips the merge;
+                # the branch is still physically deleted on finalize.
+                self._skip_merge_sessions.add(_exclude_sid)
             for child_sid in list(child_ids):
+                if _exclude_sid and child_sid == _exclude_sid:
+                    continue
                 if self._is_entry_branch_session_locked(child_sid, parent_session_id=old_session_id):
-                    self._cleanup_branch_locked(child_sid)
+                    self._cleanup_branch_locked(child_sid, exclude_task_id=exclude_task_id)
                     cleared_children += 1
                     continue
                 child_jsonl = conv_dir / f"{child_sid}.jsonl"

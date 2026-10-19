@@ -137,7 +137,7 @@ export const SessionBrowserModal = ({ open, onClose, pendingApprovals = [] }: Se
 
   const enterSession = (session: SessionListItem) => {
     useViewStore.getState().closeSettings();
-    useChatStore.getState().viewChildSession(session.session_id, undefined, session.conversation_key);
+    useChatStore.getState().viewChildSession(session.session_id, undefined, session.conversation_key, sessionTitle(session));
     onClose();
   };
 

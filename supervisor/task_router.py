@@ -254,6 +254,32 @@ class TaskRouterMixin:
             log.warning("Failed to merge branch transcript %s: %s", branch_session_id, e)
         return count
 
+    def _checkpoint_branch_task_locked(self, task: Task) -> int:
+        """Persist the current entry-branch tail without finalizing the task.
+
+        Full restart can be requested from inside a running branch. The Engine is
+        terminated before it can POST task completion, so normal finalization never
+        runs. Checkpoint the durable conversation tail now and advance base_count;
+        if completion wins the race, it merges only messages written afterwards.
+        """
+        parent_session_id = str(task.input.get("parent_session_id") or "").strip()
+        branch_session_id = str(task.input.get("branch_session_id") or "").strip()
+        if not parent_session_id or not branch_session_id:
+            return 0
+        base_count = int(task.input.get("base_count") or 0)
+        merged_count = self._merge_branch_locked(
+            parent_session_id,
+            branch_session_id,
+            base_count,
+            event_type="branch_checkpointed",
+        )
+        if merged_count > 0:
+            task.input["base_count"] = base_count + merged_count
+            task.input["_restart_checkpointed_count"] = (
+                int(task.input.get("_restart_checkpointed_count") or 0) + merged_count
+            )
+        return merged_count
+
     def _finalize_branch_task_locked(self, task: Task, *, merge: bool) -> str:
         """Merge and clean an entry branch task once; return the routing session id."""
         parent_session_id = str(task.input.get("parent_session_id") or "").strip()
@@ -265,7 +291,14 @@ class TaskRouterMixin:
             return parent_session_id
 
         merged_count = 0
-        if merge:
+        # [2026-10-19] Why: a branch excluded from its own conversation reset is
+        # still alive while the parent conversation was already wiped. How: skip
+        # only the merge step for that branch, keep the cleanup so no stray
+        # branch JSONL survives. Purpose: the reset stays a real wipe, and the
+        # branch that performed it is still collected at finalize.
+        _no_merge = branch_session_id in self._skip_merge_sessions
+        self._skip_merge_sessions.discard(branch_session_id)
+        if merge and not _no_merge:
             try:
                 base_count = int(task.input.get("base_count") or 0)
             except Exception:

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import logging
+import mimetypes
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,6 +47,9 @@ from .types import (
     InboundMessageIn,
     InboundMessageOut,
     InboundWorkItem,
+    MimoAudioConfigPublic,
+    MimoAudioConfigSecret,
+    MimoAudioConfigUpdateIn,
     OpenAIConfigPublic,
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
@@ -70,6 +78,8 @@ from .admin_api import create_admin_router
 from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admin_token
 from engine.model import resolve_provider
 from engine.node import load_node
+from clonoth_runtime import load_runtime_config
+from .local_onnx_tts import LocalOnnxTts, config_from_mapping
 
 
 logger = logging.getLogger(__name__)
@@ -352,6 +362,13 @@ def create_app(
         # tests and process restarts do not leak async tasks.
         mgr: RemoteWorkerManager = app.state.remote_workers
         await mgr.stop()
+    runtime_config = load_runtime_config(Path(state.workspace_root))
+    process_config = runtime_config.get("supervisor", {}).get("process_manager", {})
+    tts_backend = str(process_config.get("tts_backend") or os.getenv("CLONOTH_TTS_BACKEND", "mimo")).strip().lower()
+    app.state.local_onnx_tts = LocalOnnxTts(
+        config_from_mapping(process_config, Path(state.workspace_root)),
+        Path(state.workspace_root) / "data" / "tts" / "ryza_onnx",
+    )
 
     @app.get("/v1/health", response_model=HealthOut)
     async def health() -> HealthOut:
@@ -392,6 +409,35 @@ def create_app(
             payload={
                 "provider": out.provider,
                 "openai": out.openai.model_dump(mode="json"),
+                "ts": _now().isoformat(),
+            },
+        )
+        return out
+
+    @app.get("/v1/config/mimo-audio", response_model=MimoAudioConfigPublic)
+    async def get_mimo_audio_config(request: Request) -> MimoAudioConfigPublic:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        return cs.get_mimo_audio_public()
+
+    @app.get("/v1/config/mimo-audio/secret", response_model=MimoAudioConfigSecret)
+    async def get_mimo_audio_config_secret(request: Request) -> MimoAudioConfigSecret:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        return cs.get_mimo_audio_secret()
+
+    @app.post("/v1/config/mimo-audio", response_model=MimoAudioConfigPublic)
+    async def update_mimo_audio_config(body: MimoAudioConfigUpdateIn, request: Request) -> MimoAudioConfigPublic:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        st: SupervisorState = app.state.state
+        out = cs.update_mimo_audio(body)
+        st.eventlog.append(
+            session_id="__system__",
+            component="supervisor",
+            type_="config_updated",
+            payload={
+                "mimo_audio": out.model_dump(mode="json"),
                 "ts": _now().isoformat(),
             },
         )
@@ -464,6 +510,328 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         return cs.update_fallbacks(body.fallbacks)
+
+    def _mimo_config() -> dict[str, str]:
+        """读取 Mimo 语音服务配置。"""
+        cfg = app.state.config_store.get_mimo_audio_secret()
+        return {
+            "base_url": cfg.base_url.rstrip("/"),
+            "api_key": cfg.api_key.strip(),
+            "asr_path": cfg.asr_path,
+            "tts_path": cfg.tts_path,
+            "asr_model": cfg.asr_model,
+            "tts_model": cfg.tts_model,
+            "tts_voice": cfg.tts_voice,
+            "tts_format": cfg.tts_format,
+            "asr_language": cfg.asr_language,
+            "timeout": cfg.timeout,
+            "ffmpeg_path": cfg.ffmpeg_path,
+        }
+
+    def _mimo_url(base_url: str, path: str) -> str:
+        path = (path or "").strip()
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        return f"{base_url}/{path.lstrip('/')}"
+
+    def _mimo_headers(api_key: str) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["api-key"] = api_key
+        return headers
+
+    def _safe_attachment_key(conversation_key: str) -> str:
+        return (conversation_key or "default").replace(":", "_").replace("/", "_").replace("..", "_")
+
+    def _extract_transcript(payload: dict[str, Any]) -> str:
+        # Chat completions ASR and the standard transcription response.
+        if payload.get("choices"):
+            return (payload["choices"][0]["message"].get("content") or "").strip()
+        return (payload.get("text") or "").strip()
+
+    def _extract_audio_base64(payload: dict[str, Any]) -> str:
+        if not payload.get("choices"):
+            return ""
+        message = payload["choices"][0]["message"]
+        return (message.get("audio", {}).get("data") or "").strip().split(",", 1)[-1]
+
+    def _mimo_audio_format(filename: str, mime_type: str) -> tuple[str, str] | None:
+        name = (filename or "").lower()
+        mime = (mime_type or "").lower()
+        if name.endswith(".wav") or "wav" in mime or "wave" in mime:
+            return "wav", "audio/wav"
+        if name.endswith(".mp3") or "mpeg" in mime or "mp3" in mime:
+            return "mp3", "audio/mpeg"
+        return None
+
+    def _audio_input_suffix(filename: str, mime_type: str) -> str:
+        name = (filename or "").lower()
+        for suffix in (".wav", ".mp3", ".webm", ".ogg", ".opus", ".m4a", ".aac", ".amr", ".silk"):
+            if name.endswith(suffix):
+                return suffix
+        mime = (mime_type or "").lower()
+        if "webm" in mime:
+            return ".webm"
+        if "ogg" in mime or "opus" in mime:
+            return ".ogg"
+        if "wav" in mime or "wave" in mime:
+            return ".wav"
+        if "mpeg" in mime or "mp3" in mime:
+            return ".mp3"
+        return ".audio"
+
+    def _resolve_ffmpeg_executable() -> str:
+        configured = _mimo_config()["ffmpeg_path"].strip().strip('"')
+        found = shutil.which(configured or "ffmpeg")
+        if found:
+            return found
+        raise HTTPException(
+            status_code=415,
+            detail="Audio conversion requires ffmpeg. Configure ffmpeg_path or add ffmpeg to PATH.",
+        )
+
+    async def _convert_audio_to_wav(content: bytes, filename: str, mime_type: str) -> bytes:
+        ffmpeg_exe = _resolve_ffmpeg_executable()
+        with tempfile.TemporaryDirectory(prefix="mimo-asr-") as tmp_dir:
+            input_path = Path(tmp_dir) / f"input{_audio_input_suffix(filename, mime_type)}"
+            output_path = Path(tmp_dir) / "output.wav"
+            input_path.write_bytes(content)
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_exe,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(input_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(output_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not output_path.exists():
+                detail = stderr.decode("utf-8", errors="replace")[:1000]
+                raise HTTPException(status_code=415, detail=f"failed to convert audio to wav: {detail}")
+            return output_path.read_bytes()
+
+    async def _prepare_mimo_input_audio(content: bytes, filename: str, mime_type: str) -> tuple[bytes, str, str]:
+        fmt = _mimo_audio_format(filename, mime_type)
+        if fmt:
+            audio_format, data_mime = fmt
+            return content, audio_format, data_mime
+        return await _convert_audio_to_wav(content, filename, mime_type), "wav", "audio/wav"
+
+    def _audio_ext_from_format(fmt: str, mime_type: str = "") -> str:
+        fmt = (fmt or "").lower().strip().lstrip(".")
+        if fmt in {"mp3", "wav", "ogg", "opus", "flac", "m4a", "aac", "pcm16"}:
+            return ".pcm" if fmt == "pcm16" else f".{fmt}"
+        guessed = mimetypes.guess_extension(mime_type or "") or ""
+        return guessed if guessed in {".mp3", ".wav", ".ogg", ".opus", ".flac", ".m4a", ".aac"} else ".wav"
+
+
+    def _mime_from_audio_format(fmt: str) -> str:
+        fmt = (fmt or "").lower().strip().lstrip(".")
+        if fmt == "mp3":
+            return "audio/mpeg"
+        if fmt == "wav":
+            return "audio/wav"
+        if fmt == "pcm16":
+            return "application/octet-stream"
+        return mimetypes.guess_type(f"x.{fmt}")[0] or "audio/wav"
+
+    def _save_audio_attachment(
+        *,
+        workspace_root: Path,
+        conversation_key: str,
+        audio_bytes: bytes,
+        mime_type: str,
+        response_format: str,
+        filename_prefix: str = "speech",
+    ) -> dict[str, Any]:
+        safe_key = _safe_attachment_key(conversation_key)
+        att_dir = workspace_root / "data" / "attachments" / safe_key
+        att_dir.mkdir(parents=True, exist_ok=True)
+        ext = _audio_ext_from_format(response_format, mime_type)
+        filename = f"{filename_prefix}_{int(time.time())}_{os.urandom(6).hex()}{ext}"
+        save_path = att_dir / filename
+        save_path.write_bytes(audio_bytes)
+        rel_path = save_path.relative_to(workspace_root).as_posix()
+        return {
+            "path": rel_path,
+            "name": filename,
+            "size": len(audio_bytes),
+            "mime_type": mime_type or mimetypes.guess_type(filename)[0] or "audio/mpeg",
+            "type": "file",
+        }
+
+    @app.post("/v1/audio/transcribe")
+    async def transcribe_audio(
+        file: UploadFile = File(...),
+        language: str = Query(""),
+        model: str = Query(""),
+    ) -> dict[str, Any]:
+        """调用 Mimo 语音识别，把音频文件转为文本。"""
+        cfg = _mimo_config()
+        if not cfg["api_key"]:
+            raise HTTPException(status_code=503, detail="MIMO_API_KEY is not configured")
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty audio file")
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Audio file too large (max 50MB)")
+        prepared_audio, _audio_format, data_mime = await _prepare_mimo_input_audio(
+            content,
+            file.filename or "audio.webm",
+            file.content_type or "application/octet-stream",
+        )
+        audio_base64 = base64.b64encode(prepared_audio).decode("ascii")
+        if len(audio_base64.encode("utf-8")) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Base64 encoded audio is too large (max 10MB)")
+        payload: dict[str, Any] = {
+            "model": model or cfg["asr_model"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:{data_mime};base64,{audio_base64}",
+                            },
+                        }
+                    ],
+                }
+            ],
+            "asr_options": {
+                "language": language or cfg["asr_language"] or "auto",
+            },
+        }
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=float(cfg["timeout"]), follow_redirects=True) as client:
+                resp = await client.post(
+                    _mimo_url(cfg["base_url"], cfg["asr_path"]),
+                    headers=_mimo_headers(cfg["api_key"]),
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Mimo speech recognition request failed: {exc}")
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Mimo speech recognition failed: {resp.status_code} {resp.text[:500]}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Mimo ASR returned non-JSON response") from exc
+        text = _extract_transcript(payload)
+        return {"text": text, "raw": payload}
+
+    @app.post("/v1/audio/synthesize")
+    async def synthesize_audio(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        """使用已配置的 TTS 后端，把文本转为音频附件。"""
+        cfg = _mimo_config()
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+        if len(text) > 8000:
+            raise HTTPException(status_code=413, detail="text too long (max 8000 chars)")
+        response_format = str(body.get("response_format") or body.get("format") or cfg["tts_format"] or "wav").strip() or "wav"
+        requested_backend = str(body.get("backend") or tts_backend or "mimo").strip().lower()
+        if requested_backend in {"ryza", "ryza_onnx", "local", "local_onnx"}:
+            if len(text) > 510:
+                raise HTTPException(status_code=413, detail="Ryza ONNX text too long (max 510 chars)")
+            if response_format.lower() != "wav":
+                raise HTTPException(status_code=400, detail="Ryza ONNX only supports wav output")
+            audio_path: Path | None = None
+            try:
+                audio_path, metadata = await app.state.local_onnx_tts.synthesize(text, body)
+                audio_bytes = audio_path.read_bytes()
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Ryza ONNX speech synthesis failed: {exc}")
+            finally:
+                if audio_path is not None:
+                    audio_path.unlink(missing_ok=True)
+            st: SupervisorState = app.state.state
+            attachment = _save_audio_attachment(
+                workspace_root=st.workspace_root,
+                conversation_key=str(body.get("conversation_key") or "web_audio"),
+                audio_bytes=audio_bytes,
+                mime_type="audio/wav",
+                response_format="wav",
+                filename_prefix="ryza_tts",
+            )
+            return {"ok": True, "backend": "ryza_onnx", "metadata": metadata, "attachment": attachment, "attachments": [attachment]}
+        if requested_backend != "mimo":
+            raise HTTPException(status_code=400, detail=f"unsupported TTS backend: {requested_backend}")
+        if not cfg["api_key"]:
+            raise HTTPException(status_code=503, detail="MIMO_API_KEY is not configured")
+        voice = str(body.get("voice") or cfg["tts_voice"] or "mimo_default")
+        instruction = str(body.get("instruction") or body.get("prompt") or body.get("style") or "").strip()
+        messages: list[dict[str, Any]] = []
+        if instruction:
+            messages.append({"role": "user", "content": instruction})
+        messages.append({"role": "assistant", "content": text})
+        payload: dict[str, Any] = {
+            "model": str(body.get("model") or cfg["tts_model"]),
+            "messages": messages,
+            "audio": {
+                "format": response_format,
+                "voice": voice,
+            },
+        }
+        audio_options = body.get("audio")
+        if isinstance(audio_options, dict):
+            payload["audio"].update(audio_options)
+        options = body.get("options")
+        if isinstance(options, dict):
+            payload.update(options)
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=float(cfg["timeout"]), follow_redirects=True) as client:
+                resp = await client.post(
+                    _mimo_url(cfg["base_url"], cfg["tts_path"]),
+                    headers={**_mimo_headers(cfg["api_key"]), "Accept": "application/json"},
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Mimo speech synthesis request failed: {exc}")
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Mimo speech synthesis failed: {resp.status_code} {resp.text[:500]}")
+        content_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        audio_bytes = b""
+        if content_type.startswith("audio/") or content_type in {"application/octet-stream", "binary/octet-stream"}:
+            audio_bytes = resp.content
+            mime_type = content_type if content_type.startswith("audio/") else (mimetypes.guess_type(f"x.{response_format}")[0] or "audio/mpeg")
+        else:
+            try:
+                json_payload = resp.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail="Mimo TTS returned non-JSON response") from exc
+            audio_b64 = _extract_audio_base64(json_payload)
+            if audio_b64:
+                try:
+                    audio_bytes = base64.b64decode(audio_b64, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise HTTPException(status_code=502, detail=f"Mimo speech synthesis returned invalid base64: {exc}")
+            mime_type = _mime_from_audio_format(response_format)
+        if not audio_bytes:
+            raise HTTPException(status_code=502, detail="Mimo speech synthesis returned no audio data")
+        st: SupervisorState = app.state.state
+        attachment = _save_audio_attachment(
+            workspace_root=st.workspace_root,
+            conversation_key=str(body.get("conversation_key") or "web_audio"),
+            audio_bytes=audio_bytes,
+            mime_type=mime_type,
+            response_format=response_format,
+            filename_prefix="tts",
+        )
+        return {"ok": True, "attachment": attachment, "attachments": [attachment]}
 
     @app.post("/v1/attachments/upload")
     async def upload_attachment(
@@ -1579,7 +1947,18 @@ def create_app(
         conv_key = str(body.get("conversation_key") or "").strip()
         if not conv_key:
             raise HTTPException(status_code=400, detail="conversation_key required")
-        result = st.reset_conversation(conversation_key=conv_key)
+        # [2026-10-19] Why: a reset triggered from inside a running task used to
+        # cancel that task (it lives in one of the entry branches being wiped),
+        # so the user saw "task cancelled" instead of "context reset".
+        # How: accept optional exclusion ids from the caller and forward them.
+        # Purpose: the caller's own branch survives its own reset.
+        exclude_session_id = str(body.get("exclude_session_id") or "").strip()
+        exclude_task_id = str(body.get("exclude_task_id") or "").strip()
+        result = st.reset_conversation(
+            conversation_key=conv_key,
+            exclude_session_id=exclude_session_id,
+            exclude_task_id=exclude_task_id,
+        )
         if not result.get("ok"):
             raise HTTPException(status_code=404, detail=result.get("error", "not found"))
         # emit context_reset 事件，通知 bot 侧重置高水位
@@ -2087,25 +2466,30 @@ def create_app(
         # 先停 engine，再延迟退出让 HTTP 响应发出去。
         if inp.session_id:
             _pending_path = Path(st.workspace_root) / "data" / "restart_pending.json"
-            _si = st.sessions.get(inp.session_id)
-            try:
+            _all_restart_src_seq = None
+            _restart_checkpointed = 0
+            with st._lock:
+                _si = st.sessions.get(inp.session_id)
+                # A user-facing task runs on branch_<inbound_seq>, not on the parent
+                # session passed by request_restart. Match through the route session
+                # and persist the live branch before Engine shutdown; otherwise the
+                # next boot forks from the previous completed turn.
+                for _art in st.tasks.values():
+                    if _art.status not in (TaskStatus.running, TaskStatus.pending):
+                        continue
+                    if st._route_session_id_for_task_locked(_art) != inp.session_id:
+                        continue
+                    _restart_checkpointed += st._checkpoint_branch_task_locked(_art)
+                    if _all_restart_src_seq is None and _art.source_inbound_seq:
+                        _all_restart_src_seq = _art.source_inbound_seq
                 _pending_path.write_text(json.dumps({
                     "session_id": inp.session_id,
                     "target": "all",
                     "conversation_key": _si.conversation_key if _si else "",
                     "channel": _si.channel if _si else "",
+                    "checkpointed_messages": _restart_checkpointed,
                     "ts": _now().isoformat(),
                 }), encoding="utf-8")
-            except Exception:
-                pass
-            # 找 source_inbound_seq
-            _all_restart_src_seq = None
-            for _art in st.tasks.values():
-                if (_art.session_id == inp.session_id
-                        and _art.status in (TaskStatus.running, TaskStatus.pending)
-                        and _art.source_inbound_seq):
-                    _all_restart_src_seq = _art.source_inbound_seq
-                    break
             _all_restart_payload: dict[str, Any] = {"text": "✅ 已触发全量重启，系统即将重启..."}
             if _all_restart_src_seq:
                 _all_restart_payload["source_inbound_seq"] = _all_restart_src_seq

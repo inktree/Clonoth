@@ -45,9 +45,24 @@ function isAssistantFreeProse(block: TextBlock, messageContext?: MessageRenderCo
 const TOOL_CALL_PATTERN = /<<<TOOL_CALL>>>[\s\S]*?<<<END_TOOL_CALL>>>/g;
 const TRAILING_TOOL_CALL_PATTERN = /<<<(?:TOOL_CALL|END_TOOL_CALL)>>>[\s\S]*$/;
 
+const CODE_FENCE_SPLIT_PATTERN = /(```[\s\S]*?```)/g;
+
+function stripTtsMarkersOutsideCodeFences(text: string): string {
+  return text
+    .split(CODE_FENCE_SPLIT_PATTERN)
+    .map((part) => {
+      if (part.startsWith('```')) return part;
+      return part
+        .replace(/<tts>([\s\S]*?)<\/tts>/gi, '$1')
+        .replace(/\[\[tts\]\]([\s\S]*?)\[\[\/tts\]\]/gi, '$1');
+    })
+    .join('');
+}
+
 function cleanProtocolMarkers(text: string): string {
   let cleaned = text.replace(TOOL_CALL_PATTERN, '').replace(TRAILING_TOOL_CALL_PATTERN, '');
   cleaned = cleaned.replace(/<<<(?:TOOL_CALL|END_TOOL_CALL)>>>/g, '');
+  cleaned = stripTtsMarkersOutsideCodeFences(cleaned);
   return cleaned.trim();
 }
 

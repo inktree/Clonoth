@@ -64,6 +64,32 @@ npm test
 npm run test:run
 ```
 
+## Web 语音输入与 TTS 自动朗读
+
+当前 Web 前端使用 Mimo ASR，并通过 Supervisor 的统一 TTS 接口使用 Mimo 或本地 Ryza ONNX TTS。
+
+相关说明见：
+
+```text
+docs/web_voice_tts_mimo.md
+```
+
+主要能力包括：
+
+- 麦克风录音自动转 wav 后提交 ASR；
+- `Alt+M` 快捷键开始或停止录音；
+- 麦克风录音超过 120 秒会自动停止并进入识别流程；
+- 识别结果自动发送；
+- 输入栏 TTS 模式按钮，支持静音、语音、总是；
+- 输入栏 TTS 音色选择，支持本地 Ryza ONNX 的中文、日文及对应低语预设；
+- 输入栏 TTS 音量滑块；
+- `[TTS:auto]` 短标记触发 `web_tts_reply_policy` skill；
+- 助手用 `<tts>...</tts>` 或 `[[tts]]...[[/tts]]` 标出适合朗读的内容；
+- 多段 TTS 逐段合成并顺序播放；
+- 每段 TTS 音频最多播放 120 秒，超时会自动停止并释放资源；
+- 流式输出过程中提前检测完整 TTS 段并进入播放队列；
+- 自动朗读只处理明确标记的 TTS 段，避免误读代码、日志和 diff。
+
 ## 部署方式
 
 ### 方式一：Supervisor 自动挂载（默认）

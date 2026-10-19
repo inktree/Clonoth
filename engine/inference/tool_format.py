@@ -22,6 +22,13 @@ from typing import Any
 
 from providers.base import ProviderResponse
 
+# [2026-10-19] DSML: DeepSeek V4/V4.1 的原生工具调用标记。
+# Why: 该模型在服务器端未转成结构化 tool_calls 时，会把 DSML 标记当正文输出，
+#   既不执行工具，也会把标记原样泄露给用户。
+# How: 在 formatter 层统一解析与剥离，流式路径另接 StreamFilter。
+# Purpose: 泄露的 DSML 变成真正的工具调用。
+from providers import dsml as _dsml
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -148,8 +155,12 @@ class ToolFormatter(ABC):
         """从响应中提取纯文本部分，去除工具调用标记。
 
         默认实现直接返回 response.text。子类可覆盖。
+        [2026-10-19] 统一剥离 DSML 残留标记，避免任何模式下泄露协议文本。
         """
-        return response.text
+        text = response.text
+        if text and "DSML" in text:
+            text = _dsml.strip_blocks(text) or None
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +189,21 @@ class NativeToolFormatter(ToolFormatter):
         return system_prompt, tools if tools else None
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ParsedToolCall]:
-        """Native 模式：直接转换 ProviderResponse.tool_calls。"""
+        """Native 模式：直接转换 ProviderResponse.tool_calls。
+
+        [2026-10-19] DSML 兜底：provider 未把 DeepSeek 原生标记转成结构化
+        tool_calls 时，标记会留在正文里。此处解析出来，让它们仍然被执行，
+        而不是当作正文泄露给用户。
+        """
         if not response.tool_calls:
+            if "DSML" in (response.text or ""):
+                _clean, _calls = _dsml.parse_tool_calls(response.text or "")
+                if _calls:
+                    response.text = _clean or None
+                    return [
+                        ParsedToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                        for c in _calls
+                    ]
             return []
         return [
             ParsedToolCall(
@@ -256,8 +280,19 @@ class FakeNativeToolFormatter(ToolFormatter):
         return system_prompt, tools if tools else None
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ParsedToolCall]:
-        """Native 模式：直接转换 ProviderResponse.tool_calls。"""
+        """Native 模式：直接转换 ProviderResponse.tool_calls。
+
+        [2026-10-19] 与 NativeToolFormatter 一致，兼容 DSML 文本调用。
+        """
         if not response.tool_calls:
+            if "DSML" in (response.text or ""):
+                _clean, _calls = _dsml.parse_tool_calls(response.text or "")
+                if _calls:
+                    response.text = _clean or None
+                    return [
+                        ParsedToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                        for c in _calls
+                    ]
             return []
         return [
             ParsedToolCall(
@@ -588,6 +623,9 @@ class JsonToolFormatter(ToolFormatter):
         plain = self._TOOL_CALL_PATTERN.sub("", response.text).strip()
         # 也清理未闭合的块
         plain = self._TOOL_CALL_UNCLOSED.sub("", plain).strip()
+        # [2026-10-19] DSML 标记同样不能出现在可见正文里。
+        if plain and "DSML" in plain:
+            plain = _dsml.strip_blocks(plain).strip()
         return plain if plain else None
 
     # ------------------------------------------------------------------

@@ -10,6 +10,9 @@ import type { Attachment, ChatState, WsMessage } from '../types/message';
 export interface ConversationMeta {
   id: string;
   sessionId: string;
+  // [2026-10-19] Why: sidebar sessions can belong to any platform. How: retain
+  // the backend key. Purpose: sending and resetting must not add a web prefix.
+  conversationKey?: string;
   title: string;
   workspaceName?: string;
   updatedAt: string;
@@ -71,6 +74,7 @@ export interface ChatStoreState extends ChatState {
   // keep the key only on the temporary view state. Purpose: operators can inspect
   // and talk in arbitrary sessions without polluting normal conversation metadata.
   viewingChildConversationKey: string | null;
+  viewingChildTitle: string | null;
   // [2026-06-07] Why: WS events use branch session ids, but viewChildSession
   // stores the parent session id. Matching by task_id is reliable because all
   // events from the same task share the same task_id regardless of session.
@@ -95,7 +99,8 @@ export interface ChatStoreState extends ChatState {
   cancelCurrentTask: () => Promise<void>;
   preemptCurrentTask: (message: string, attachments?: Attachment[]) => Promise<void>;
   resetState: () => void;
-  viewChildSession: (sessionId: string, taskId?: string, conversationKey?: string) => void;
+  viewChildSession: (sessionId: string, taskId?: string, conversationKey?: string, title?: string) => void;
+
   exitChildSession: () => void;
   loadStartup: () => void;
   updateContextUsage: (data: unknown) => void;
@@ -116,6 +121,8 @@ export type HistoryToolResult = {
   format?: string;
   elapsedMs?: number;
   attachments?: Attachment[];
+  summary?: string;
+
   rejected?: boolean;
   rejectionCode?: string;
   resultVisibility?: string;
@@ -138,6 +145,7 @@ export type HistoryThinkingSegment = {
 
 export const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'intermediate_reply', 'switch_node', 'ask']);
 export const INTERNAL_USER_MESSAGE_TYPES = new Set(['tool_result', 'tool_result_attachment', 'system', 'summary', 'compact_request']);
+
 export const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
 export const CHILD_NODE_ACTIVE_STATUSES = new Set<ChildNodeStatus>(['running', 'awaiting_approval']);
 export const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus | undefined>> = {
@@ -229,7 +237,8 @@ export function createConversationMeta(id = createConversationId(), sessionId = 
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'activeTaskBySession' | 'childNodes' | 'viewingChildSessionId' | 'viewingChildConversationKey' | 'viewingChildTaskId' | 'childSessionMessages' | 'taskActivities' | 'contextUsage' | 'contextUsageBySession' | 'historyFullyLoaded' | 'historyLoadedCount' | 'historyTotal' | 'isLoadingMoreHistory'> {
+export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'activeTaskBySession' | 'childNodes' | 'viewingChildSessionId' | 'viewingChildTitle' | 'viewingChildConversationKey' | 'viewingChildTaskId' | 'childSessionMessages' | 'taskActivities' | 'contextUsage' | 'contextUsageBySession' | 'historyFullyLoaded' | 'historyLoadedCount' | 'historyTotal' | 'isLoadingMoreHistory'> {
+
   return {
     conversations: [],
     activeConversationId: null,
@@ -240,6 +249,7 @@ export function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activ
     childNodes: {},
     viewingChildSessionId: null,
     viewingChildConversationKey: null,
+    viewingChildTitle: null,
     viewingChildTaskId: null,
     childSessionMessages: {},
     taskActivities: {},
@@ -261,7 +271,14 @@ export function normalizeConversationKey(value: string): string {
 }
 
 export function isEntryBranchSessionId(sessionId: string): boolean {
-  return /^branch_\d+$/.test(sessionId);
+  return sessionId.startsWith('branch_');
+}
+
+// [2026-10-19] Why: legacy metadata and restart recovery may lack an explicit key.
+// How: preserve platform-qualified ids, otherwise use the web default. Purpose:
+// all frontend write paths resolve conversation keys consistently.
+export function getConversationKey(conversation: Pick<ConversationMeta, 'id' | 'conversationKey'>): string {
+  return conversation.conversationKey || (conversation.id.includes(':') ? conversation.id : `web:${conversation.id}`);
 }
 
 export function titleFromSession(conversationKey: string, sessionId: string): string {
@@ -308,6 +325,7 @@ export function upsertConversationMeta(
       })(),
       title: patch.title && patch.title.trim() ? patch.title : current.title,
       updatedAt: patch.updatedAt || current.updatedAt,
+      conversationKey: patch.conversationKey || current.conversationKey,
     };
     return updated;
   }
@@ -317,6 +335,7 @@ export function upsertConversationMeta(
       id: patch.id,
       sessionId: patch.sessionId ?? '',
       title: patch.title && patch.title.trim() ? patch.title : '新对话',
+      conversationKey: patch.conversationKey,
       updatedAt: patch.updatedAt ?? new Date().toISOString(),
     },
   ];
@@ -464,4 +483,11 @@ export function collapseForPreview(value: string): string {
 
 export function truncateForPreview(value: string, limit: number): string {
   return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+export function stripClientOnlyTtsInstruction(text: string): string {
+  return text
+    .replace(/\n*\[系统提示：如果本次回复适合语音播放，[\s\S]*?普通正文仍然正常输出。\]\s*$/u, '')
+    .replace(/\n*\[TTS:auto\]\s*$/u, '')
+    .trim();
 }

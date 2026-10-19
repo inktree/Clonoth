@@ -125,6 +125,11 @@ async function fetchBlobUrl(apiPath: string, token: string): Promise<string> {
   return url;
 }
 
+export async function fetchAuthenticatedAttachmentBlobUrl(path: string, sessionId?: string): Promise<string> {
+  const apiPath = getAttachmentApiPath({ path }, sessionId)!;
+  return fetchBlobUrl(apiPath, useSettingsStore.getState().adminToken || '');
+}
+
 // ── Per-attachment hook ─────────────────────────────────────────────────
 function useAuthenticatedUrl(attachment: RenderableAttachment, sessionId?: string): { url: string | undefined; loading: boolean } {
   const adminToken = useSettingsStore(s => s.adminToken);
@@ -217,6 +222,16 @@ function AttachmentItem({
         </figure>
       );
     }
+  }
+
+  if ((attachment.mime_type || '').toLowerCase().startsWith('audio/') && url) {
+    return (
+      <div className="relative max-w-full border border-[var(--duties-border)] bg-[var(--duties-panel)] p-2">
+        <div className="mb-1 truncate text-xs">{name}</div>
+        <audio className="h-8 max-w-full" controls preload="metadata" src={url} />
+        {removeButton}
+      </div>
+    );
   }
 
   // File attachment (non-image, or image without URL)

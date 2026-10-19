@@ -24,15 +24,27 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
     (e.g. PM2 daemon) inherit stdout/stderr pipe fds. communicate() waits for
     pipe EOF, so if grandchildren still hold the pipe, the gather(waiter) hangs
     forever. Using start_new_session=True + os.killpg kills the whole tree.
+
+    [2026-10-19] Why: os.killpg / signal.SIGKILL are POSIX-only, so on Windows
+    this raised AttributeError, which was NOT in the except tuple — the caller's
+    cancellation path crashed instead of degrading to proc.kill().
+    How: probe for killpg explicitly and catch AttributeError as well.
+    Purpose: a cancelled task on Windows stops cleanly instead of dying with
+    "module 'os' has no attribute 'killpg'".
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        # Fallback: kill just the direct process if killpg fails
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", None)
+    if killpg is not None and sigkill is not None:
         try:
-            proc.kill()
-        except ProcessLookupError:
+            killpg(os.getpgid(proc.pid), sigkill)
+            return
+        except (AttributeError, ProcessLookupError, PermissionError, OSError):
             pass
+    # Fallback: kill just the direct process if killpg is unavailable or failed
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 # ---------------------------------------------------------------------------

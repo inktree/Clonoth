@@ -30,6 +30,19 @@ from .config import (
     CLONOTH_BASE_URL,
     CLONOTH_WORKSPACE,
     ENTRY_NODE_ID,
+    QQ_OWNER_ID,
+    QQ_OWNER_NAME,
+    QQ_SUPERUSERS,
+    ONEBOT_DELETE_AUDIO_AFTER_USE,
+    ONEBOT_TTS_FORMAT,
+    ONEBOT_TTS_INSTRUCTION,
+    ONEBOT_TTS_VOICE,
+    ONEBOT_VOICE_INPUT,
+    ONEBOT_VOICE_REPLY,
+    ONEBOT_VOICE_REPLY_AUTO_ON_TEXT,
+    ONEBOT_VOICE_REPLY_GROUP,
+    ONEBOT_VOICE_REPLY_ON_VOICE_INPUT,
+    ONEBOT_VOICE_REPLY_PRIVATE,
 )
 from .emoji_handler import load_bqbs, process_emojis, strip_output_markers
 
@@ -57,7 +70,9 @@ _HISTORY_MAX_LEN = 20
 _HISTORY_TEXT_LIMIT = 400
 _QQ_MESSAGE_LIMIT = 4300
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_AUDIO_SUFFIXES = {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".amr", ".silk", ".webm"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
+_TTS_SEGMENT_RE = re.compile(r"<tts>([\s\S]*?)</tts>|\[\[tts\]\]([\s\S]*?)\[\[/tts\]\]", re.IGNORECASE)
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
 # 目标阶段，避免 stream_delta 高频到达时重复调用 OneBot React API。
@@ -127,6 +142,34 @@ def _sender_display_name(sender: Any, fallback_user_id: Any = "") -> str:
     return _sanitize_name(card or nickname or str(fallback_user_id or "未知成员"))
 
 
+def _is_superuser(user_id: Any) -> bool:
+    """判断 QQ 用户是否为 OneBot 最高权限用户。"""
+    try:
+        return int(user_id) in QQ_SUPERUSERS
+    except Exception:
+        return False
+
+
+def _identity_lines(user_id: Any, display_name: str) -> List[str]:
+    """生成提交给入口节点的当前用户身份说明。"""
+    uid = str(user_id or "")
+    is_owner = bool(QQ_OWNER_ID and uid == str(QQ_OWNER_ID))
+    if _is_superuser(user_id):
+        role = "最高权限管理员"
+    else:
+        role = "普通 QQ 用户"
+    lines = [
+        "【当前用户身份】",
+        f"显示名: {display_name}",
+        f"QQ号: {uid}",
+        f"权限: {role}",
+    ]
+    if is_owner:
+        owner_name = QQ_OWNER_NAME or display_name
+        lines.append(f"项目身份: {owner_name}，项目所有者")
+    return lines
+
+
 def _format_hhmm(timestamp: Optional[int]) -> str:
     """把 OneBot 秒级时间戳格式化为入口节点要求的 HH:MM。"""
     try:
@@ -189,6 +232,46 @@ def _guess_image_mime(url: str, content_type: str = "") -> str:
     return "image/jpeg"
 
 
+def _guess_audio_mime(url: str, content_type: str = "") -> str:
+    """根据 QQ 语音 URL 和响应头推断音频 MIME 类型。"""
+    url_lower = (url or "").lower()
+    content_type_lower = (content_type or "").lower()
+    if "wav" in url_lower or "wav" in content_type_lower:
+        return "audio/wav"
+    if "ogg" in url_lower or "ogg" in content_type_lower or "opus" in url_lower or "opus" in content_type_lower:
+        return "audio/ogg"
+    if "m4a" in url_lower or "aac" in content_type_lower:
+        return "audio/aac"
+    if "amr" in url_lower or "amr" in content_type_lower:
+        return "audio/amr"
+    if "webm" in url_lower or "webm" in content_type_lower:
+        return "audio/webm"
+    if "silk" in url_lower or "silk" in content_type_lower:
+        return "audio/silk"
+    return "audio/mpeg"
+
+
+def _audio_ext_from_url_or_mime(url: str, mime_type: str) -> str:
+    """为保存到本地的 QQ 语音选择稳定后缀。"""
+    clean_url_path = (url or "").split("?", 1)[0].split("#", 1)[0]
+    ext = Path(clean_url_path).suffix.lower()
+    if ext in _AUDIO_SUFFIXES:
+        return ext
+    if mime_type == "audio/wav":
+        return ".wav"
+    if mime_type == "audio/ogg":
+        return ".ogg"
+    if mime_type == "audio/aac":
+        return ".aac"
+    if mime_type == "audio/amr":
+        return ".amr"
+    if mime_type == "audio/webm":
+        return ".webm"
+    if mime_type == "audio/silk":
+        return ".silk"
+    return ".mp3"
+
+
 def _image_ext_from_url_or_mime(url: str, mime_type: str) -> str:
     """为保存到本地的 QQ 图片选择稳定后缀。"""
     # 2026-05-03 修改原因：附件文件名需要随机生成，但后缀会影响后续图片
@@ -205,6 +288,45 @@ def _image_ext_from_url_or_mime(url: str, mime_type: str) -> str:
     if mime_type == "image/webp":
         return ".webp"
     return ".jpg"
+
+
+def _iter_qq_record_items(message: Any) -> List[Dict[str, Any]]:
+    """从 OneBot Message 中提取 record segment 数据。"""
+    items: List[Dict[str, Any]] = []
+    if message is None:
+        return items
+    try:
+        segments = list(message)
+    except Exception:
+        return items
+    for segment in segments:
+        if getattr(segment, "type", "") != "record":
+            continue
+        data = dict(getattr(segment, "data", {}) or {})
+        if data:
+            items.append(data)
+    return items
+
+
+async def _get_record_as_mp3(bot: Bot, record_data: Dict[str, Any]) -> Optional[Path]:
+    """优先请求 NapCat 将 QQ 语音转换为 mp3，避免把 SILK 误交给 Mimo ASR。"""
+    file_id = str(record_data.get("file") or "").strip()
+    if not file_id:
+        return None
+    try:
+        payload = await bot.call_api("get_record", file=file_id, out_format="mp3")
+    except Exception as exc:
+        logger.warning("NapCat get_record mp3 failed: file=%s error=%s", file_id, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_path = str(payload.get("file") or payload.get("path") or payload.get("url") or "").strip()
+    if not raw_path or raw_path.startswith("http://") or raw_path.startswith("https://"):
+        return None
+    if raw_path.startswith("file://"):
+        raw_path = raw_path[7:]
+    path = Path(raw_path)
+    return path if path.exists() else None
 
 
 def _iter_qq_image_urls(message: Any) -> List[str]:
@@ -229,7 +351,7 @@ def _iter_qq_image_urls(message: Any) -> List[str]:
     return urls
 
 
-async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
+async def _collect_qq_attachments(event, conversation_key: str, bot: Optional[Bot] = None) -> list[dict]:
     """下载 QQ 当前消息及引用消息中的图片，并返回 Clonoth 附件列表。"""
     # 2026-05-03 修改原因：QQ 图片以前只被转为 [图片] 文本，占位符无法让
     # Clonoth 读取图像内容。这里把 image segment 的 URL 下载到工作区
@@ -248,9 +370,11 @@ async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
         messages.append(reply_msg)
 
     image_urls: List[str] = []
+    audio_items: List[Dict[str, Any]] = []
     for message in messages:
         image_urls.extend(_iter_qq_image_urls(message))
-    if not image_urls:
+        audio_items.extend(_iter_qq_record_items(message))
+    if not image_urls and not audio_items:
         return result
 
     workspace = Path(CLONOTH_WORKSPACE)
@@ -284,7 +408,169 @@ async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
                 })
             except Exception as exc:
                 logger.warning("collect QQ image attachment failed: url=%s error=%s", url, exc)
+        for record_data in audio_items:
+            try:
+                converted_path = await _get_record_as_mp3(bot, record_data) if bot is not None else None
+                if converted_path is not None:
+                    filename = f"{os.urandom(16).hex()}.mp3"
+                    file_path = att_dir / filename
+                    file_path.write_bytes(converted_path.read_bytes())
+                    rel_path = file_path.relative_to(workspace).as_posix()
+                    result.append({
+                        "type": "file",
+                        "path": rel_path,
+                        "mime_type": "audio/mpeg",
+                        "name": "voice.mp3",
+                    })
+                    continue
+
+                url = str(record_data.get("url") or "").strip()
+                local_raw = str(record_data.get("path") or "").strip()
+                if url:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    content = response.content
+                    content_type = response.headers.get("content-type", "")
+                    mime_type = _guess_audio_mime(url, content_type)
+                    ext = _audio_ext_from_url_or_mime(url, mime_type)
+                elif local_raw:
+                    local_path = Path(local_raw)
+                    if not local_path.exists():
+                        logger.warning("collect QQ audio local file missing: %s", local_raw)
+                        continue
+                    content = local_path.read_bytes()
+                    mime_type = _guess_audio_mime(local_raw, "")
+                    ext = _audio_ext_from_url_or_mime(local_raw, mime_type)
+                else:
+                    continue
+
+                if not content:
+                    logger.warning("collect QQ audio attachment skipped empty content: %s", record_data)
+                    continue
+                filename = f"{os.urandom(16).hex()}{ext}"
+                file_path = att_dir / filename
+                file_path.write_bytes(content)
+                rel_path = file_path.relative_to(workspace).as_posix()
+                result.append({
+                    "type": "file",
+                    "path": rel_path,
+                    "mime_type": mime_type,
+                    "name": f"voice{ext}",
+                })
+            except Exception as exc:
+                logger.warning("collect QQ audio attachment failed: record=%s error=%s", record_data, exc)
     return result
+
+
+def _is_audio_attachment(attachment: Dict[str, Any]) -> bool:
+    """判断附件是否为 QQ 语音或音频文件。"""
+    mime_type = str(attachment.get("mime_type") or "").lower()
+    name = str(attachment.get("name") or attachment.get("filename") or "").lower()
+    path = str(attachment.get("path") or "").lower()
+    return mime_type.startswith("audio/") or name.startswith("voice") or Path(path).suffix.lower() in _AUDIO_SUFFIXES
+
+
+def _delete_file_quietly(path: Optional[Path]) -> None:
+    """删除临时文件，失败时只写日志，不影响主流程。"""
+    if not path or not ONEBOT_DELETE_AUDIO_AFTER_USE:
+        return
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+    except Exception as exc:
+        logger.warning("delete temporary audio failed: path=%s error=%s", path, exc)
+
+
+async def _transcribe_qq_audio_attachments(
+    attachments: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[str], bool]:
+    """把 QQ 语音附件转写为文本，并按配置删除本地临时音频。"""
+    if not attachments or not ONEBOT_VOICE_INPUT:
+        return attachments, [], False
+
+    kept: List[Dict[str, Any]] = []
+    transcripts: List[str] = []
+    had_audio = False
+
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for attachment in attachments:
+            if not _is_audio_attachment(attachment):
+                kept.append(attachment)
+                continue
+
+            had_audio = True
+            path = _resolve_attachment_path(attachment)
+            try:
+                if path is None or not path.exists():
+                    transcripts.append("（语音文件不存在，无法识别。）")
+                    continue
+                content = path.read_bytes()
+                if not content:
+                    transcripts.append("（语音文件为空，无法识别。）")
+                    continue
+                filename = str(attachment.get("name") or path.name)
+                mime_type = str(attachment.get("mime_type") or "application/octet-stream")
+                files = {"file": (filename, content, mime_type)}
+                response = await client.post(f"{CLONOTH_BASE_URL.rstrip('/')}/v1/audio/transcribe", files=files, headers={"Authorization": f"Bearer {_client._resolve_admin_token()}"})
+                response.raise_for_status()
+                payload = response.json()
+                text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+                transcripts.append(text or "（语音识别没有返回文字。）")
+            except Exception as exc:
+                logger.warning("QQ voice transcription failed: attachment=%s error=%s", attachment, exc)
+                transcripts.append(f"（语音识别失败：{exc}）")
+            finally:
+                _delete_file_quietly(path)
+
+    return kept, transcripts, had_audio
+
+
+def _strip_voice_placeholders(text: str) -> str:
+    """清理 OneBot record 占位符，避免与转写文本重复。"""
+    return re.sub(r"\s*\[语音\]\s*", " ", text or "").strip()
+
+
+def _compose_qq_user_text(raw_text: str, transcripts: List[str], had_audio: bool) -> tuple[str, str, str]:
+    """生成提交给模型的用户文本、群历史文本和输入类型。"""
+    clean_text = _strip_voice_placeholders(raw_text)
+    transcript_text = "\n".join(t for t in (s.strip() for s in transcripts) if t).strip()
+    if had_audio and clean_text and transcript_text:
+        base = f"【输入方式】QQ文字加语音消息\n【用户文字】\n{clean_text}\n\n【语音转写】\n{transcript_text}"
+        history = f"{clean_text} [语音转写] {transcript_text}"
+        return base, history, "voice"
+    if had_audio and transcript_text:
+        base = f"【输入方式】QQ语音消息\n【语音转写】\n{transcript_text}"
+        history = f"[语音转写] {transcript_text}"
+        return base, history, "voice"
+    if had_audio:
+        base = "【输入方式】QQ语音消息\n【语音转写】\n（语音未能识别出可用文本。）"
+        return base, "[语音未能识别出可用文本]", "voice"
+    base = clean_text or raw_text.strip() or "你好"
+    return base, base, "text"
+
+
+def _append_qq_reply_modality_hint(inbound_text: str, input_modality: str, is_dm: bool) -> str:
+    """给模型加入 QQ 语音回复提示。用户不需要手动输入任何标记。"""
+    if not ONEBOT_VOICE_REPLY:
+        return inbound_text
+    if input_modality == "voice" and ONEBOT_VOICE_REPLY_ON_VOICE_INPUT:
+        hint = (
+            "【QQ回复方式提示】\n"
+            "本轮用户通过 QQ 语音消息发来请求。请优先生成适合语音发送的简短自然语言回复，"
+            "并用 <tts>...</tts> 标出适合发送为 QQ 语音消息的内容。普通正文仍可保留必要说明。"
+        )
+    elif input_modality == "text" and ONEBOT_VOICE_REPLY_AUTO_ON_TEXT:
+        hint = (
+            "【QQ回复方式提示】\n"
+            "本轮用户通过 QQ 文字消息发来请求。通常使用文字回复。若你判断本轮适合额外发送语音回复，"
+            "例如用户明确要求语音、回复很短、需要提醒或安抚，可以用 <tts>...</tts> 标出适合发送为 QQ 语音消息的内容。"
+            "如果不适合语音回复，不要使用 TTS 标记。"
+        )
+    else:
+        return inbound_text
+    if not is_dm:
+        hint += " 群聊中应保持克制，只有确实适合时才标出语音内容。"
+    return inbound_text.replace("请根据以上上下文，执行当前用户的指令并给出回复。", f"{hint}\n\n请根据以上上下文，执行当前用户的指令并给出回复。")
 
 
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
@@ -349,6 +635,10 @@ def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str) -> s
     parts.extend([
         "",
         f"当前时间: {now}",
+    ])
+    parts.extend(_identity_lines(event.user_id, current_name))
+    parts.extend([
+        "",
         "【当前用户指令】",
         f"{current_name}（{event.user_id}）: {user_text}",
         "",
@@ -364,11 +654,15 @@ def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user_text:
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
     parts: List[str] = [
         f"当前时间: {now}",
+    ]
+    parts.extend(_identity_lines(event.user_id, name))
+    parts.extend([
+        "",
         "【当前用户指令】",
         f"{name}（{event.user_id}）: {text}",
         "",
         "请根据以上上下文，执行当前用户的指令并给出回复。",
-    ]
+    ])
     return "\n".join(parts)
 
 
@@ -562,6 +856,99 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
     return Message(message_segments)
 
 
+def _extract_tts_segments(text: str) -> tuple[str, List[str]]:
+    """提取助手回复中的 TTS 段，并返回去掉标记后的展示文本。"""
+    segments: List[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        segment = (match.group(1) or match.group(2) or "").strip()
+        if segment:
+            segments.append(segment)
+        return segment
+
+    display_text = _TTS_SEGMENT_RE.sub(_replace, text or "").strip()
+    return display_text, segments
+
+
+def _voice_reply_allowed(target: Dict[str, Any], input_modality: str, has_tts_segments: bool) -> bool:
+    """根据输入方式、目标会话和配置判断是否发送 QQ 语音回复。"""
+    if not ONEBOT_VOICE_REPLY:
+        return False
+    if target.get("type") == "private" and not ONEBOT_VOICE_REPLY_PRIVATE:
+        return False
+    if target.get("type") == "group" and not ONEBOT_VOICE_REPLY_GROUP:
+        return False
+    if input_modality == "voice" and ONEBOT_VOICE_REPLY_ON_VOICE_INPUT:
+        return True
+    if input_modality == "text" and has_tts_segments and ONEBOT_VOICE_REPLY_AUTO_ON_TEXT:
+        return True
+    return False
+
+
+def _fallback_spoken_text(display_text: str) -> str:
+    """在必须语音回复但模型没有标记 TTS 时，选择一段较短文本用于合成。"""
+    text = strip_output_markers(display_text or "")
+    text = _QQ_EMOJI_MARK_RE.sub("", text)
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 600:
+        text = text[:600].rstrip() + "。"
+    return text
+
+
+async def _synthesize_onebot_tts(text: str, conversation_key: str) -> Optional[Path]:
+    """调用 Supervisor 的 Mimo TTS 接口，返回本地音频附件路径。"""
+    spoken = (text or "").strip()
+    if not spoken:
+        return None
+    body: Dict[str, Any] = {
+        "text": spoken,
+        "conversation_key": conversation_key or "qq_audio",
+        "format": ONEBOT_TTS_FORMAT or "wav",
+    }
+    if ONEBOT_TTS_VOICE:
+        body["voice"] = ONEBOT_TTS_VOICE
+    if ONEBOT_TTS_INSTRUCTION:
+        body["instruction"] = ONEBOT_TTS_INSTRUCTION
+    try:
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            response = await client.post(f"{CLONOTH_BASE_URL.rstrip('/')}/v1/audio/synthesize", json=body, headers={"Authorization": f"Bearer {_client._resolve_admin_token()}"})
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.warning("QQ TTS synthesize failed: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    attachment = payload.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    return _resolve_attachment_path(attachment)
+
+
+async def _send_qq_voice_or_file(bot: Bot, target: Dict[str, Any], path: Path) -> None:
+    """优先按 QQ 语音消息发送，失败后退回为普通文件。"""
+    try:
+        await _send_qq_message(bot, target, MessageSegment.record(file=str(path.resolve())))
+        return
+    except Exception as exc:
+        logger.warning("send QQ record failed, fallback to file upload: path=%s error=%s", path, exc)
+    await _send_attachment_path(bot, target, path, filename=path.name)
+
+
+async def _send_tts_voice_segments(bot: Bot, target: Dict[str, Any], conversation_key: str, segments: List[str]) -> None:
+    """合成并发送 TTS 语音段，发送完成后删除临时音频。"""
+    for segment in segments:
+        path: Optional[Path] = None
+        try:
+            path = await _synthesize_onebot_tts(segment, conversation_key)
+            if path is None or not path.exists():
+                continue
+            await _send_qq_voice_or_file(bot, target, path)
+        finally:
+            _delete_file_quietly(path)
+
+
 async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any) -> None:
     """按 QQ 会话类型选择 OneBot 发送接口。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
@@ -666,15 +1053,32 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
         await _send_attachment_path(bot, target, path, filename=filename)
 
 
-async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Dict[str, Any]]) -> None:
-    """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
-    # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
-    # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
-    if text:
-        if await _send_split_text(bot, target, text) and target.get("type") == "group":
+async def _send_text_and_attachments(
+    bot: Bot,
+    target: Dict[str, Any],
+    text: str,
+    attachments: List[Dict[str, Any]],
+    *,
+    conversation_key: str = "",
+    input_modality: str = "text",
+    record_group_history: bool = True,
+) -> None:
+    """统一发送文本、TTS 语音和附件，可选把展示文本写回群历史。"""
+    display_text, tts_segments = _extract_tts_segments(text or "")
+    should_send_voice = _voice_reply_allowed(target, input_modality, bool(tts_segments))
+    voice_segments = list(tts_segments)
+    if should_send_voice and not voice_segments:
+        fallback = _fallback_spoken_text(display_text)
+        if fallback:
+            voice_segments = [fallback]
+
+    if display_text:
+        if await _send_split_text(bot, target, display_text) and record_group_history and target.get("type") == "group":
             group_id = target.get("group_id")
             if group_id is not None:
-                _record_bot_reply(int(group_id), text)
+                _record_bot_reply(int(group_id), display_text)
+    if should_send_voice and voice_segments:
+        await _send_tts_voice_segments(bot, target, conversation_key, voice_segments)
     if attachments:
         await _send_attachments(bot, target, attachments)
 
@@ -771,7 +1175,14 @@ class TangQiuCallbacks:
             final_text, reactions = _extract_reactions(final_text)
             if reactions:
                 await self.add_reactions(trigger, reactions)
-        await _send_text_and_attachments(bot, target, final_text, attachments or [])
+        await _send_text_and_attachments(
+            bot,
+            target,
+            final_text,
+            attachments or [],
+            conversation_key=trigger.conversation_key,
+            input_modality=str(platform_data.get("_qq_input_modality") or "text"),
+        )
         # 2026-05-03 修改原因：最终回复到达时，触发消息上可能仍残留生命周期 React。
         # 做法是调用统一清理函数移除 76、281、178、97、326，目的在于把本轮
         # 新增的推理和工具阶段也纳入最终收尾。
@@ -807,7 +1218,16 @@ class TangQiuCallbacks:
         if reactions:
             await self.add_reactions(trigger, reactions)
         if text:
-            await _send_split_text(bot, target, text)
+            await _send_text_and_attachments(
+                bot,
+                target,
+                text,
+                [],
+                conversation_key=trigger.conversation_key,
+                # 中间回复只解析显式 <tts> 段，不因语音输入自动 fallback 整段合成。
+                input_modality="text",
+                record_group_history=False,
+            )
 
     async def send_to_channel(
         self,
@@ -823,7 +1243,7 @@ class TangQiuCallbacks:
             return
         bot = _conversation_bots.get(conversation_key) or _get_fallback_bot()
         if bot:
-            await _send_text_and_attachments(bot, target, text or "", attachments or [])
+            await _send_text_and_attachments(bot, target, text or "", attachments or [], conversation_key=conversation_key)
 
     async def delete_status_message(self, trigger: TriggerInfo) -> None:
         return None
@@ -981,6 +1401,7 @@ async def _startup() -> None:
         base_url=CLONOTH_BASE_URL,
         entry_node_id=ENTRY_NODE_ID,
         conversation_key_prefix="qq_group",
+        workspace_root=Path(CLONOTH_WORKSPACE),
         # 2026-05-03 修改原因：TangQiu QQ 侧不展示审批控件。本轮要求
         # 审批默认放行，所以打开 SDK 的内部操作自动审批开关，目的是避免
         # 内部工具调用停在等待审批状态。
@@ -1043,12 +1464,14 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
 
     group_id = int(event.group_id)
     conversation_key = f"qq_group:{group_id}"
-    user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    raw_user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    # 2026-06-21 修改原因：QQ 语音消息需要先转写，再以文本形式进入 Clonoth。
+    # 处理完成后删除临时音频文件，长期只保留转写文本和轻量输入方式标记。
+    attachments = await _collect_qq_attachments(event, conversation_key, bot)
+    attachments, voice_transcripts, had_voice_input = await _transcribe_qq_audio_attachments(attachments)
+    user_text, history_text, input_modality = _compose_qq_user_text(raw_user_text, voice_transcripts, had_voice_input)
     inbound_text = _build_inbound_text(event, bot, user_text)
-    # 2026-05-03 修改原因：QQ 群聊图片需要以 Clonoth 附件形式传入。
-    # 做法是在构造 inbound 文本后立刻下载当前消息和引用消息中的图片，目的
-    # 是让 preempt 与 submit_inbound 使用同一份附件载荷。
-    attachments = await _collect_qq_attachments(event, conversation_key)
+    inbound_text = _append_qq_reply_modality_hint(inbound_text, input_modality, is_dm=False)
     # 把 inbound_text 中的 [图片] 占位符替换为带路径版本，让 engine 能定位图片
     if attachments:
         for att in attachments:
@@ -1069,10 +1492,11 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
             "event": event,
             "type": "group",
             "group_id": group_id,
+            "_qq_input_modality": input_modality,
         },
     )
     if preempt_ok:
-        _record_group_message(event, bot, override_text=user_text)
+        _record_group_message(event, bot, override_text=history_text)
         await _agent_matcher.finish()
 
     try:
@@ -1104,16 +1528,16 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
             pass
     except Exception as exc:
         logger.exception("submit inbound failed")
-        _record_group_message(event, bot, override_text=user_text)
+        _record_group_message(event, bot, override_text=history_text)
         await _agent_matcher.finish(f"无法连接到 Clonoth Agent：{exc}")
 
-    _record_group_message(event, bot, override_text=user_text)
+    _record_group_message(event, bot, override_text=history_text)
 
     if not result.session_id or not result.accepted:
         await _agent_matcher.finish("Clonoth Agent 未接受本次请求。")
 
     _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "group", "group_id": group_id, "bot": bot, "event": event}
+    _session_targets[result.session_id] = {"type": "group", "group_id": group_id, "bot": bot, "event": event, "_qq_input_modality": input_modality}
     _conversation_bots[conversation_key] = bot
 
     if result.inbound_seq:
@@ -1127,6 +1551,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
                 "event": event,
                 "type": "group",
                 "group_id": group_id,
+                "_qq_input_modality": input_modality,
                 "last_typing_time": time.time(),
                 # 2026-05-03 修改原因：submit_inbound 成功后已经把触发消息切到 281。
                 # 做法是在 trigger 平台数据中记录 submitted 阶段，目的在于后续
@@ -1158,12 +1583,14 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     user_id = int(event.user_id)
     conversation_key = f"qq_private:{user_id}"
-    user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    raw_user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    # 2026-06-21 修改原因：私聊语音同样先转写为文本，再进入 Clonoth。
+    # 本地音频只作为临时文件，转写后删除。
+    attachments = await _collect_qq_attachments(event, conversation_key, bot)
+    attachments, voice_transcripts, had_voice_input = await _transcribe_qq_audio_attachments(attachments)
+    user_text, _history_text, input_modality = _compose_qq_user_text(raw_user_text, voice_transcripts, had_voice_input)
     inbound_text = _build_private_inbound_text(event, bot, user_text)
-    # 2026-05-03 修改原因：QQ 私聊图片同样需要作为 Clonoth 附件传入。
-    # 做法与群聊入口一致，先下载当前消息和引用消息中的图片，目的是让
-    # preempt 与 submit_inbound 在私聊路径也收到正确附件。
-    attachments = await _collect_qq_attachments(event, conversation_key)
+    inbound_text = _append_qq_reply_modality_hint(inbound_text, input_modality, is_dm=True)
     if attachments:
         for att in attachments:
             inbound_text = inbound_text.replace("[图片]", f"[图片: {att['path']}]", 1)
@@ -1183,6 +1610,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             "event": event,
             "type": "private",
             "user_id": user_id,
+            "_qq_input_modality": input_modality,
         },
     )
     if preempt_ok:
@@ -1215,7 +1643,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         await _private_matcher.finish("Clonoth Agent 未接受本次请求。")
 
     _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "private", "user_id": user_id, "bot": bot, "event": event}
+    _session_targets[result.session_id] = {"type": "private", "user_id": user_id, "bot": bot, "event": event, "_qq_input_modality": input_modality}
     _conversation_bots[conversation_key] = bot
 
     if result.inbound_seq:
@@ -1229,6 +1657,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
                 "event": event,
                 "type": "private",
                 "user_id": user_id,
+                "_qq_input_modality": input_modality,
                 "last_typing_time": time.time(),
             },
         )

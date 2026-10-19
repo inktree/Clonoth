@@ -17,7 +17,9 @@ import {
   useState,
 } from 'react';
 
-import { type ApprovalLevel, useChatStore, useClientPrefsStore } from '../../store';
+import { transcribeAudio } from '../../api/supervisorClient';
+import { type ApprovalLevel, type TtsBackend, type TtsVoicePreset, useChatStore, useClientPrefsStore } from '../../store';
+import { getConversationKey } from '../../store/chatTypes';
 import { isConversationGenerating } from '../../store/eventRouting';
 import type { Attachment } from '../../types';
 import { Icon } from '../common';
@@ -33,8 +35,79 @@ const APPROVAL_LEVEL_DISPLAY: Record<ApprovalLevel, { icon: string; label: strin
   yolo: { icon: 'lock_open', label: '放行' },
 };
 
+const TTS_REPLY_MODE_ORDER = ['off', 'voice-input', 'always'] as const;
+
+const TTS_REPLY_MODE_DISPLAY = {
+  off: { label: '静音', title: '不自动语音回复' },
+  'voice-input': { label: '语音', title: '语音输入时自动语音回复' },
+  always: { label: '总是', title: '始终自动语音回复' },
+} as const;
+
+const TTS_TRIGGER_MARKER = '\n\n[TTS:auto]';
+
+const TTS_BACKEND_DISPLAY: Record<TtsBackend, string> = {
+  mimo: 'Mimo',
+  ryza_onnx: '本地',
+};
+
+const TTS_VOICE_PRESET_DISPLAY: Record<TtsVoicePreset, string> = {
+  normal_cn: '中文',
+  normal_ja: '日文',
+  whisper_cn: '中文低语',
+  whisper_ja: '日文低语',
+};
+
 const FALLBACK_LINE_HEIGHT_PX = 20;
 const MAX_VISIBLE_TEXTAREA_LINES = 6;
+const MAX_RECORDING_MS = 120_000;
+
+const audioBufferToWavBlob = (audioBuffer: AudioBuffer): Blob => {
+  const channel = audioBuffer.getChannelData(0);
+  const sampleRate = audioBuffer.sampleRate;
+  const bytesPerSample = 2;
+  const headerBytes = 44;
+  const dataBytes = channel.length * bytesPerSample;
+  const buffer = new ArrayBuffer(headerBytes + dataBytes);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i));
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataBytes, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 8 * bytesPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataBytes, true);
+
+  let offset = headerBytes;
+  for (let i = 0; i < channel.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, channel[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += bytesPerSample;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+};
+
+const recordedAudioToWav = async (blob: Blob): Promise<Blob> => {
+  const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) throw new Error('当前浏览器不支持音频解码。');
+  const context = new AudioContextCtor();
+  try {
+    const audioBuffer = await context.decodeAudioData(await blob.arrayBuffer());
+    return audioBufferToWavBlob(audioBuffer);
+  } finally {
+    void context.close();
+  }
+};
 
 const readCssPixelValue = (value: string): number => {
   const parsed = Number.parseFloat(value);
@@ -93,11 +166,26 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [isContextPopoverOpen, setIsContextPopoverOpen] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentsRef = useRef<Attachment[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<BlobPart[]>([]);
+  const recordingTimeoutRef = useRef<number | null>(null);
+  const draftRef = useRef('');
   const approvalLevel = useClientPrefsStore((state) => state.approvalLevel) || 'smart';
   const setApprovalLevel = useClientPrefsStore((state) => state.setApprovalLevel);
+  const ttsReplyMode = useClientPrefsStore((state) => state.ttsReplyMode || 'voice-input');
+  const setTtsReplyMode = useClientPrefsStore((state) => state.setTtsReplyMode);
+  const ttsBackend = useClientPrefsStore((state) => state.ttsBackend);
+  const setTtsBackend = useClientPrefsStore((state) => state.setTtsBackend);
+  const ttsVoicePreset = useClientPrefsStore((state) => state.ttsVoicePreset);
+  const setTtsVoicePreset = useClientPrefsStore((state) => state.setTtsVoicePreset);
+  const ttsVolume = useClientPrefsStore((state) => state.ttsVolume);
+  const setTtsVolume = useClientPrefsStore((state) => state.setTtsVolume);
   const approvalDisplay = APPROVAL_LEVEL_DISPLAY[approvalLevel] || APPROVAL_LEVEL_DISPLAY.smart;
   const contextUsage = useChatStore((state) => {
     const activeConversation = state.activeConversationId
@@ -130,9 +218,11 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
       : undefined;
     return state.viewingChildSessionId || activeConversation?.sessionId || '';
   });
-  const conversationKey = useChatStore((state) =>
-    state.activeConversationId ? `web:${state.activeConversationId}` : '',
-  );
+  const conversationKey = useChatStore((state) => {
+    if (state.viewingChildConversationKey) return state.viewingChildConversationKey;
+    const conversation = state.conversations.find((item) => item.id === state.activeConversationId);
+    return conversation ? getConversationKey(conversation) : '';
+  });
 
   // [AutoC 2026-08-22] Plugin input slots need the reroll target and generating
   // state as data. Why: a quick-reroll contribution cannot read the store by
@@ -200,9 +290,106 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
     attachmentsRef.current = attachments;
   }, [attachments]);
 
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
   useEffect(() => () => {
     revokeLocalAttachmentUrls(attachmentsRef.current);
+    if (recordingTimeoutRef.current) window.clearTimeout(recordingTimeoutRef.current);
+    recordingTimeoutRef.current = null;
+    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
+
+  const handleVoiceInput = async () => {
+    if (isRecording) {
+      if (recordingTimeoutRef.current) window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+      if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop();
+      return;
+    }
+    if (composerDisabled || isTranscribing) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      window.alert('当前浏览器不支持录音。');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      recordingChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        if (recordingTimeoutRef.current) window.clearTimeout(recordingTimeoutRef.current);
+        recordingTimeoutRef.current = null;
+        const chunks = [...recordingChunksRef.current];
+        recordingChunksRef.current = [];
+        stream.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+        mediaRecorderRef.current = null;
+        setIsRecording(false);
+        if (chunks.length === 0) return;
+        const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+        setIsTranscribing(true);
+        void recordedAudioToWav(blob)
+          .then((wavBlob) => transcribeAudio(wavBlob, `recording-${Date.now()}.wav`))
+          .then(async (result) => {
+            const text = (result.text || '').trim();
+            if (!text) return;
+            const currentDraft = draftRef.current.trim();
+            const messageText = currentDraft ? `${currentDraft}
+${text}` : text;
+            const currentAttachments = [...attachmentsRef.current];
+            draftRef.current = '';
+            attachmentsRef.current = [];
+            setDraft('');
+            setAttachments([]);
+            revokeLocalAttachmentUrls(currentAttachments);
+            if (ttsReplyMode !== 'off') {
+              useClientPrefsStore.getState().setPendingVoiceReply(true);
+            }
+            const outboundText = ttsReplyMode === 'off' ? messageText : `${messageText}${TTS_TRIGGER_MARKER}`;
+            if (isGenerating) {
+              await preemptCurrentTask(outboundText, currentAttachments.length > 0 ? currentAttachments : undefined);
+            } else {
+              await onSend(outboundText, currentAttachments.length > 0 ? currentAttachments : undefined);
+            }
+          })
+          .catch((error) => window.alert(error instanceof Error ? error.message : '语音识别失败'))
+          .finally(() => setIsTranscribing(false));
+      };
+      recorder.start();
+      recordingTimeoutRef.current = window.setTimeout(() => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
+      }, MAX_RECORDING_MS);
+      setIsRecording(true);
+    } catch (error) {
+      if (recordingTimeoutRef.current) window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+      setIsRecording(false);
+      window.alert(error instanceof Error ? error.message : '无法开始录音');
+    }
+  };
+
+  useEffect(() => {
+    const handleVoiceShortcut = (event: globalThis.KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (event.key.toLowerCase() !== 'm') return;
+      event.preventDefault();
+      void handleVoiceInput();
+    };
+    window.addEventListener('keydown', handleVoiceShortcut);
+    return () => window.removeEventListener('keydown', handleVoiceShortcut);
+  }, [handleVoiceInput]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -217,10 +404,12 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
     setDraft('');
     setAttachments([]);
     revokeLocalAttachmentUrls(currentAttachments);
+    const shouldRequestTtsSelection = ttsReplyMode === 'always';
+    const outboundText = shouldRequestTtsSelection ? `${text}${TTS_TRIGGER_MARKER}` : text;
     if (isGenerating) {
-      await preemptCurrentTask(text, currentAttachments.length > 0 ? currentAttachments : undefined);
+      await preemptCurrentTask(outboundText, currentAttachments.length > 0 ? currentAttachments : undefined);
     } else {
-      await onSend(text, currentAttachments.length > 0 ? currentAttachments : undefined);
+      await onSend(outboundText, currentAttachments.length > 0 ? currentAttachments : undefined);
     }
   };
 
@@ -241,6 +430,12 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
     if (!showStop && !canSend) return;
     event.preventDefault();
     event.currentTarget.form?.requestSubmit();
+  };
+
+  const cycleTtsReplyMode = () => {
+    const currentIndex = TTS_REPLY_MODE_ORDER.indexOf(ttsReplyMode);
+    const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % TTS_REPLY_MODE_ORDER.length : 1;
+    setTtsReplyMode(TTS_REPLY_MODE_ORDER[nextIndex]);
   };
 
   const cycleApprovalLevel = () => {
@@ -360,6 +555,66 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
             >
               <Icon name="attach_file" size={18} />
             </button>
+            <button
+              aria-label={isRecording ? '停止录音并识别' : '语音输入'}
+              className={`inline-flex h-8 items-center justify-center border border-[var(--duties-border)] px-2 text-sm transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)] ${isRecording ? 'text-red-600' : 'text-[var(--duties-secondary)]'}`}
+              disabled={composerDisabled || isTranscribing}
+              onClick={handleVoiceInput}
+              title={isRecording ? '停止录音并识别（Alt+M）' : isTranscribing ? '正在识别语音' : '语音输入（Alt+M）'}
+              type="button"
+            >
+              <Icon name={isRecording ? 'stop_circle' : isTranscribing ? 'hourglass_empty' : 'mic'} size={18} />
+            </button>
+            <button
+              aria-label={`语音回复：${TTS_REPLY_MODE_DISPLAY[ttsReplyMode].label}`}
+              className="inline-flex h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"
+              onClick={cycleTtsReplyMode}
+              title={TTS_REPLY_MODE_DISPLAY[ttsReplyMode].title}
+              type="button"
+            >
+              <Icon name="settings" size={16} />
+              <span>{TTS_REPLY_MODE_DISPLAY[ttsReplyMode].label}</span>
+            </button>
+            <label className="hidden h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] md:inline-flex" title="TTS 后端">
+              <span>引擎</span>
+              <select
+                aria-label="TTS 后端"
+                className="max-w-20 bg-transparent text-[var(--duties-secondary)] outline-none"
+                onChange={(event) => setTtsBackend(event.target.value as TtsBackend)}
+                value={ttsBackend}
+              >
+                {Object.entries(TTS_BACKEND_DISPLAY).map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </label>
+            {ttsBackend === 'ryza_onnx' && <label className="hidden h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] md:inline-flex" title="本地 TTS 参考音频预设">
+              <span>音色</span>
+              <select
+                aria-label="TTS 音色"
+                className="max-w-24 bg-transparent text-[var(--duties-secondary)] outline-none"
+                onChange={(event) => setTtsVoicePreset(event.target.value as TtsVoicePreset)}
+                value={ttsVoicePreset}
+              >
+                {Object.entries(TTS_VOICE_PRESET_DISPLAY).map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </label>}
+            <label className="hidden h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] sm:inline-flex" title={`TTS 音量：${Math.round(ttsVolume * 100)}%`}>
+              <span>音量</span>
+              <input
+                aria-label="TTS 音量"
+                className="w-20 accent-[var(--duties-text)]"
+                max="1"
+                min="0"
+                onChange={(event) => setTtsVolume(Number(event.target.value))}
+                step="0.05"
+                type="range"
+                value={ttsVolume}
+              />
+              <span className="w-8 text-right">{Math.round(ttsVolume * 100)}%</span>
+            </label>
             <button
               aria-label={`审批级别：${approvalDisplay.label}。点击切换`}
               className="inline-flex h-8 items-center gap-1 border border-[var(--duties-border)] px-2 font-mono text-xs text-[var(--duties-secondary)] transition-colors hover:border-[var(--duties-text)] hover:text-[var(--duties-text)]"

@@ -69,3 +69,6 @@ test_*.py
 *.test.*
 *.spec.*
 tools/
+
+/TEMP/
+*.local.yaml

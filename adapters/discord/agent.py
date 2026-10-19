@@ -22,7 +22,7 @@ from aiohttp import web
 from clonoth_sdk import TriggerInfo
 
 from .context import _build_context_text, _build_reply_context, _ensure_channel
-from .messaging import _collect_attachments, _safe_restart
+from .messaging import _collect_attachments, _safe_restart, append_discord_reply_modality_hint
 
 
 logger = logging.getLogger("discord_bot")
@@ -333,10 +333,21 @@ async def handle_agent(
     message: discord.Message,
     user_input: str,
     channel_id: int,
+    *,
+    inbound_attachments: list[dict[str, Any]] | None = None,
+    input_modality: str = "text",
 ) -> None:
     """入口：所有请求都走同一个 session，直接并发执行。"""
     conv_key = f"discord:{channel_id}"
-    await _handle_agent_inner(rt, message, user_input, channel_id, conv_key)
+    await _handle_agent_inner(
+        rt,
+        message,
+        user_input,
+        channel_id,
+        conv_key,
+        inbound_attachments=inbound_attachments,
+        input_modality=input_modality,
+    )
 
 
 async def _handle_agent_inner(
@@ -345,6 +356,9 @@ async def _handle_agent_inner(
     user_input: str,
     channel_id: int,
     conversation_key: str,
+    *,
+    inbound_attachments: list[dict[str, Any]] | None = None,
+    input_modality: str = "text",
 ) -> None:
     """handle_agent 核心逻辑。"""
     if not rt.clonoth_client or not rt.session_state:
@@ -360,8 +374,13 @@ async def _handle_agent_inner(
         rt, channel_id, message.author, user_input,
         reply_context=reply_context,
         exclude_last=True,
+        # [2026-10-19 fix] Pass the real conversation type so private messages
+        # stop being dressed up as group-chat context.
+        is_dm=is_dm,
     )
-    inbound_attachments = await _collect_attachments(rt, message, conversation_key)
+    full_text = append_discord_reply_modality_hint(rt, full_text, input_modality, is_dm)
+    if inbound_attachments is None:
+        inbound_attachments = await _collect_attachments(rt, message, conversation_key)
 
     # --- Preempt V2: 打断同 conversation 的 running task ---
     existing_sid = rt.session_state.get_session_id(conversation_key)
@@ -426,6 +445,7 @@ async def _handle_agent_inner(
             old_trigger.platform_data["status_msg"] = status_msg
             old_trigger.platform_data["cancel_view"] = cancel_view
             old_trigger.platform_data["last_typing_time"] = time.time()
+            old_trigger.platform_data["_discord_input_modality"] = input_modality
         elif preempted_src_seq:
             new_trigger = TriggerInfo(
                 inbound_seq=preempted_src_seq,
@@ -436,6 +456,7 @@ async def _handle_agent_inner(
                     "message": message, "channel_id": channel_id,
                     "status_msg": status_msg, "cancel_view": cancel_view,
                     "last_typing_time": time.time(),
+                    "_discord_input_modality": input_modality,
                 },
             )
             rt.session_state.register_trigger(new_trigger)
@@ -513,6 +534,7 @@ async def _handle_agent_inner(
                 "status_msg": None,
                 "cancel_view": cancel_view,
                 "last_typing_time": time.time(),
+                "_discord_input_modality": input_modality,
             },
         )
         rt.session_state.register_trigger(trigger)

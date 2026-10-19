@@ -1,12 +1,16 @@
-import { useEffect, useRef, useState } from 'react';
 // [2026-05-31] MessageCard is the unified v2 renderer for normalized chat messages.
 // Why: Step 2B replaces the old MessageBubble plus StreamPreview split with one replayable
 // message surface. How: derive header, role styling, streaming indicator, ordered block
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
+import { useEffect, useRef, useState } from 'react';
+
+import { synthesizeSpeech } from '../../api/supervisorClient';
 import type { MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../types/message';
+import { getConversationKey } from '../../store/chatTypes';
 import { useChatStore } from '../../store/chatStore';
-import { AttachmentList } from './AttachmentList';
+import { useClientPrefsStore } from '../../store/clientPrefsStore';
+import { AttachmentList, fetchAuthenticatedAttachmentBlobUrl } from './AttachmentList';
 import { RenderBlockView } from './RenderBlockView';
 import { mergeThinkingBlocksForDisplay } from './displayBlocks';
 import { BLOCK_STACK_CLASS, type MessageRenderContext } from './renderingConstants';
@@ -97,6 +101,174 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
+function getMessageText(message: WsMessage): string {
+  return message.blocks
+    .filter((block): block is TextBlock => block.kind === 'text')
+    .map((block) => block.text.trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function sanitizeTtsText(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/<<<TOOL_CALL>>>[\s\S]*?<<<END_TOOL_CALL>>>/g, '')
+    .replace(/^\s*(?:diff --git|index [a-f0-9]|@@ |[+\-]{3} |[+\-]\s*import |[+\-]\s*const |[+\-]\s*function |[+\-]\s*class ).*$/gim, '')
+    .replace(/`([^`]{1,80})`/g, '$1')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function stripNonSpokenTtsSources(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`]*<\/?tts[^`]*`/gi, '')
+    .replace(/`[^`]*\[\[\/?tts\]\][^`]*`/gi, '')
+    .replace(/<<<TOOL_CALL>>>[\s\S]*?<<<END_TOOL_CALL>>>/g, '')
+    .replace(/<<<TOOL_CALL_RESULT[\s\S]*?<\/TOOL_CALL_RESULT>/g, '');
+}
+
+function getMarkedTtsSegments(text: string): string[] {
+  const spokenSource = stripNonSpokenTtsSources(text);
+  const segments = [
+    ...Array.from(spokenSource.matchAll(/<tts>([\s\S]*?)<\/tts>/gi), (match) => match[1] || ''),
+    ...Array.from(spokenSource.matchAll(/\[\[tts\]\]([\s\S]*?)\[\[\/tts\]\]/gi), (match) => match[1] || ''),
+  ];
+  return segments
+    .map((segment) => sanitizeTtsText(segment))
+    .filter(Boolean);
+}
+
+function getSpeakableSegments(message: WsMessage): string[] {
+  const text = getMessageText(message);
+  const markedSegments = getMarkedTtsSegments(text);
+  if (markedSegments.length > 0) return markedSegments.map((segment) => segment.slice(0, 4000));
+
+  const fallback = sanitizeTtsText(text).slice(0, 4000);
+  return fallback ? [fallback] : [];
+}
+
+const MAX_TTS_PLAYBACK_MS = 120_000;
+
+function stopAudio(audio: HTMLAudioElement) {
+  audio.pause();
+  audio.src = '';
+  audio.load();
+}
+
+function playAudioToEnd(audio: HTMLAudioElement): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      stopAudio(audio);
+      resolve();
+    }, MAX_TTS_PLAYBACK_MS);
+
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      audio.onended = null;
+      audio.onerror = null;
+    };
+
+    audio.onended = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    audio.onerror = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('audio playback failed'));
+    };
+    void audio.play().catch((error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    });
+  });
+}
+
+const AUTO_TTS_PLAYED_SESSION_KEY = 'clonoth_auto_tts_played_segments';
+
+let ttsQueue: Promise<void> = Promise.resolve();
+let currentTtsAudio: HTMLAudioElement | null = null;
+
+function readAutoTtsPlayedKeys(): Set<string> {
+  try {
+    const raw = sessionStorage.getItem(AUTO_TTS_PLAYED_SESSION_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function rememberAutoTtsPlayedKey(key: string) {
+  try {
+    const keys = Array.from(readAutoTtsPlayedKeys());
+    if (!keys.includes(key)) keys.push(key);
+    sessionStorage.setItem(AUTO_TTS_PLAYED_SESSION_KEY, JSON.stringify(keys.slice(-500)));
+  } catch {
+    // ignore storage failures
+  }
+}
+
+type GlobalTtsTask = {
+  segments: string[];
+  conversationKey: string;
+  sessionId?: string;
+  volume: number;
+  backend: 'mimo' | 'ryza_onnx';
+  preset: string;
+  onStart?: () => void;
+  onEnd?: () => void;
+};
+
+async function playGlobalTtsTask(task: GlobalTtsTask): Promise<void> {
+  for (const segment of task.segments) {
+    try {
+      const result = await synthesizeSpeech({
+        text: segment,
+        conversation_key: task.conversationKey,
+        backend: task.backend,
+        ...(task.backend === 'ryza_onnx' ? { preset: task.preset } : {}),
+        response_format: 'wav',
+      });
+      const attachment = result.attachment;
+      const href = attachment?.path ? await fetchAuthenticatedAttachmentBlobUrl(attachment.path, task.sessionId) : '';
+      if (!href) continue;
+
+      const audio = new Audio(href);
+      currentTtsAudio = audio;
+      audio.volume = Math.min(1, Math.max(0, task.volume));
+      try {
+        await playAudioToEnd(audio);
+      } finally {
+        stopAudio(audio);
+        if (currentTtsAudio === audio) currentTtsAudio = null;
+      }
+    } catch (error) {
+      console.warn('TTS playback segment failed', error);
+    }
+  }
+}
+
+function enqueueGlobalTtsTask(task: GlobalTtsTask): void {
+  ttsQueue = ttsQueue.then(async () => {
+    task.onStart?.();
+    try {
+      await playGlobalTtsTask(task);
+    } finally {
+      task.onEnd?.();
+    }
+  }).catch((error) => console.warn('TTS playback queue failed', error));
+}
+
 // ponytail: user message retry/edit lives in the message_retry plugin since
 // 2026-08-23 (message_footer slot). upgrade path: keep the slot data payload
 // (messageId/role/sessionId/editable/text) stable; the plugin renders the UI.
@@ -105,6 +277,68 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
   const roleStyle = ROLE_STYLES[message.role];
   const active = isActiveStatus(message.status);
   const attachments = message.attachments ?? [];
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const autoSpokenSegmentKeysRef = useRef<Set<string>>(readAutoTtsPlayedKeys());
+  const componentMountedRef = useRef(true);
+  const ttsReplyMode = useClientPrefsStore((state) => state.ttsReplyMode);
+  const pendingVoiceReply = useClientPrefsStore((state) => state.pendingVoiceReply);
+  const setPendingVoiceReply = useClientPrefsStore((state) => state.setPendingVoiceReply);
+  const ttsVolume = useClientPrefsStore((state) => state.ttsVolume);
+  const ttsBackend = useClientPrefsStore((state) => state.ttsBackend);
+  const ttsVoicePreset = useClientPrefsStore((state) => state.ttsVoicePreset);
+  const messageText = message.role === 'assistant' ? getMessageText(message) : '';
+  const markedSegments = message.role === 'assistant' ? getMarkedTtsSegments(messageText) : [];
+  const speakableSegments = message.role === 'assistant' ? getSpeakableSegments(message) : [];
+  const speakableText = speakableSegments.join('\n\n');
+
+  const enqueueTtsSegments = (segments: string[]) => {
+    if (segments.length === 0) return;
+    enqueueGlobalTtsTask({
+      segments,
+      conversationKey: getConversationKey(useChatStore.getState().conversations.find((item) => item.id === message.conversationId) || { id: message.conversationId }),
+      sessionId: message.sessionId || undefined,
+      volume: ttsVolume,
+      backend: ttsBackend,
+      preset: ttsVoicePreset,
+      onStart: () => {
+        if (componentMountedRef.current) setIsSpeaking(true);
+      },
+      onEnd: () => {
+        if (componentMountedRef.current) setIsSpeaking(false);
+      },
+    });
+  };
+
+  const handleSpeak = async () => {
+    if (!speakableText || isSpeaking) return;
+    enqueueTtsSegments(speakableSegments);
+  };
+
+  useEffect(() => {
+    componentMountedRef.current = true;
+    return () => {
+      componentMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (message.hydratedFromHistory || ttsReplyMode === 'off') return;
+    if (message.role !== 'assistant' || markedSegments.length === 0) return;
+    if (!['streaming', 'running_tools', 'completed'].includes(message.status)) return;
+    if (ttsReplyMode === 'voice-input' && !pendingVoiceReply) return;
+    const newSegments = markedSegments.filter((segment, index) => {
+      const key = `${message.id}:${index}:${segment}`;
+      if (autoSpokenSegmentKeysRef.current.has(key)) return false;
+      autoSpokenSegmentKeysRef.current.add(key);
+      rememberAutoTtsPlayedKey(key);
+      return true;
+    });
+    if (newSegments.length > 0) {
+      if (pendingVoiceReply) setPendingVoiceReply(false);
+      enqueueTtsSegments(newSegments);
+    }
+  }, [ttsReplyMode, pendingVoiceReply, setPendingVoiceReply, message.id, message.role, message.status, message.hydratedFromHistory, markedSegments]);
+
   // Why: child block renderers only need the message fields that affect presentation.
   // How: pass a small context object instead of threading completionType, role, and
   // status as separate props. Purpose: the message-to-block contract stays explicit
@@ -172,6 +406,17 @@ export const MessageCard = ({ message, toolsById, prevRole, nextRole, isLastUser
                 || message.completionType === 'ask')
             )) && (
               <div className="msg-footer-row ml-auto">
+                {speakableText && (
+                  <button
+                    className="font-mono text-[0.55rem] text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:opacity-50"
+                    disabled={isSpeaking}
+                    onClick={handleSpeak}
+                    title="朗读这条回复"
+                    type="button"
+                  >
+                    {isSpeaking ? '合成中' : '朗读'}
+                  </button>
+                )}
                 <MessageCopyButton text={plainText} />
                 <MessageMetaInfo source={message.source} />
                 <PluginSlotHost

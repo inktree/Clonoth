@@ -10,6 +10,9 @@ import yaml
 from .types import (
     AppConfigPublic,
     AppConfigSecret,
+    MimoAudioConfigPublic,
+    MimoAudioConfigSecret,
+    MimoAudioConfigUpdateIn,
     OpenAIConfigPublic,
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
@@ -144,7 +147,23 @@ class ConfigStore:
                     m = str(_resolve_env_value(v.get("model", ""))).strip()
                     if m:
                         pm[k] = m
-            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, provider_models=pm)
+            mimo = cfg.mimo_audio
+            mimo_present, mimo_redacted = _redact_api_key(mimo.api_key)
+            mimo_pub = MimoAudioConfigPublic(
+                base_url=mimo.base_url,
+                api_key_present=mimo_present,
+                api_key=mimo_redacted,
+                asr_path=mimo.asr_path,
+                asr_model=mimo.asr_model,
+                asr_language=mimo.asr_language,
+                tts_path=mimo.tts_path,
+                tts_model=mimo.tts_model,
+                tts_voice=mimo.tts_voice,
+                tts_format=mimo.tts_format,
+                timeout=mimo.timeout,
+                ffmpeg_path=mimo.ffmpeg_path,
+            )
+            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, mimo_audio=mimo_pub, provider_models=pm)
 
     def get_openai_secret(self) -> OpenAIConfigSecret:
         with self._lock:
@@ -192,13 +211,72 @@ class ConfigStore:
                 api_key_present=present,
                 api_key=redacted,
             )
-            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub)
+            mimo_pub = self.get_mimo_audio_public()
+            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, mimo_audio=mimo_pub)
+
+    def get_mimo_audio_secret(self) -> MimoAudioConfigSecret:
+        with self._lock:
+            cfg = self._config.mimo_audio.model_copy(deep=True)
+            cfg.base_url = _resolve_env_value(cfg.base_url) or "https://api.xiaomimimo.com"
+            cfg.api_key = _resolve_env_value(cfg.api_key)
+            cfg.asr_path = _resolve_env_value(cfg.asr_path) or "/v1/chat/completions"
+            cfg.asr_model = _resolve_env_value(cfg.asr_model) or "mimo-v2.5-asr"
+            cfg.asr_language = _resolve_env_value(cfg.asr_language) or "auto"
+            cfg.tts_path = _resolve_env_value(cfg.tts_path) or "/v1/chat/completions"
+            cfg.tts_model = _resolve_env_value(cfg.tts_model) or "mimo-v2.5-tts"
+            cfg.tts_voice = _resolve_env_value(cfg.tts_voice) or "mimo_default"
+            cfg.tts_format = _resolve_env_value(cfg.tts_format) or "wav"
+            cfg.timeout = _resolve_env_value(cfg.timeout) or "60"
+            cfg.ffmpeg_path = _resolve_env_value(cfg.ffmpeg_path) or os.getenv("FFMPEG_PATH", "").strip()
+            return cfg
+
+    def get_mimo_audio_public(self) -> MimoAudioConfigPublic:
+        with self._lock:
+            cfg = self.get_mimo_audio_secret()
+            present, redacted = _redact_api_key(cfg.api_key)
+            return MimoAudioConfigPublic(
+                base_url=cfg.base_url,
+                api_key_present=present,
+                api_key=redacted,
+                asr_path=cfg.asr_path,
+                asr_model=cfg.asr_model,
+                asr_language=cfg.asr_language,
+                tts_path=cfg.tts_path,
+                tts_model=cfg.tts_model,
+                tts_voice=cfg.tts_voice,
+                tts_format=cfg.tts_format,
+                timeout=cfg.timeout,
+                ffmpeg_path=cfg.ffmpeg_path,
+            )
+
+    def update_mimo_audio(self, update: MimoAudioConfigUpdateIn) -> MimoAudioConfigPublic:
+        with self._lock:
+            cfg = self._config
+            for key in (
+                "base_url",
+                "api_key",
+                "asr_path",
+                "asr_model",
+                "asr_language",
+                "tts_path",
+                "tts_model",
+                "tts_voice",
+                "tts_format",
+                "timeout",
+                "ffmpeg_path",
+            ):
+                value = getattr(update, key)
+                if value is not None:
+                    setattr(cfg.mimo_audio, key, value.strip())
+            self._save_yaml(cfg)
+            self._config = cfg
+            return self.get_mimo_audio_public()
 
     # ================================================================
     #  Multi-provider CRUD (operates on raw YAML dict)
     # ================================================================
 
-    _META_KEYS = frozenset({"version", "provider", "fallbacks"})
+    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio"})
 
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""

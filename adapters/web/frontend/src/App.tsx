@@ -8,6 +8,7 @@
 // as App-level modal/right-panel conditionals. How: build one AppViewContext, choose
 // viewRegistry[viewMode], and pass the resolved slots to AppLayout. Purpose: App.tsx
 // remains a small composition root instead of a business-routing file.
+import { getConversationKey } from './store/chatTypes';
 import { useEffect } from 'react';
 
 import { checkHealth, resetConversation } from './api/supervisorClient';
@@ -35,6 +36,8 @@ const MainApp = () => {
   // reducer-owned data model without reintroducing legacy streamPreview state.
   const toolsById = useChatStore((state) => state.toolExecutionsById);
   const viewingChildSessionId = useChatStore((state) => state.viewingChildSessionId);
+  const viewingChildTitle = useChatStore((state) => state.viewingChildTitle);
+  const viewingChildConversationKey = useChatStore((state) => state.viewingChildConversationKey);
   const childNodes = useChatStore((state) => state.childNodes);
   const exitChildSession = useChatStore((state) => state.exitChildSession);
   const { activeNodeId, entryNodeId, pendingProviderOverride, setPendingProviderOverride } = useSettingsStore();
@@ -62,7 +65,7 @@ const MainApp = () => {
   // child label when viewingChildSessionId is set. Purpose: users can see they are
   // inspecting a child node and can return to the parent.
   const activeTitle = viewingChildSessionId
-    ? (viewingChildNode?.nodeId ? `子节点: ${viewingChildNode.nodeId}` : `临时会话: ${viewingChildSessionId.slice(0, 8)}`)
+    ? viewingChildTitle || (viewingChildNode?.nodeId ? `子节点: ${viewingChildNode.nodeId}` : `临时会话: ${viewingChildSessionId.slice(0, 8)}`)
     : activeConversation?.title || '未选择对话';
 
   // [2026-05-31] Startup loading now belongs to chatStore. Why: the canonical store
@@ -112,8 +115,12 @@ const MainApp = () => {
   };
 
   const handleReset = async () => {
-    if (!activeConversationId) return;
-    const convKey = `web:${activeConversationId}`;
+    // [2026-10-19] Why: the selected session may not be a web conversation. How:
+    // resolve the displayed session's real key. Purpose: never reset another platform's web copy.
+    const convKey = viewingChildSessionId
+      ? viewingChildConversationKey
+      : activeConversation ? getConversationKey(activeConversation) : null;
+    if (!convKey) return;
     try { await resetConversation(convKey); } catch { /* ignore reset failures in the shell */ }
   };
 

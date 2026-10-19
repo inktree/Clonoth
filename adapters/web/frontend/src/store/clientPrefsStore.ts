@@ -7,6 +7,9 @@ import { create } from 'zustand';
 
 export type TitleGenerationMode = 'auto' | 'manual' | 'first-message';
 export type ApprovalLevel = 'manual' | 'smart' | 'yolo';
+export type TtsReplyMode = 'off' | 'voice-input' | 'always';
+export type TtsBackend = 'mimo' | 'ryza_onnx';
+export type TtsVoicePreset = 'normal_cn' | 'normal_ja' | 'whisper_cn' | 'whisper_ja';
 
 export interface ClientPrefs {
   // [2026-06-05] Why: automatic approvals now have a top-level safety mode instead
@@ -18,14 +21,24 @@ export interface ClientPrefs {
   titleGeneration: TitleGenerationMode;
   thinkingDefaultCollapsed: boolean;
   toolResultsDefaultCollapsed: boolean;
+  ttsReplyMode: TtsReplyMode;
+  ttsBackend: TtsBackend;
+  ttsVoicePreset: TtsVoicePreset;
+  ttsVolume: number;
 }
 
 interface ClientPrefsState extends ClientPrefs {
+  pendingVoiceReply: boolean;
+  setPendingVoiceReply: (pending: boolean) => void;
   setApprovalLevel: (level: ApprovalLevel) => void;
   setAutoApproveTool: (toolName: string, enabled: boolean) => void;
   setTitleGeneration: (mode: TitleGenerationMode) => void;
   setThinkingDefaultCollapsed: (collapsed: boolean) => void;
   setToolResultsDefaultCollapsed: (collapsed: boolean) => void;
+  setTtsReplyMode: (mode: TtsReplyMode) => void;
+  setTtsBackend: (backend: TtsBackend) => void;
+  setTtsVoicePreset: (preset: TtsVoicePreset) => void;
+  setTtsVolume: (volume: number) => void;
   resetClientPrefs: () => void;
 }
 
@@ -51,6 +64,10 @@ export const DEFAULT_CLIENT_PREFS: ClientPrefs = {
   titleGeneration: 'first-message',
   thinkingDefaultCollapsed: true,
   toolResultsDefaultCollapsed: true,
+  ttsReplyMode: 'voice-input',
+  ttsBackend: 'mimo',
+  ttsVoicePreset: 'normal_cn',
+  ttsVolume: 0.6,
 };
 
 function isTitleGenerationMode(value: unknown): value is TitleGenerationMode {
@@ -62,6 +79,24 @@ function isApprovalLevel(value: unknown): value is ApprovalLevel {
   // levels. How: accept only the three supported string literals. Purpose: malformed
   // values fall back to the smart default without breaking startup.
   return value === 'manual' || value === 'smart' || value === 'yolo';
+}
+
+function isTtsReplyMode(value: unknown): value is TtsReplyMode {
+  return value === 'off' || value === 'voice-input' || value === 'always';
+}
+
+function isTtsBackend(value: unknown): value is TtsBackend {
+  return value === 'mimo' || value === 'ryza_onnx';
+}
+
+function isTtsVoicePreset(value: unknown): value is TtsVoicePreset {
+  return value === 'normal_cn' || value === 'normal_ja' || value === 'whisper_cn' || value === 'whisper_ja';
+}
+
+function clampTtsVolume(value: unknown): number | undefined {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(1, Math.max(0, n));
 }
 
 function readStoredPrefs(): Partial<ClientPrefs> {
@@ -83,6 +118,10 @@ function readStoredPrefs(): Partial<ClientPrefs> {
       titleGeneration: isTitleGenerationMode(parsed.titleGeneration) ? parsed.titleGeneration : undefined,
       thinkingDefaultCollapsed: typeof parsed.thinkingDefaultCollapsed === 'boolean' ? parsed.thinkingDefaultCollapsed : undefined,
       toolResultsDefaultCollapsed: typeof parsed.toolResultsDefaultCollapsed === 'boolean' ? parsed.toolResultsDefaultCollapsed : undefined,
+      ttsReplyMode: isTtsReplyMode(parsed.ttsReplyMode) ? parsed.ttsReplyMode : undefined,
+      ttsBackend: isTtsBackend(parsed.ttsBackend) ? parsed.ttsBackend : undefined,
+      ttsVoicePreset: isTtsVoicePreset(parsed.ttsVoicePreset) ? parsed.ttsVoicePreset : undefined,
+      ttsVolume: clampTtsVolume(parsed.ttsVolume),
     };
   } catch {
     return {};
@@ -114,6 +153,10 @@ function publicPrefs(state: ClientPrefsState): ClientPrefs {
     titleGeneration: state.titleGeneration,
     thinkingDefaultCollapsed: state.thinkingDefaultCollapsed,
     toolResultsDefaultCollapsed: state.toolResultsDefaultCollapsed,
+    ttsReplyMode: state.ttsReplyMode,
+    ttsBackend: state.ttsBackend,
+    ttsVoicePreset: state.ttsVoicePreset,
+    ttsVolume: state.ttsVolume,
   };
 }
 
@@ -135,6 +178,8 @@ export function shouldAutoApproveTool(
 
 export const useClientPrefsStore = create<ClientPrefsState>((set, get) => ({
   ...mergePrefs(readStoredPrefs()),
+  pendingVoiceReply: false,
+  setPendingVoiceReply: (pending) => set({ pendingVoiceReply: pending }),
 
   setApprovalLevel: (level) => set((state) => {
     // [2026-06-05] Why: approval level changes affect every future approval request.
@@ -170,6 +215,31 @@ export const useClientPrefsStore = create<ClientPrefsState>((set, get) => ({
     const nextState = { ...state, toolResultsDefaultCollapsed: collapsed };
     persistPrefs(publicPrefs(nextState));
     return { toolResultsDefaultCollapsed: collapsed };
+  }),
+
+  setTtsReplyMode: (mode) => set((state) => {
+    const nextState = { ...state, ttsReplyMode: mode };
+    persistPrefs(publicPrefs(nextState));
+    return { ttsReplyMode: mode };
+  }),
+
+  setTtsBackend: (backend) => set((state) => {
+    const nextState = { ...state, ttsBackend: backend };
+    persistPrefs(publicPrefs(nextState));
+    return { ttsBackend: backend };
+  }),
+
+  setTtsVoicePreset: (preset) => set((state) => {
+    const nextState = { ...state, ttsVoicePreset: preset };
+    persistPrefs(publicPrefs(nextState));
+    return { ttsVoicePreset: preset };
+  }),
+
+  setTtsVolume: (volume) => set((state) => {
+    const nextVolume = Math.min(1, Math.max(0, Number.isFinite(volume) ? volume : DEFAULT_CLIENT_PREFS.ttsVolume));
+    const nextState = { ...state, ttsVolume: nextVolume };
+    persistPrefs(publicPrefs(nextState));
+    return { ttsVolume: nextVolume };
   }),
 
   resetClientPrefs: () => {

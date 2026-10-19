@@ -243,6 +243,16 @@ def main() -> None:
 
     base_url = f"http://{args.host}:{args.port}"
 
+    # Initialize and persist the supervisor token before spawning Engine workers.
+    # When CLONOTH_ADMIN_TOKEN is unset, get_admin_token() creates a new token for
+    # each Supervisor process. Workers used to start first and read the previous
+    # process's token from data/.admin_token, so every protected request returned
+    # 401 until the workers were restarted again.
+    from .admin_api import get_admin_token
+    _admin_token_file = data_dir / ".admin_token"
+    _admin_token_file.write_text(get_admin_token(), encoding="utf-8")
+    _log(f"[supervisor] initialized admin token file before worker startup: {_admin_token_file}")
+
     process_manager: ProcessManager | None = None
     if not args.no_workers:
         process_manager = ProcessManager(
@@ -253,6 +263,12 @@ def main() -> None:
         )
         if not args.no_kernel:
             process_manager.start_engine()
+        if process_manager.spawn_discord_adapter:
+            process_manager.start_discord_adapter()
+        if process_manager.spawn_onebot_adapter:
+            process_manager.start_onebot_adapter()
+        if process_manager.spawn_napcat:
+            process_manager.start_napcat()
 
     scheduler = SchedulerThread(state=state, workspace_root=workspace_root)
     scheduler.start()

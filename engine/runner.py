@@ -161,6 +161,7 @@ def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path 
     # served from the module cache, while hot edits still take effect immediately.
     candidates = [
         workspace_root / "engine" / "system_nodes" / f"{node_id}.yaml",
+        workspace_root / "config" / "nodes" / f"{node_id}.local.yaml",
         workspace_root / "config" / "nodes" / f"{node_id}.yaml",
     ]
     for path in candidates:
@@ -266,7 +267,8 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
         for f in sorted(nodes_dir.iterdir()):
             if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
                 continue
-            n = load_node(workspace_root, f.stem)
+            nid = f.stem.removesuffix(".local")
+            n = load_node(workspace_root, nid)
             if n is None or n.type != "ai" or n.id in entries:
                 continue
             entries[n.id] = {
@@ -789,11 +791,16 @@ async def _handle_task(
     session_id = str(item.get("session_id") or "").strip()
     session_generation = int(item.get("session_generation") or 0)
 
-    cfg_raw = await fetch_llm_secret(http, sup_url)
-    api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
-
-    _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+    _hb: asyncio.Task[None] | None = None
     try:
+        # Configuration fetch is part of task execution and must be covered by the
+        # same terminal-state fallback as model/tool errors. Previously a 401 here
+        # escaped _handle_task before heartbeat setup and before complete_task,
+        # leaving the task silent until the zombie reaper expired its lease.
+        cfg_raw = await fetch_llm_secret(http, sup_url)
+        api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
+        _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
+
         if kind == "node":
             result = await _run_node_task(
                 http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
@@ -821,7 +828,8 @@ async def _handle_task(
         _tb.print_exc()
         result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
 
-    _hb.cancel()
+    if _hb is not None:
+        _hb.cancel()
     # 重试 complete_task POST，防止因网络/超时导致 task 永久孤立
     try:
         for _complete_attempt in range(3):

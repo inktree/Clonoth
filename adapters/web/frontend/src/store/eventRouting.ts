@@ -172,7 +172,11 @@ export function resolveEventConversationId(state: ChatStoreState, event: Supervi
     if (isDispatchChildEvent(payload)) {
       return resolveAgentRouteConversationId(state, payload);
     }
-    return '';
+    // [2026-10-19] Why: non-web sidebar sessions also receive keyed live events.
+    // How: route only known top-level conversations. Purpose: retain platform keys
+    // without admitting unknown internal sessions into the sidebar.
+    return state.conversations.find((conversation) =>
+      (conversation.conversationKey || conversation.id) === conversationKey)?.id || '';
   }
 
   // No conversation_key — dispatch child still routes via metadata

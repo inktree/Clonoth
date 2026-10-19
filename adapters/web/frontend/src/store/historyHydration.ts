@@ -6,6 +6,7 @@
 //   - Block factories (text, thinking, tool)
 //   - Message CRUD on ChatState (append, remove)
 
+import { stripClientOnlyTtsInstruction } from './chatTypes';
 import type { StructuredMessage, StructuredThinkingBlock } from '../api/supervisorClient';
 import type {
   Attachment,
@@ -293,11 +294,13 @@ function mergeHistoryAttachments(...groups: readonly Attachment[][]): Attachment
 }
 
 function getHistoryTextContent(message: StructuredMessage): string {
-  if (!Array.isArray(message.content)) return stringifyContent(message.content);
-  return message.content
-    .map((part) => (isRecord(part) && getHistoryString(part.type) === 'text' ? getHistoryString(part.text) : ''))
-    .filter((text) => text.trim() && !/^\[Attached file:/i.test(text.trim()))
-    .join('\n');
+  const rawText = !Array.isArray(message.content)
+    ? stringifyContent(message.content)
+    : message.content
+      .map((part) => (isRecord(part) && getHistoryString(part.type) === 'text' ? getHistoryString(part.text) : ''))
+      .filter((text) => text.trim() && !/^\[Attached file:/i.test(text.trim()))
+      .join('\n');
+  return stripClientOnlyTtsInstruction(rawText);
 }
 
 export function normalizeHistoryThinkingSegments(message: StructuredMessage): HistoryThinkingSegment[] {
@@ -369,7 +372,7 @@ export function createHistoryToolExecutions(
       status: historyToolStatus(result),
       arguments: toolCall.arguments,
       argumentsText: toolCall.arguments ? JSON.stringify(toolCall.arguments) : undefined,
-      summary: summarizeArguments(toolCall.name, toolCall.arguments),
+      summary: result?.summary || summarizeArguments(toolCall.name, toolCall.arguments),
       result: result?.result,
       rawInline: result?.rawInline,
       format: result?.format,

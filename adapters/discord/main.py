@@ -1,7 +1,7 @@
 """Compatibility entry point for PM2.
 
 [2026-05-14 refactor note] The production bot implementation now lives in
-platform.discord.app. This file stays small so old process managers can keep
+adapters.discord.app. This file stays small so old process managers can keep
 executing adapters/discord/main.py without losing the import path setup.
 """
 from __future__ import annotations

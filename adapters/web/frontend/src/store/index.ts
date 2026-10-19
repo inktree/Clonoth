@@ -9,7 +9,7 @@ export { useClientPrefsStore, shouldAutoApproveTool } from './clientPrefsStore';
 // contract. How: re-export the ApprovalLevel type beside the existing preference
 // types. Purpose: barrel imports can type settings code without reaching into the
 // store implementation file.
-export type { ApprovalLevel, ClientPrefs, TitleGenerationMode } from './clientPrefsStore';
+export type { ApprovalLevel, ClientPrefs, TitleGenerationMode, TtsBackend, TtsVoicePreset } from './clientPrefsStore';
 export { useSettingsStore } from './settingsStore';
 export type { SettingsState } from './settingsStore';
 // [2026-06-01] Export viewStore beside configuration stores.

@@ -5,16 +5,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any
 
 from .stream_buffer import _StreamBuffer
+# [2026-10-19] DSML 流式过滤：DeepSeek 原生工具标记在未结构化时会混进
+# 正文 token 流，必须在 flush 给前端之前就吞掉，否则用户会看到
+# <｜DSML｜tool_calls> 之类的协议文本。
+from providers.dsml import StreamFilter as _DSMLStreamFilter
 from ..attachments import prepare_messages_for_llm
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
 from .tool_format import build_llm_messages, sanitize_control_tool_history
 from ..hooks import HookContext, hook_registry
+from .history_budget import bound_tool_history, get_history_tool_budget
 # Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
 # 在 while True 循环前发射 llm.call.start，在 return resp 前发射 llm.call.end，
 # 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
@@ -25,6 +31,8 @@ from engine.signals.types import make_span_id
 # ---------------------------------------------------------------------------
 #  可重试状态码
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
@@ -170,6 +178,25 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
+    # [2026-10-19] Why: per-tool truncation bounds one result, but history still
+    # accumulates dozens of large tool outputs and every request resends them all,
+    # eventually overflowing the upstream request body (surfaces as
+    # MALFORMED_RESPONSE, often mislabelled as a safety filter by proxies).
+    # How: apply a shared budget across historical tool results, keeping the most
+    # recent ones intact and compressing older ones to a short head fragment.
+    # Purpose: keep every request bounded without deleting messages, so
+    # assistant.tool_calls / role=tool pairing stays valid.
+    _formatted, _budget_stats = bound_tool_history(
+        _formatted, total_budget=get_history_tool_budget(ls.runtime_cfg)
+    )
+    if _budget_stats.get("compressed_count"):
+        log.info(
+            "tool history bounded: %d results compressed, %d -> %d chars (budget %d)",
+            _budget_stats["compressed_count"],
+            _budget_stats["before_chars"],
+            _budget_stats["after_chars"],
+            _budget_stats["budget"],
+        )
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
 
     # [AutoC 2026-08-24] before_llm_call：请求级消息变换点。
@@ -223,6 +250,14 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
         if ls.use_stream:
             text_buf = _StreamBuffer(ls.rctx, ls.node.id, "text", request_id=request_id)
             think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking", request_id=request_id)
+            _dsml_filter = _DSMLStreamFilter()
+
+            async def _on_text_filtered(chunk: str) -> None:
+                """把 DSML 标记从实时文本流里剔除后再交给缓冲区。"""
+                kept = _dsml_filter.push(chunk)
+                if kept:
+                    await text_buf.push(kept)
+
 
             async def _emit_tool_delta(payload: dict[str, Any]) -> None:
                 # [tool-stream 2026-05-19] 将 provider 的工具调用增量接入 RunContext 事件流。
@@ -248,7 +283,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 ls.provider.chat_stream(
                     messages=llm_messages,
                     tools=tools_arg,
-                    on_text=text_buf.push,
+                    on_text=_on_text_filtered,
                     on_thinking=think_buf.push,
                     on_tool_delta=_emit_tool_delta,
                 )
@@ -324,6 +359,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                                 return None
                         else:
                             ls.preempt_after_step = True
+            tail = _dsml_filter.finish()
+            if tail:
+                await text_buf.push(tail)
             await text_buf.flush()
             await think_buf.flush()
             # [thinking-time 2026-06-01] Record precise reasoning timing on LoopState.
