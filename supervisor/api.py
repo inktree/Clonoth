@@ -2712,6 +2712,14 @@ def create_app(
     from starlette.responses import RedirectResponse as _RR
 
     # [2026-05-16] Web chat frontend
+    _display_host = os.getenv("CLONOTH_HOST", "127.0.0.1")
+    _port_file_path = state.workspace_root / "data" / "supervisor.port"
+    _display_port = os.getenv("CLONOTH_PORT", "8765")
+    if _port_file_path.is_file():
+        _port_text = _port_file_path.read_text(encoding="utf-8").strip()
+        if _port_text:
+            _display_port = _port_text
+
     web_dist = state.workspace_root / "adapters" / "web" / "frontend" / "dist"
     web_mounted = False
     if web_dist.is_dir():
@@ -2724,7 +2732,7 @@ def create_app(
 
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
         web_mounted = True
-        print(f"[web] 前端地址: http://{{host}}:{{port}}/web/", flush=True)
+        print(f"[web] 前端地址: http://{_display_host}:{_display_port}/web/", flush=True)
 
     # Legacy admin assets are optional. If adapters/admin is absent, keep /admin
     # as a stable entry point by redirecting it to the current web frontend.
@@ -2735,7 +2743,7 @@ def create_app(
             return _RR("./admin/")
 
         app.mount("/admin", StaticFiles(directory=str(admin_dir), html=True), name="admin")
-        print(f"[admin] 管理界面地址: http://{{host}}:{{port}}/admin/", flush=True)
+        print(f"[admin] 管理界面地址: http://{_display_host}:{_display_port}/admin/", flush=True)
     elif web_mounted:
         @app.get("/admin")
         @app.get("/admin/")

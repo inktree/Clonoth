@@ -50,6 +50,8 @@ def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
             [npm, "run", "build"],
             cwd=str(frontend_dir),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=300,
@@ -253,6 +255,8 @@ def main() -> None:
     _admin_token_file.write_text(get_admin_token(), encoding="utf-8")
     _log(f"[supervisor] initialized admin token file before worker startup: {_admin_token_file}")
 
+    _ensure_web_frontend(workspace_root, _log)
+
     process_manager: ProcessManager | None = None
     if not args.no_workers:
         process_manager = ProcessManager(
@@ -347,7 +351,6 @@ def main() -> None:
 
     threading.Thread(target=_reap_zombie_tasks, daemon=True, name="zombie-reaper").start()
 
-    _ensure_web_frontend(workspace_root, _log)
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
@@ -403,6 +406,8 @@ def main() -> None:
     asyncio.set_event_loop(_loop)
     try:
         _loop.run_until_complete(_uvi_server.serve())
+    except KeyboardInterrupt:
+        _log("[supervisor] interrupted by user")
     finally:
         _loop.close()
 

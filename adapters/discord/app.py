@@ -25,6 +25,8 @@ import yaml
 # [2026-05-14 refactor note] Keep the repository root on sys.path when app.py is
 # imported through the compatibility shim or directly during deployment checks.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if not __package__:
+    __package__ = "adapters.discord"
 from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState  # noqa: E402
 
 from .agent import ApprovalView, BotRestartConfirmView, _start_bridge, handle_agent, handle_model_command

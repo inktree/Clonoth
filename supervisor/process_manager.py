@@ -250,7 +250,7 @@ class ProcessManager:
             extra_env["DISCORD_PROXY"] = self.discord_proxy
         self.discord_adapter = self._spawn(
             name="discord-adapter",
-            script_path=self.workspace_root / "adapters" / "discord" / "app.py",
+            module="adapters.discord.app",
             capture_output=True,
             new_console=False,
             pass_supervisor_arg=False,
@@ -262,7 +262,7 @@ class ProcessManager:
             return
         self.onebot_adapter = self._spawn(
             name="onebot-adapter",
-            script_path=self.workspace_root / "adapters" / "onebot" / "app.py",
+            module="adapters.onebot.app",
             capture_output=True,
             new_console=False,
             pass_supervisor_arg=False,
@@ -294,7 +294,7 @@ class ProcessManager:
             return
         self.napcat = self._spawn(
             name="napcat",
-            script_path=self.workspace_root / "adapters" / "onebot" / "napcat_manager.py",
+            module="adapters.onebot.napcat_manager",
             extra_args=[
                 "start",
                 "--reverse-host", self.onebot_host,

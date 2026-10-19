@@ -68,7 +68,10 @@ def _ensure_port_free(port: int, max_wait: int = 5) -> None:
 
 def main() -> None:
     while True:
-        result = subprocess.call([sys.executable, "-B", "-m", "supervisor.main", *sys.argv[1:]])
+        try:
+            result = subprocess.call([sys.executable, "-B", "-m", "supervisor.main", *sys.argv[1:]])
+        except KeyboardInterrupt:
+            sys.exit(0)
         if result == RESTART_EXIT_CODE:
             port = _read_port_file()
             print(f"[launcher] supervisor exited with code {RESTART_EXIT_CODE}, ensuring port {port} is free...", flush=True)
