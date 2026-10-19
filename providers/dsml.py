@@ -28,7 +28,7 @@ import re
 import uuid
 from typing import Any
 
-_DSML = r"[｜|]\s*DSML\s*[｜|]"
+_DSML = r"[｜|]+\s*DSML\s*[｜|]+"
 _BLOCK_NAMES = r"(?:tool_calls|calls|toolcalls|tool)"
 
 _OPEN_RE = re.compile(
@@ -148,6 +148,8 @@ def strip_blocks(text: str) -> str:
         return text
     cleaned = _BLOCK_RE.sub("", text)
     cleaned = _UNCLOSED_BLOCK_RE.sub("", cleaned)
+    cleaned = _INVOKE_RE.sub("", cleaned)
+    cleaned = _PARAM_RE.sub("", cleaned)
     cleaned = _ANY_TAG_RE.sub("", cleaned)
     return cleaned.strip()
 

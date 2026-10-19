@@ -56,7 +56,12 @@ class PlaintextRetryHandler:
                 context_ref=ctx_ref,
             ))
 
-        if getattr(ls.node, "output_mode", "tool_only") == "hybrid":
+        has_broken_tool_markup = (
+            "<<<TOOL_CALL>>>" in text
+            or "<<<END_TOOL_CALL>>>" in text
+            or "DSML" in text
+        )
+        if getattr(ls.node, "output_mode", "tool_only") == "hybrid" and not has_broken_tool_markup:
             return hook_result(action=_build_implicit_finish(ctx, ls, resp, text))
 
         ls.plaintext_retry_count += 1

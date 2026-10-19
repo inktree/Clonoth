@@ -23,6 +23,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from .base import BaseProvider, ProviderResponse, ToolCall
+from . import dsml as _dsml
 from .openai import OpenAIProvider, _normalize_base_url, _extract_usage, _extract_openai_error_message, _parse_first_json_object
 
 log = logging.getLogger(__name__)
@@ -271,6 +272,15 @@ class DeepSeekProvider(OpenAIProvider):
                             args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
 
+                if not tool_calls and text and "DSML" in text:
+                    clean_text, dsml_calls = _dsml.parse_tool_calls(text)
+                    if dsml_calls:
+                        text = clean_text or None
+                        tool_calls = [
+                            ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                            for c in dsml_calls
+                        ]
+
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
                     reasoning=reasoning_text, status_code=status, usage=stream_usage,
@@ -335,6 +345,15 @@ class DeepSeekProvider(OpenAIProvider):
                             fallback = _parse_first_json_object(raw_args)
                             args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc.get("id", ""), name=name, arguments=args))
+
+            if not tool_calls and isinstance(text, str) and "DSML" in text:
+                clean_text, dsml_calls = _dsml.parse_tool_calls(text)
+                if dsml_calls:
+                    text = clean_text or None
+                    tool_calls = [
+                        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                        for c in dsml_calls
+                    ]
 
             usage = _extract_usage(data)
 

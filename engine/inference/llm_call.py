@@ -250,13 +250,17 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
         if ls.use_stream:
             text_buf = _StreamBuffer(ls.rctx, ls.node.id, "text", request_id=request_id)
             think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking", request_id=request_id)
-            _dsml_filter = _DSMLStreamFilter()
+            _is_deepseek = getattr(ls.provider, "name", "") == "deepseek"
+            _dsml_filter = _DSMLStreamFilter() if _is_deepseek else None
 
             async def _on_text_filtered(chunk: str) -> None:
-                """把 DSML 标记从实时文本流里剔除后再交给缓冲区。"""
-                kept = _dsml_filter.push(chunk)
-                if kept:
-                    await text_buf.push(kept)
+                """把 DSML 标记从实时文本流里剔除后再交给缓冲区（仅对 DeepSeek 启用）。"""
+                if _dsml_filter is not None:
+                    kept = _dsml_filter.push(chunk)
+                    if kept:
+                        await text_buf.push(kept)
+                else:
+                    await text_buf.push(chunk)
 
 
             async def _emit_tool_delta(payload: dict[str, Any]) -> None:
@@ -359,9 +363,10 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                                 return None
                         else:
                             ls.preempt_after_step = True
-            tail = _dsml_filter.finish()
-            if tail:
-                await text_buf.push(tail)
+            if _dsml_filter is not None:
+                tail = _dsml_filter.finish()
+                if tail:
+                    await text_buf.push(tail)
             await text_buf.flush()
             await think_buf.flush()
             # [thinking-time 2026-06-01] Record precise reasoning timing on LoopState.

@@ -586,6 +586,16 @@ class JsonToolFormatter(ToolFormatter):
                         arguments=arguments,
                     ))
 
+        # 回退：DeepSeek 在 json 工具模式下仍可能直接输出原生 DSML 工具块
+        if not calls and "DSML" in response.text:
+            _clean, _dsml_calls = _dsml.parse_tool_calls(response.text)
+            for c in _dsml_calls:
+                calls.append(ParsedToolCall(
+                    id=f"jt_{uuid.uuid4().hex[:8]}",
+                    name=str(c["name"]),
+                    arguments=dict(c.get("arguments") or {}),
+                ))
+
         # 自由正文不合成为 reply：正文保留在 build_assistant_message 存储的
         # assistant 消息 content 中，LLM 下轮可见，用户不可见。
         # 原 Fix 2 在此处把正文合成为 reply tool_call 追加到 calls 尾部，
@@ -1203,5 +1213,7 @@ def build_llm_messages(
         # json 文本格式，而不是原样保留 role=tool + tool_calls 结构。
         # 各 formatter 的 message_to_llm 已有跨模式兼容逻辑（如 json/fake-native
         # 都能将 role=tool 转为 user 文本）。
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), str) and "DSML" in msg["content"]:
+            msg = {**msg, "content": _dsml.strip_blocks(msg["content"])}
         result.append(current_formatter.message_to_llm(msg))
     return result
