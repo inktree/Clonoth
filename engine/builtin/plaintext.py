@@ -90,15 +90,17 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
     provider_name = getattr(ls.provider, "name", "") or "unknown"
+    provider_meta = getattr(resp, "provider_meta", None)
+    reasoning_text = getattr(resp, "reasoning", None) or ""
     implicit_meta = MessageMeta(
         provider=provider_name,
         tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        metadata={},
+        metadata={provider_name: provider_meta} if provider_meta else {},
         tool_call_ids=[],
-        reasoning="",
-        has_reasoning=False,
+        reasoning=reasoning_text,
+        has_reasoning=bool(reasoning_text),
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(assistant_msg, implicit_meta)

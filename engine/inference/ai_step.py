@@ -1167,6 +1167,8 @@ async def run_ai_node(
                     reasoning=resp.reasoning,
                     status_code=resp.status_code,
                     usage=resp.usage,
+                    inline_data=resp.inline_data,
+                    provider_meta=resp.provider_meta,
                 )
                 # [stream-clean 2026-05-31] Why: JSON tool mode mixes protocol
                 # markers (<<<TOOL_CALL>>>) into stream_delta output. The markers

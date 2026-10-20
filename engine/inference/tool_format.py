@@ -233,6 +233,9 @@ class NativeToolFormatter(ToolFormatter):
         API:  {id, type: "function", function: {name, arguments: "<json>"}}
         """
         clean = {k: v for k, v in message_dict.items() if not k.startswith('_')}
+        meta = message_dict.get('_meta')
+        if isinstance(meta, dict) and meta.get('metadata'):
+            clean['_meta'] = {'metadata': meta['metadata']}
         # 将简化存储格式的 tool_calls 转换回 API 原生格式
         if 'tool_calls' in clean and isinstance(clean['tool_calls'], list):
             api_calls = []
@@ -342,6 +345,9 @@ class FakeNativeToolFormatter(ToolFormatter):
 
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
+        meta = message_dict.get('_meta')
+        if isinstance(meta, dict) and meta.get('metadata'):
+            clean['_meta'] = {'metadata': meta['metadata']}
 
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
@@ -426,6 +432,17 @@ class JsonToolFormatter(ToolFormatter):
         if not tools:
             return system_prompt, None
 
+        has_finish_tool = any(
+            ((t.get("function") or t).get("name") == "finish")
+            for t in tools
+            if isinstance(t, dict)
+        )
+        finish_rule = (
+            "5. 完成任务时，必须调用 finish 工具提交最终结果"
+            if has_finish_tool
+            else "5. 完成所有工具调用后，直接输出最终回复正文即可（无需调用 finish 工具）"
+        )
+
         lines: list[str] = [
             "",
             "",
@@ -442,8 +459,8 @@ class JsonToolFormatter(ToolFormatter):
             "2. JSON 必须合法，name 是工具名称，arguments 是参数对象",
             "3. 可以在一条回复中调用多个工具，每个用独立的边界标记包裹",
             "4. 可以在工具调用前后附带文字说明",
-            "5. 完成任务时，必须调用 finish 工具提交最终结果",
-            "6. 发送中间进度时，使用 reply 工具",
+            finish_rule,
+            "6. 发送中间进度时，使用 intermediate_reply 工具",
             "",
             "## 可用工具",
             "",
