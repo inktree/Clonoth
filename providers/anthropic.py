@@ -400,8 +400,11 @@ class AnthropicProvider(BaseProvider):
         super().__init__(model=model, name=self.provider_name)
         self._http = http
         self._api_key = api_key
-        # Default to official Anthropic API; strip trailing slash
-        self._base_url = (base_url or "https://api.anthropic.com").rstrip("/")
+        # Default to official Anthropic API; strip trailing slash and redundant /v1 suffix
+        base = (base_url or "https://api.anthropic.com").strip().rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-len("/v1")].rstrip("/")
+        self._base_url = base
         self._options = provider_options or {}
 
     # -- Auth headers --

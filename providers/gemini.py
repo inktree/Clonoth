@@ -46,7 +46,10 @@ class GeminiProvider(BaseProvider):
         super().__init__(model=model, name=self.provider_name)
         self._http = http
         self._api_key = api_key
-        self._base_url = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+        base = (base_url or "https://generativelanguage.googleapis.com").strip().rstrip("/")
+        if base.endswith("/v1beta"):
+            base = base[:-len("/v1beta")].rstrip("/")
+        self._base_url = base
         self._options = provider_options or {}
 
     # ── URL helpers ──────────────────────────────────────────────────
