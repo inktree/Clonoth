@@ -65,6 +65,7 @@ class LocalOnnxTts:
 
     def _release_if_idle(self) -> None:
         released: Any | None = None
+        released_g2pw: Any | None = None
         with self._engine_lock:
             self._idle_timer = None
             if self._engine is None:
@@ -77,9 +78,14 @@ class LocalOnnxTts:
                 return
             released = self._engine
             self._engine = None
+            for mod_name in ("frontend.chinese2", "hf_space_v2proplus_onnx.frontend.chinese2"):
+                ch2 = sys.modules.get(mod_name)
+                if ch2 is not None and getattr(ch2, "g2pw", None) is not None:
+                    released_g2pw = ch2.g2pw
+                    ch2.g2pw = None
         # Drop the last reference outside the lock, then force a collection so
         # the ORT sessions (and their CUDA arenas) are actually reclaimed.
-        del released
+        del released, released_g2pw
         gc.collect()
 
     def _providers(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -127,6 +133,17 @@ class LocalOnnxTts:
             if package_text not in sys.path:
                 sys.path.insert(0, package_text)
             runtime_module = importlib.import_module("runtime")
+            for mod_name in ("frontend.chinese2", "hf_space_v2proplus_onnx.frontend.chinese2"):
+                ch2 = sys.modules.get(mod_name)
+                if ch2 is not None and getattr(ch2, "is_g2pw", False) and getattr(ch2, "g2pw", None) is None:
+                    g2pw_cls = getattr(ch2, "G2PWPinyin")
+                    ch_dir = os.path.dirname(ch2.__file__)
+                    ch2.g2pw = g2pw_cls(
+                        model_dir=os.path.join(ch_dir, "G2PWModel"),
+                        model_source=os.path.join(ch_dir, "bert_tokenizer"),
+                        v_to_u=False,
+                        neutral_tone_with_five=True,
+                    )
             engine_class = getattr(runtime_module, "OnnxSynthesisEngine")
             model_providers, decoder_providers = self._providers()
             self.output_dir.mkdir(parents=True, exist_ok=True)
