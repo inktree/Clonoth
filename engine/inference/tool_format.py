@@ -702,6 +702,9 @@ class JsonToolFormatter(ToolFormatter):
 
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
+        meta = message_dict.get('_meta')
+        if isinstance(meta, dict) and meta.get('metadata'):
+            clean['_meta'] = {'metadata': meta['metadata']}
 
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
