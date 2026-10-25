@@ -420,21 +420,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
 
         assert resp is not None
 
-        # ---- 提取 token usage ----
-        if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
-            ls.last_prompt_tokens = resp.usage["prompt_tokens"]
-            ls.last_usage = dict(resp.usage)
-            ls.compacted = False
-            await ls.rctx.emit_event("context_usage", {
-                "node_id": ls.node.id,
-                "task_id": ls.rctx.task_id,
-                # [AutoC 2026-08-24] 附带 provider 名：前端消息卡片的元信息按钮
-                # 需要实时显示渠道，历史路径有 JSONL 的 provider 字段，实时路径
-                # 此前缺失。
-                "provider": getattr(ls.provider, "name", "") or "",
-                "usage": resp.usage,
-            })
-
         # ---- 重试判定 ----
         _retry_reason = ""
         if not resp.ok and _is_retryable_error(resp):
@@ -534,6 +519,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # Phase 1: Signal — 循环结束，发射 llm.call.end 信号
     # 此时 resp 可能是成功响应，也可能是不可重试的失败响应
     _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
+    resp.provider_meta["_elapsed_ms"] = _elapsed
     _end_payload = {**_sig_payload, "elapsed_ms": _elapsed, "attempt": _retry_attempt + 1, "ok": resp.ok}
     if not resp.ok:
         _end_payload["error"] = resp.error or "unknown"

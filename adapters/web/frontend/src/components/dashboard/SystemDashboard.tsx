@@ -5,9 +5,10 @@
 // Purpose: users can see system health without losing chat context.
 import { useEffect, useMemo, useState } from 'react';
 
-import { checkHealth, getAdminState, type AdminState, type HealthState } from '../../api/supervisorClient';
+import { checkHealth, getAdminState, getUsageStats, type UsageSummary, type AdminState, type HealthState } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
+import { useViewStore } from '../../store/viewStore';
 
 interface DashboardData {
   adminState: AdminState | null;
@@ -81,6 +82,39 @@ const Stat = ({ label, value, detail }: { label: string; value: string | number;
     {detail && <p className="mt-0.5 truncate text-[0.65rem] text-[var(--duties-secondary)]">{detail}</p>}
   </div>
 );
+
+function TodayUsageCard({ adminToken }: { adminToken: string | null }) {
+  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (!adminToken) return;
+    let cancelled = false;
+    const load = () => getUsageStats('today')
+      .then(data => { if (!cancelled) { setSummary(data.summary); setError(''); } })
+      .catch((cause: Error) => { if (!cancelled) setError(cause.message); });
+    void load();
+    const timer = setInterval(load, 60000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [adminToken]);
+
+  return <div className="mt-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5">
+    <div className="flex items-center justify-between gap-2">
+      <h3 className="font-mono text-xs font-semibold">今日用量</h3>
+      <button type="button" className="font-mono text-[0.65rem] text-[var(--duties-secondary)] hover:text-[var(--duties-text)]" onClick={() => useViewStore.getState().openSettings('usage')}>查看详情 →</button>
+    </div>
+    {!adminToken ? <p className="mt-2 text-[0.65rem] text-[var(--duties-secondary)]">请先登录 Admin Token</p> : <>
+      {error && <p role="status" className="mt-2 text-[0.65rem] text-amber-500">用量加载失败：{error}</p>}
+      {summary ? <>
+        <p className="mt-3 font-mono text-xl font-semibold text-emerald-500">${summary.total_cost_usd.toFixed(4)}</p>
+        <div className="mt-2 grid grid-cols-2 gap-2 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+          <p>请求 <span className="text-[var(--duties-text)]">{summary.request_count.toLocaleString()}</span></p>
+          <p>命中 <span className="text-[var(--duties-text)]">{(summary.cache_hit_rate * 100).toFixed(1)}%</span></p>
+          <p className="col-span-2">Token <span className="text-[var(--duties-text)]">{summary.total_tokens.toLocaleString()}</span></p>
+        </div>
+      </> : !error && <p className="mt-2 font-mono text-[0.65rem] text-[var(--duties-tertiary)]">加载中…</p>}
+    </>}
+  </div>;
+}
 
 export const SystemDashboard = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
@@ -162,6 +196,7 @@ export const SystemDashboard = () => {
         <p className="mt-1 text-[0.65rem] leading-4 text-[var(--duties-secondary)]">{engine.detail}</p>
       </div>
 
+      <TodayUsageCard key={adminToken} adminToken={adminToken} />
     </section>
   );
 };

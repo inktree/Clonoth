@@ -99,6 +99,9 @@ def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
         cached = details.get("cached_tokens")
         if isinstance(cached, int) and cached > 0:
             result["cached_prompt_tokens"] = cached
+    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    if isinstance(reasoning, int) and reasoning > 0:
+        result["reasoning_tokens"] = reasoning
     return result
 
 

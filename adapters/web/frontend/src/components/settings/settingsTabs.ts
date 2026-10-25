@@ -15,6 +15,7 @@ import { AgentsSettingsPage } from './pages/AgentsSettingsPage';
 import { ApprovalsSettingsPage } from './pages/ApprovalsSettingsPage';
 import { AutomationSettingsPage } from './pages/AutomationSettingsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
+import { UsageSettingsPage } from './pages/UsageSettingsPage';
 import { ToolsSettingsPage } from './pages/ToolsSettingsPage';
 import {
   AgentsSettingsRightPanel,
@@ -59,6 +60,7 @@ export const settingsTabs: SettingsTabDefinition[] = [
   // config are independent settings domains. How: add each page with a Material
   // Symbol icon, explicit order, and contextual right panel. Purpose: future settings
   // navigation remains data-driven through this one registry.
+  { id: 'usage', label: '用量', icon: 'monitoring', order: 3.5, Page: UsageSettingsPage },
   { id: 'system', label: '系统', icon: 'settings_power', order: 4, Page: SystemSettingsPage },
   { id: 'approvals', label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage },
   { id: 'agents', label: '节点', icon: 'smart_toy', order: 6, Page: AgentsSettingsPage, RightPanel: AgentsSettingsRightPanel },

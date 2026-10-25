@@ -15,7 +15,7 @@ PLUGIN_META = {
     "hook_points": [
         ("after_llm_call", "handle"),
     ],
-    "priority": 0,
+    "priority": -30,
 }
 
 
@@ -23,7 +23,7 @@ class UsageTracker:
     """Accumulate provider token usage after each LLM call."""
 
     name = "usage_tracker"
-    priority = 0
+    priority = -30
 
     async def handle(self, ctx: Any) -> Any | None:
         """Move response.usage into RunContext.total_usage.
@@ -38,7 +38,10 @@ class UsageTracker:
             return None
 
         modified = False
-        for usage_key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        for usage_key in (
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            "cached_prompt_tokens", "cache_write_prompt_tokens", "reasoning_tokens",
+        ):
             if usage_key in usage:
                 ctx.rctx.total_usage[usage_key] = ctx.rctx.total_usage.get(usage_key, 0) + usage[usage_key]
                 modified = True

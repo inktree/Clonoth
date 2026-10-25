@@ -379,6 +379,35 @@ def create_app(
             uptime_seconds=uptime,
         )
 
+    @app.get("/v1/admin/usage/stats")
+    async def usage_stats(
+        request: Request,
+        range: str = Query("today", pattern="^(today|7d|30d|all)$"),
+        tz_offset: int = Query(480, ge=-1439, le=1439),
+    ) -> dict[str, Any]:
+        verify_admin_token(request)
+        return app.state.state.usage_store.get_stats(range, tz_offset)
+
+    @app.get("/v1/admin/usage/pricing")
+    async def usage_pricing(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        return app.state.state.usage_store.get_pricing()
+
+    @app.post("/v1/admin/usage/pricing")
+    async def update_usage_pricing(request: Request, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        verify_admin_token(request)
+        store = app.state.state.usage_store
+        try:
+            if "overrides" in body:
+                store.replace_overrides(body["overrides"])
+            elif "model" in body and "pricing" in body:
+                store.set_pricing(body["model"], body["pricing"])
+            else:
+                raise ValueError("provide model and pricing, or overrides")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return store.get_pricing()
+
     @app.get("/v1/config", response_model=AppConfigPublic)
     async def get_config() -> AppConfigPublic:
         cs: ConfigStore = app.state.config_store

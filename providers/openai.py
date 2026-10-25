@@ -90,6 +90,13 @@ def _extract_usage(data: Any) -> dict[str, int] | None:
     cache_hit = usage.get("prompt_cache_hit_tokens")
     if isinstance(cache_hit, int) and cache_hit > 0:
         result["cached_prompt_tokens"] = cache_hit
+    cache_write = usage.get("cache_creation_input_tokens") or (details or {}).get("cache_creation_tokens")
+    if isinstance(cache_write, int) and cache_write > 0:
+        result["cache_write_prompt_tokens"] = cache_write
+    comp_details = usage.get("completion_tokens_details") or {}
+    reasoning = comp_details.get("reasoning_tokens") or usage.get("reasoning_tokens")
+    if isinstance(reasoning, int) and reasoning > 0:
+        result["reasoning_tokens"] = reasoning
     return result if result else None
 
 

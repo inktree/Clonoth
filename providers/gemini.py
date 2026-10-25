@@ -603,11 +603,15 @@ def _parse_usage(um: dict[str, Any]) -> dict[str, int]:
     [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部字段 cached_prompt_tokens。
     Gemini 的 cachedContentTokenCount 归一化到该字段。
     """
+    thoughts = um.get("thoughtsTokenCount")
+    reasoning = thoughts if isinstance(thoughts, int) and thoughts > 0 else 0
     result = {
         "prompt_tokens": um.get("promptTokenCount", 0),
-        "completion_tokens": um.get("candidatesTokenCount", 0),
+        "completion_tokens": um.get("candidatesTokenCount", 0) + reasoning,
         "total_tokens": um.get("totalTokenCount", 0),
     }
+    if reasoning:
+        result["reasoning_tokens"] = reasoning
     cached = um.get("cachedContentTokenCount")
     if isinstance(cached, int) and cached > 0:
         result["cached_prompt_tokens"] = cached

@@ -1148,6 +1148,21 @@ async def run_ai_node(
         if _usage_ctx.response is not resp:
             resp = _usage_ctx.response
 
+        if resp.ok and resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
+            ls.last_prompt_tokens = resp.usage["prompt_tokens"]
+            ls.last_usage = dict(resp.usage)
+            ls.compacted = False
+            _p_meta = resp.provider_meta or {}
+            await ls.rctx.emit_event("context_usage", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "provider": _p_meta.get("_fallback_provider") or getattr(ls.provider, "name", "") or "",
+                "model": _p_meta.get("_fallback_model") or getattr(ls.provider, "model", "") or "",
+                "elapsed_ms": _p_meta.get("_elapsed_ms", 0.0),
+                "step": step,
+                "usage": resp.usage,
+            })
+
         if not resp.ok:
             return _build_failure_action(ls, resp, step)
 

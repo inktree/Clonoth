@@ -351,18 +351,18 @@ def _parse_usage(data: dict) -> dict:
     cached_prompt_tokens 和 cache_write_prompt_tokens。
     """
     usage = data.get("usage", {})
-    inp = usage.get("input_tokens", 0)
-    out = usage.get("output_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens") or 0
+    cache_write = usage.get("cache_creation_input_tokens") or 0
+    inp = (usage.get("input_tokens") or 0) + cache_read + cache_write
+    out = usage.get("output_tokens") or 0
     result = {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": inp + out,
     }
-    cache_read = usage.get("cache_read_input_tokens")
-    if isinstance(cache_read, int) and cache_read > 0:
+    if cache_read > 0:
         result["cached_prompt_tokens"] = cache_read
-    cache_write = usage.get("cache_creation_input_tokens")
-    if isinstance(cache_write, int) and cache_write > 0:
+    if cache_write > 0:
         result["cache_write_prompt_tokens"] = cache_write
     return result
 
@@ -723,13 +723,7 @@ class AnthropicProvider(BaseProvider):
             return ProviderResponse(ok=False, error=str(exc), status_code=0)
 
         # Build final usage combining message_start and message_delta
-        inp_tokens = input_usage.get("input_tokens", 0)
-        out_tokens = usage.get("output_tokens", 0)
-        final_usage = {
-            "prompt_tokens": inp_tokens,
-            "completion_tokens": out_tokens,
-            "total_tokens": inp_tokens + out_tokens,
-        }
+        final_usage = _parse_usage({"usage": {**input_usage, **usage}})
 
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts)

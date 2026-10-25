@@ -300,6 +300,11 @@ class FallbackProviderHandler:
                         i, elapsed, fb_base_url[:40], fb_model,
                     )
                     # Overwrite ctx.response so ai_step uses the new response
+                    new_resp.provider_meta.update({
+                        "_fallback_provider": fb_provider.name,
+                        "_fallback_model": fb_provider.model,
+                        "_elapsed_ms": elapsed,
+                    })
                     ctx.response = new_resp
 
                     # Emit signal if bus is available

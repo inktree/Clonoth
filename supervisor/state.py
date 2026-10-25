@@ -21,6 +21,7 @@ from engine.hooks import HookRegistry
 from .policy import PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore
+from .usage_store import UsageStore
 from .task_router import TaskRouterMixin
 from .task_store import TaskStoreMixin
 from .types import (
@@ -40,6 +41,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def __init__(self, *, workspace_root: Path, eventlog: EventLog, policy: PolicyEngine) -> None:
         self.workspace_root = workspace_root
+        self.usage_store = UsageStore(workspace_root / "data" / "usage.db")
         self.eventlog = eventlog
         self.policy = policy
         self.started_at = _now()

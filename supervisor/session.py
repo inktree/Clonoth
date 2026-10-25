@@ -1321,6 +1321,7 @@ class SessionMixin:
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         if not session_id or not usage:
             return
+        self.usage_store.record(session_id, payload)
         node_id = str(payload.get("node_id") or "")
         cache_key = (session_id, node_id)
         with self._lock:

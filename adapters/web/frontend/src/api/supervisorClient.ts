@@ -3,6 +3,133 @@ import type { NodeDef, SupervisorEvent } from '../types';
 
 const API = '/v1';
 
+export type UsageRange = 'today' | '7d' | '30d' | 'all';
+
+export interface UsageSummary {
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_write_prompt_tokens: number;
+  reasoning_tokens: number;
+  cache_hit_rate: number;
+  avg_elapsed_ms: number;
+  avg_tps: number;
+  total_cost_usd: number;
+}
+
+export interface UsageTimeseriesPoint {
+  bucket: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_prompt_tokens: number;
+  cache_write_prompt_tokens: number;
+  reasoning_tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageModelPricing {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  is_override?: boolean;
+  matched_key?: string;
+}
+
+export interface UsageByProviderRow {
+  provider: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_write_prompt_tokens: number;
+  reasoning_tokens: number;
+  cache_hit_rate: number;
+  cost_usd: number;
+}
+
+export interface UsageByModelRow extends UsageByProviderRow {
+  model: string;
+  avg_elapsed_ms: number;
+  avg_tps: number;
+  pricing?: UsageModelPricing;
+}
+
+export interface UsageByNodeRow {
+  node_id: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_prompt_tokens: number;
+  reasoning_tokens: number;
+  cache_hit_rate: number;
+  cost_usd: number;
+}
+
+export interface UsageLogRow {
+  id: number;
+  ts: number;
+  created_at: string;
+  session_id: string;
+  task_id: string;
+  node_id: string;
+  is_system_task: boolean;
+  provider: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_prompt_tokens: number;
+  cache_write_prompt_tokens: number;
+  reasoning_tokens: number;
+  elapsed_ms: number;
+  tps: number;
+  cost_usd: number;
+}
+
+export interface UsageStatsResponse {
+  ok: boolean;
+  range: UsageRange;
+  summary: UsageSummary;
+  timeseries: UsageTimeseriesPoint[];
+  by_model: UsageByModelRow[];
+  by_provider: UsageByProviderRow[];
+  by_node: UsageByNodeRow[];
+  recent: UsageLogRow[];
+}
+
+export interface UsagePricingResponse {
+  ok: boolean;
+  defaults: Record<string, UsageModelPricing>;
+  overrides: Record<string, UsageModelPricing>;
+  effective: Record<string, UsageModelPricing>;
+}
+
+export async function getUsageStats(range: UsageRange = '7d'): Promise<UsageStatsResponse> {
+  const params = new URLSearchParams({ range, tz_offset: String(-new Date().getTimezoneOffset()) });
+  return (await apiFetch(`/admin/usage/stats?${params}`)).json();
+}
+
+export async function getUsagePricing(): Promise<UsagePricingResponse> {
+  return (await apiFetch('/admin/usage/pricing')).json();
+}
+
+export async function updateModelPricing(
+  model: string,
+  pricing: Pick<UsageModelPricing, 'input' | 'output' | 'cache_read' | 'cache_write'> | null,
+): Promise<UsagePricingResponse> {
+  return (await apiFetch('/admin/usage/pricing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, pricing }),
+  })).json();
+}
+
 // ── Helper ──
 
 /**

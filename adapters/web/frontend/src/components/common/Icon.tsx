@@ -96,7 +96,14 @@ import { LockOpenW400 } from '@material-symbols-svg/react/icons/lock-open';
 
 type SvgIcon = ComponentType<SVGProps<SVGSVGElement>>;
 
+const MonitoringIcon: SvgIcon = (props) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" {...props}>
+    <path d="M3 3v18h18M7 17v-5m5 5V8m5 9V4" />
+  </svg>
+);
+
 const ICON_MAP: Record<string, SvgIcon> = {
+  monitoring: MonitoringIcon,
   approval: ApprovalW400,
   arrow_back: ArrowBackW400,
   attach_file: AttachFileW400,

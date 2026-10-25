@@ -178,6 +178,7 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
     // Purpose: 自包含面板拿到全部主区宽度，内置页签的双栏结构不变。
     rightTop: () => {
       const active = useViewStore.getState().activeSettingsTab;
+      if (active === 'usage') return null;
       if (typeof active === 'string' && active.startsWith('plugin:')) {
         // [AutoC 2026-08-28] 插件页右栏常驻，与内置页签一致。Why: 用户明确
         // 要求插件设置页的布局与内置页签没有区别——右栏始终存在，未选中
