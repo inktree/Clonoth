@@ -27,6 +27,7 @@ RESERVED_TOOL_NAMES = {
     "apply_diff",
     "write_file",
     "execute_command",
+    "grep",
     "search_in_files",
     "create_or_update_skill",
     "list_skills",
@@ -40,8 +41,15 @@ RESERVED_TOOL_NAMES = {
     "save_memory",
     "list_memories",
     "delete_memory",
+    "cancel_active_tasks",
     "get_context_window",
     "set_workspace",
+    "create_or_update_mcp_client",
+    "list_mcp_clients",
+    "delete_mcp_client",
+    "create_agent",
+    "read_todos",
+    "update_todos",
 }
 
 # Convenience alias used by supervisor/admin_api.py

@@ -420,6 +420,10 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
         return None
 
     try:
+        raw_size = p.stat().st_size
+        if raw_size > 25 * 1024 * 1024:
+            _logger.warning("attachment file too large before read (%d bytes), skipping: %s", raw_size, rel_path)
+            return None
         data = p.read_bytes()
     except Exception:
         return None

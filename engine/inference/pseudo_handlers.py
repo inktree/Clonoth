@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import mimetypes as _mimetypes
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -119,10 +120,12 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # intermediate_reply: 非终止，发送中间消息
     if pseudo_call.name == "intermediate_reply":
         reply_text = str(args.get("text") or "").strip()
-        if reply_text:
-            # 解析附件
-            _reply_att_paths = args.get("attachment_paths") or []
-            _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root)
+        # 解析附件
+        # [AutoC 2026-09-13] 兼容 attachments 别名：模型有时会漏写 schema 里的
+        # attachment_paths 而写成 attachments，旧逻辑会把附件静默丢弃（工具仍返回 ok）。
+        _reply_att_paths = args.get("attachment_paths") or args.get("attachments") or []
+        _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root) if _reply_att_paths else []
+        if reply_text or _reply_atts:
             _reply_payload: dict[str, Any] = {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -131,7 +134,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             if _reply_atts:
                 _reply_payload["attachments"] = _reply_atts
             await ls.rctx.emit_event("intermediate_reply", _reply_payload)
-            _emit_pseudo_tool_result(ls, pseudo_call, "ok")
+        # [fix 2026-10-21] 即使 reply_text 为空也必须写入 tool_result，
+        # 否则 native 模式下 assistant.functionCall 数量大于 functionResponse 数量会导致 400 锁死。
+        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         return None
 
     # compact_context: 非终止，手动压缩
@@ -141,6 +146,21 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # preempt_task: 非终止，软打断子任务
     if pseudo_call.name == "preempt_task":
         return await _handle_pseudo_preempt_task(ls, pseudo_call, args)
+
+    # [AutoC 2026-09-12] spawn_worker: non-terminal anonymous delegation.
+    # Why: this tool has no target encoded in its name and must resolve the built-in
+    # template before dynamic dispatch-name parsing. How: normalize its arguments in
+    # a dedicated handler, then reuse the existing dispatch sender. Purpose: worker
+    # calls retain dispatch event, attachment, fork, and callback behavior.
+    if pseudo_call.name == "spawn_worker":
+        return await _handle_spawn_worker(ls, args, pseudo_call)
+
+    # [AutoC 2026-09-12] manage_workers: non-terminal child-agent control.
+    # Why: it is injected only after active-child discovery and must remain in the
+    # pseudo layer rather than ToolRegistry. How: route all action variants through
+    # one handler. Purpose: list, message, and cancel share session-scoped validation.
+    if pseudo_call.name == "manage_workers":
+        return await _handle_manage_workers(ls, args, pseudo_call)
 
     # [2026-05-04] dispatch:{target_id}: 非终止，固定目标异步委派。
     # Why: dynamic per-target tools remove the target parameter from the schema.
@@ -200,7 +220,8 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         final_atts = []
         if terminal_name == "finish":
-            _selected_paths = args.get("attachment_paths")
+            # [AutoC 2026-09-13] 同 intermediate_reply，兼容 attachments 别名写法。
+            _selected_paths = args.get("attachment_paths") or args.get("attachments")
             if isinstance(_selected_paths, list) and _selected_paths:
                 final_atts = _select_attachments(
                     ls.collected_attachments, _selected_paths,
@@ -441,6 +462,202 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
     return None
 
 
+async def _handle_spawn_worker(ls: _LoopState, args: dict, pseudo_call) -> None:
+    """Create an anonymous ephemeral sub-agent through shared dispatch handling.
+
+    The built-in ``_worker`` node is used unless the caller selects another node as
+    the model/tool template. Both accepted modes create isolated child conversation
+    keys; fork additionally asks Supervisor to inherit the parent session context.
+    """
+    instr = str(args.get("instruction") or "").strip()
+    if not instr:
+        # [AutoC 2026-09-12] Reject empty work before dispatch. Why: an empty child
+        # task wastes an engine slot and cannot produce a useful callback. How: emit
+        # a normal paired pseudo-tool result. Purpose: the parent model can correct
+        # the call without creating a child session.
+        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+            "success": False,
+            "error": "instruction is required",
+        }, ensure_ascii=False))
+        return None
+
+    ctx_mode = str(args.get("context_mode") or "fork").strip()
+    if ctx_mode not in ("fresh", "fork"):
+        ctx_mode = "fork"
+
+    template = str(args.get("template") or "_worker").strip() or "_worker"
+    raw_attachment_paths = args.get("attachment_paths") or []
+    attachment_paths = raw_attachment_paths if isinstance(raw_attachment_paths, list) else []
+
+    # [AutoC 2026-09-12] Reuse dispatch instead of creating a second child-session
+    # transport. Why: dispatch already handles attachments, fork metadata, events,
+    # callback origin, and unique fresh/fork conversation keys. How: resolve target
+    # and normalized context fields, then delegate to the shared handler. Purpose:
+    # spawn_worker stays non-terminal and receives normal child-result callbacks.
+    dispatch_args = {
+        "target": template,
+        "instruction": instr,
+        "context_mode": ctx_mode,
+        "attachment_paths": attachment_paths,
+    }
+    return await _handle_pseudo_dispatch(ls, dispatch_args, pseudo_call)
+
+
+def _resolve_active_child_task_id(tasks: list[dict[str, Any]], requested: str) -> tuple[str, str]:
+    """Resolve a full or unique-prefix task id within the active child set."""
+    needle = str(requested or "").strip()
+    if not needle:
+        return "", "task_id is required"
+    matches = [
+        str(task.get("task_id") or "").strip()
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("task_id") or "").strip().startswith(needle)
+    ]
+    matches = list(dict.fromkeys(task_id for task_id in matches if task_id))
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        return "", f"active child task not found: {needle}"
+    return "", f"ambiguous task_id prefix: {needle}"
+
+
+def _task_elapsed_seconds(created_at: Any) -> int | None:
+    """Return elapsed whole seconds for an ISO timestamp, if parseable."""
+    raw = str(created_at or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> None:
+    """List, message, or cancel active child agents in the routed session."""
+    action = str(args.get("action") or "").strip()
+    route_session_id = str(
+        getattr(ls.rctx, "parent_session_id", "")
+        or getattr(ls.rctx, "session_id", "")
+        or ""
+    ).strip()
+
+    async def _active_tasks() -> list[dict[str, Any]]:
+        # [AutoC 2026-09-12] Reuse the exact discovery view used for dynamic tool
+        # injection. Why: management must not message or cancel unrelated user-entry
+        # tasks. How: delegate to RunContext's normalized child query. Purpose: tool
+        # visibility, list results, and mutation authorization use one task set.
+        discover = getattr(ls.rctx, "list_active_child_tasks", None)
+        if not callable(discover):
+            return []
+        result = await discover()
+        return [dict(item) for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+
+    if action == "list":
+        try:
+            tasks = await _active_tasks()
+            task_list: list[dict[str, Any]] = []
+            for task in tasks:
+                created_at = str(task.get("created_at") or "")
+                task_list.append({
+                    "task_id": str(task.get("task_id") or "")[:12],
+                    "node_id": str(task.get("node_id") or ""),
+                    "status": str(task.get("status") or ""),
+                    "created_at": created_at,
+                    "elapsed_sec": _task_elapsed_seconds(created_at),
+                })
+            result = json.dumps({
+                "active_children": len(task_list),
+                "tasks": task_list,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+        _emit_pseudo_tool_result(ls, pseudo_call, result)
+        return None
+
+    if action == "message":
+        requested_task_id = str(args.get("task_id") or "").strip()
+        message = str(args.get("message") or "").strip()
+        if not requested_task_id or not message:
+            _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+                "success": False,
+                "error": "task_id and message are required for 'message' action",
+            }, ensure_ascii=False))
+            return None
+        try:
+            task_id, resolution_error = _resolve_active_child_task_id(await _active_tasks(), requested_task_id)
+            if resolution_error:
+                result = json.dumps({"success": False, "error": resolution_error}, ensure_ascii=False)
+            else:
+                response = await ls.rctx.http.post(
+                    f"{ls.rctx.supervisor_url}/v1/tasks/{task_id}/preempt",
+                    json={"message": message},
+                    timeout=10.0,
+                )
+                if response.status_code == 200:
+                    result = json.dumps({
+                        "success": True,
+                        "message": f"Instruction injected to {task_id[:12]}",
+                    }, ensure_ascii=False)
+                else:
+                    result = json.dumps({
+                        "success": False,
+                        "error": f"API returned {response.status_code}: {response.text}",
+                    }, ensure_ascii=False)
+        except Exception as exc:
+            result = json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+        _emit_pseudo_tool_result(ls, pseudo_call, result)
+        return None
+
+    if action == "cancel":
+        requested_task_id = str(args.get("task_id") or "").strip()
+        try:
+            if requested_task_id:
+                task_id, resolution_error = _resolve_active_child_task_id(await _active_tasks(), requested_task_id)
+                if resolution_error:
+                    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+                        "success": False,
+                        "error": resolution_error,
+                    }, ensure_ascii=False))
+                    return None
+                response = await ls.rctx.http.post(
+                    f"{ls.rctx.supervisor_url}/v1/tasks/{task_id}/cancel",
+                    timeout=10.0,
+                )
+                cancelled = task_id[:12]
+            else:
+                # [AutoC 2026-09-12] Preserve the caller during cancel-all.
+                # Why: the session endpoint can see the current entry task alongside
+                # its children. How: pass exclude_task_id, matching the existing
+                # cancel_active_tasks builtin. Purpose: manage_workers cancels child
+                # agents without terminating itself before reporting the result.
+                response = await ls.rctx.http.post(
+                    f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
+                    params={"exclude_task_id": str(getattr(ls.rctx, "task_id", "") or "")},
+                    timeout=10.0,
+                )
+                cancelled = "all"
+            if response.status_code == 200:
+                result = json.dumps({"success": True, "cancelled": cancelled}, ensure_ascii=False)
+            else:
+                result = json.dumps({
+                    "success": False,
+                    "error": f"API returned {response.status_code}: {response.text}",
+                }, ensure_ascii=False)
+        except Exception as exc:
+            result = json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+        _emit_pseudo_tool_result(ls, pseudo_call, result)
+        return None
+
+    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+        "success": False,
+        "error": f"Unknown action: {action}. Use 'list', 'message', or 'cancel'.",
+    }, ensure_ascii=False))
+    return None
+
+
 async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
     """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
 
@@ -451,6 +668,15 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     目的：统一生命周期管理，为 persistent node 支持铺路。
     """
     target = str(args.get("target") or "").strip()
+    # [2026-09-13] _worker 从插件声明迁移为 config/nodes 物理文件：首次使用前
+    # 确保默认文件已落盘，之后设置页可直接编辑 provider/model。spawn_worker
+    # 也走本函数（它委托到此处），同一挂点覆盖两条路径。
+    if target == "_worker":
+        try:
+            from engine.builtin.agent_manage import ensure_worker_node_yaml
+            ensure_worker_node_yaml(ls.rctx.workspace_root)
+        except Exception:
+            pass
     instr = str(args.get("instruction") or "").strip()
     _raw_ctx_mode = args.get("context_mode")
     if _raw_ctx_mode is not None:
@@ -514,6 +740,10 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "dispatch_origin": {
             "parent_session_id": parent_session_id,
             "caller_node_id": ls.node.id,
+            # [2026-09-13] origin_task_id：派发发生时的父 task id。supervisor 回调
+            # 路由据此做三级承接查找（preempt 活跃父 task / 标记承接 fork），
+            # 详见 task_router._find_dispatch_callback_carrier_locked。
+            "origin_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
             # [2026-05-29 方案C第一步] 为什么：审批和子进度事件只带子 session，
             # 旧 SDK 只能从 agent: conversation_key 反解析父频道，容易误判或丢事件。
             # 怎么改：把父频道的原始 conversation_key 与上下文模式随 dispatch_origin
@@ -546,15 +776,26 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         )
         if _dispatch_resp.status_code == 200:
             _d_data = _dispatch_resp.json()
+            _sid_short = str(_d_data.get("session_id", ""))[:8]
+            # [fix 2026-09-14] Why: 异步占位提示词在三条路径上不一致——异步工具
+            # 与自动转异步都会告知投递方式与行为指引，旧 dispatch 版只说
+            # “已委派”，模型不知道结果何时、以什么形态回来。How: 对齐另两条
+            # 路径的句式，写明 <dispatch_result> 投递渠道与“可继续其他工作”。
+            # Purpose: 三类异步占位语义一致，降低模型轮询/空等行为。
             _dispatch_result = json.dumps({
                 "success": True,
                 "session_id": _d_data.get("session_id", ""),
-                "message": f"已异步委派给 {target}",
+                "message": (
+                    f"⏳ Task delegated to {target} (child session: {_sid_short}). "
+                    "The result will arrive wrapped in <dispatch_result>, delivered via preempt "
+                    "while this task is running, or as a follow-up message after it ends. "
+                    "You can finish this task or continue working on other things."
+                ),
             }, ensure_ascii=False)
         else:
             _dispatch_result = json.dumps({
                 "success": False,
-                "error": f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
+                "error": f"inbound API returned {_dispatch_resp.status_code}: {_dispatch_resp.text}",
             }, ensure_ascii=False)
     except Exception as e:
         _dispatch_result = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)

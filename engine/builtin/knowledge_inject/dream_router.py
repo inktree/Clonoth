@@ -29,7 +29,7 @@ from engine.hooks.types import Handler, HookContext, HookResult
 log = logging.getLogger(__name__)
 
 _SYSTEM_NODES = frozenset({"system.dream", "system.memory_extractor"})
-_ROUTABLE_TOOLS = frozenset({"save_memory", "delete_memory"})
+_ROUTABLE_TOOLS = frozenset({"save_memory", "delete_memory", "list_memories"})
 
 
 class DreamMemoryRouter(Handler):
@@ -99,8 +99,9 @@ class DreamMemoryRouter(Handler):
         if not target_ns:
             return None
 
-        # Rewrite ToolContext to redirect the write
+        # Rewrite ToolContext to redirect the write, preserving original caller node_id
         old_node_id = getattr(tool_ctx, "_node_id", "") or getattr(tool_ctx, "node_id", "")
+        tool_ctx._caller_node_id = node_id  # type: ignore[attr-defined]
         tool_ctx._node_id = target_ns  # type: ignore[attr-defined]
         tool_ctx.node_id = target_ns
 

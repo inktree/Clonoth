@@ -83,6 +83,20 @@ class AdapterCallbacks(Protocol):
         """
         ...
 
+    async def send_response_notice(
+        self,
+        trigger: TriggerInfo | None,
+        conversation_key: str,
+        response_info: dict[str, Any],
+    ) -> None:
+        """Optional user-only annotation after a delivered response.
+
+        Older adapters may omit this method. Render separately (e.g. an embed),
+        and do not add the notice to model-visible channel history or reply text.
+        The SDK does not interpret plugin-specific notice codes or details.
+        """
+        ...
+
     async def send_intermediate_reply(
         self,
         trigger: TriggerInfo,
@@ -170,7 +184,9 @@ class AdapterCallbacks(Protocol):
             conversation_key: 目标会话键（如 "discord:123456789"）。
             text: 清理过 SDK 协议标记后的文本。仍含 Bot 自定义标记。
             attachments: 附件列表。
-            node_id: 发送方节点 ID。空字符串表示未知。
+            node_id: 对外回复所属节点 ID。outbound_message 优先使用
+                     reply_node_id，旧事件和 intermediate_reply 使用 node_id。
+                     空字符串表示未知；执行节点仍可从原始事件 node_id 读取。
                      适配器可据此为非入口节点消息添加来源标识前缀。
         """
         ...
@@ -391,7 +407,7 @@ class AdapterCallbacks(Protocol):
     ) -> None:
         """外部操作需要人工审批，通知适配器展示审批 UI。
 
-        触发时机：approval_requested 事件，经 trust_level 判定为
+        触发时机：approval_requested 事件，经 is_external_operation 判定为
                   外部操作（操作目标在工作区外部）。
         对应 bot_adapter.py L993-1006 _process_approval_event 中的外部操作分支。
 

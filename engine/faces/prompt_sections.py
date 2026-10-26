@@ -106,7 +106,7 @@ class PromptSectionRegistry:
         # collecting block is active. Purpose: one unload undoes all surfaces.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("prompt_section", self, clean_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:

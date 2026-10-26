@@ -274,7 +274,12 @@ class TaskStoreMixin:
                 or session_recorded
                 or default_node
             )
-        if session_info and not session_info.entry_node_id:
+        if (
+            session_info
+            and not session_info.entry_node_id
+            and not payload.get("dispatch_origin")
+            and self._is_switchable_entry_node(entry_node)
+        ):
             # Why: newly-created sessions may not yet know their frontend-selected
             # entry node. How: once an inbound is actually routed, copy the node
             # into memory and sessions.json. Purpose: later restarts can reproduce
@@ -446,6 +451,9 @@ class TaskStoreMixin:
                 },
                 "dispatch_context_mode": _dispatch_context_mode,
                 "_dispatch_origin": _dispatch_origin,
+                # [2026-09-13] dispatch 回调承接标记：origin task 终态后 fork 的入口
+                # task 携带派发者 task_id，后续同源回调据此找到它并 preempt 注入。
+                "_dispatch_owner_root_task_id": str(payload.get("_dispatch_owner_root_task_id") or ""),
                 **inbound_metadata,
             },
             continuation={},
@@ -697,13 +705,19 @@ class TaskStoreMixin:
             if task is None or task.status not in (TaskStatus.running, TaskStatus.pending):
                 return False
             task.preempt_requested = True
-            task.preempt_message = message
-            # [AutoC 2026-06-17] Why: a second preempt without files must not keep a
-            # previous unconsumed file list, and malformed API input must not become
-            # iterable garbage when consumed. How: always replace with a shallow list
-            # only when the provided value is actually a list. Purpose: preempt
-            # attachments stay scoped to exactly one injected message.
-            task.preempt_attachments = list(attachments) if isinstance(attachments, list) else []
+            # [2026-09-13] preempt 语义统一改为追加。Why: 引擎消费前多条消息并发
+            # 到达（异步工具结果、子任务回调、连发 preempt）时，覆盖式赋值会丢弃
+            # 先到的消息。How: 文本以空行拼接，attachments 仅在传入为 list 时追加
+            # 拼接。Purpose: consume_preempt_message 一次取走全部未消费内容。
+            if message:
+                task.preempt_message = (
+                    f"{task.preempt_message}\n\n{message}"
+                    if task.preempt_message else message
+                )
+            task.preempt_attachments = [
+                *task.preempt_attachments,
+                *(list(attachments) if isinstance(attachments, list) else []),
+            ]
             # [Fork/Merge 2026-05-17] Why: a task can be running inside a
             # temporary entry branch, but session event consumers watch the
             # durable parent session. How: use the task route helper when the
@@ -728,18 +742,45 @@ class TaskStoreMixin:
             )
             return True
 
-    def consume_preempt_message(self, task_id: str) -> dict:
-        """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。"""
+    def consume_preempt_message(self, task_id: str, consumed_message: str | None = None, consumed_attachment_count: int = 0) -> dict:
+        """消费 preempt message，返回 {message, attachments} 并清空。同时重置 preempt_requested。
+
+        [2026-09-13] 前缀切除语义。Why: engine 的消费流程是 GET /preempted 读文本
+        →注入+持久化（耗时）→ POST 本方法；旧实现无条件全清，若读与清之间又有
+        消息追加到达（异步工具结果、子任务回调并发），后到的消息会被一并清掉
+        永久丢失。How: 携带 engine 实际消费的文本，完全匹配则清文本；只是前缀则
+        切除前缀保留追加部分（flag 维持 True 供下轮轮询）；纯打断确认（空文本
+        哨兵 ""）但期间来了新消息时保留消息与 flag。None 表示旧式无参调用，
+        维持无条件全清保持兼容。Purpose: 追加语义下消费不丢失并发到达的消息。
+        """
         with self._lock:
             task = self.tasks.get(task_id)
             if task is None:
                 return {"message": "", "attachments": []}
             msg = task.preempt_message
             atts = list(task.preempt_attachments)
-            task.preempt_message = ""
-            task.preempt_attachments = []
-            task.preempt_requested = False
-            return {"message": msg, "attachments": atts}
+            if consumed_message is None:
+                # 旧式无参调用：无条件全清。
+                task.preempt_message = ""
+                task.preempt_attachments = []
+                task.preempt_requested = False
+                return {"message": msg, "attachments": atts}
+            consumed = str(consumed_message)
+            count = max(0, int(consumed_attachment_count))
+            if msg == consumed:
+                remaining = ""
+            elif consumed and msg.startswith(consumed + "\n\n"):
+                remaining = msg[len(consumed) + 2:]
+            elif not consumed:
+                remaining = msg
+            else:
+                # A stale acknowledgement must not discard a different message.
+                return {"message": "", "attachments": [], "kept": True}
+            remaining_atts = atts[count:]
+            task.preempt_message = remaining
+            task.preempt_attachments = remaining_atts
+            task.preempt_requested = bool(remaining or remaining_atts)
+            return {"message": msg, "attachments": atts, "kept": task.preempt_requested}
 
     def is_task_preempted(self, task_id: str) -> dict:
         """查询 task 的 preempt 状态，包含 message。"""
@@ -845,6 +886,7 @@ class TaskStoreMixin:
                 # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
                 # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
                 self._finalize_branch_task_locked(task, merge=True)
+                self._mark_child_session_terminal(task)
                 self._event_task_snapshot("task_cancelled", task, component="engine")
                 return task
 
@@ -861,6 +903,9 @@ class TaskStoreMixin:
                 task.status = TaskStatus.completed
 
             self._cleanup_tool_result_artifacts_for_task(task.task_id)
+            # [2026-09-14] 任务终态写回子会话 registry，供 TTL 与 session_children
+            # 在任务被裁剪/重启丢失后仍能报终态。见 SupervisorState._mark_child_session_terminal。
+            self._mark_child_session_terminal(task)
             self._event_task_snapshot("task_completed", task, component="engine")
             self._route_completed_task_locked(task)
             return task

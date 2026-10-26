@@ -234,8 +234,14 @@ class NativeToolFormatter(ToolFormatter):
         """
         clean = {k: v for k, v in message_dict.items() if not k.startswith('_')}
         meta = message_dict.get('_meta')
-        if isinstance(meta, dict) and meta.get('metadata'):
-            clean['_meta'] = {'metadata': meta['metadata']}
+        if isinstance(meta, dict):
+            kept_meta: dict[str, Any] = {}
+            if meta.get('metadata'):
+                kept_meta['metadata'] = meta['metadata']
+            if meta.get('reasoning'):
+                kept_meta['reasoning'] = meta['reasoning']
+            if kept_meta:
+                clean['_meta'] = kept_meta
         # 将简化存储格式的 tool_calls 转换回 API 原生格式
         if 'tool_calls' in clean and isinstance(clean['tool_calls'], list):
             api_calls = []
@@ -346,8 +352,14 @@ class FakeNativeToolFormatter(ToolFormatter):
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
         meta = message_dict.get('_meta')
-        if isinstance(meta, dict) and meta.get('metadata'):
-            clean['_meta'] = {'metadata': meta['metadata']}
+        if isinstance(meta, dict):
+            kept_meta: dict[str, Any] = {}
+            if meta.get('metadata'):
+                kept_meta['metadata'] = meta['metadata']
+            if meta.get('reasoning'):
+                kept_meta['reasoning'] = meta['reasoning']
+            if kept_meta:
+                clean['_meta'] = kept_meta
 
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
@@ -703,8 +715,14 @@ class JsonToolFormatter(ToolFormatter):
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
         meta = message_dict.get('_meta')
-        if isinstance(meta, dict) and meta.get('metadata'):
-            clean['_meta'] = {'metadata': meta['metadata']}
+        if isinstance(meta, dict):
+            kept_meta: dict[str, Any] = {}
+            if meta.get('metadata'):
+                kept_meta['metadata'] = meta['metadata']
+            if meta.get('reasoning'):
+                kept_meta['reasoning'] = meta['reasoning']
+            if kept_meta:
+                clean['_meta'] = kept_meta
 
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))

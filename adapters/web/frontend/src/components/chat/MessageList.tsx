@@ -122,6 +122,15 @@ export const MessageList = ({ messages, toolsById }: MessageListProps) => {
   const prevMessageCountRef = useRef(0);
   const lastScrolledUserIdRef = useRef<string | null>(null);
 
+  // [2026-09-13] 子会话视图空态：区分“正在加载”“已确认无记录”“未选择会话”，
+  // 避免点击已清理的子节点行时误显默认文案。
+  const viewingChild = useChatStore((state) => Boolean(state.viewingChildSessionId));
+  const childViewEmpty = useChatStore((state) => {
+    if (!state.viewingChildSessionId) return false;
+    const cached = state.childSessionMessages[state.viewingChildSessionId];
+    return Boolean(cached && cached.length === 0 && state.childSessionEmpty[state.viewingChildSessionId]);
+  });
+
   // [AutoC 2026-06-15] Dynamic padding: when a new user message appears,
   // insert a large padding at the bottom so the user message sits at the
   // viewport top. As assistant content streams in, recalculate padding to
@@ -311,7 +320,11 @@ export const MessageList = ({ messages, toolsById }: MessageListProps) => {
   if (messages.length === 0) {
     return (
       <div className="flex h-full items-center justify-center p-6 text-sm text-[var(--duties-tertiary)]">
-        请选择或创建一个对话。
+        {childViewEmpty
+          ? '该子会话已清理或没有可显示的记录。'
+          : viewingChild
+            ? '正在加载子会话记录…'
+            : '请选择或创建一个对话。'}
       </div>
     );
   }

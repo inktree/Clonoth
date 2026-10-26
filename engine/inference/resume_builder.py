@@ -56,9 +56,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         text = str(result.get("text") or "")
         child_atts = _attachments_from_payload(result)
-        lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
+        lines = [f"Downstream node {from_node} has finished." if from_node else "Downstream node has finished."]
         if text:
-            lines.append("结果：")
+            lines.append("Result:")
             lines.append(text)
         content_text = "\n".join(lines).strip()
         if isinstance(child_atts, list) and child_atts:
@@ -71,13 +71,13 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         text = str(result.get("text") or "").strip()
         if from_node and text:
-            content = f"下游节点 {from_node} 需要补充信息：{text}"
+            content = f"Downstream node {from_node} needs more information: {text}"
         elif text:
-            content = f"下游节点需要补充信息：{text}"
+            content = f"Downstream node needs more information: {text}"
         elif from_node:
-            content = f"下游节点 {from_node} 需要补充信息。"
+            content = f"Downstream node {from_node} needs more information."
         else:
-            content = "下游节点需要补充信息。"
+            content = "Downstream node needs more information."
         return [{"role": "user", "content": content}]
 
     # v2: output_rejected (output chain downstream rejected upstream finish)
@@ -92,23 +92,23 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     # v2: child_failed
     if rtype == "child_failed":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-        error = str(resume_data.get("error") or "未知错误")
-        prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
+        error = str(resume_data.get("error") or "unknown error")
+        prefix = f"Downstream node {from_node} failed: " if from_node else "Downstream node failed: "
         return [{"role": "user", "content": f"{prefix}{error}"}]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-        text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
+        text = f"Downstream node {from_node} was cancelled." if from_node else "Downstream node was cancelled."
         return [{"role": "user", "content": text}]
 
     # v2: child_preempted
     if rtype == "child_preempted":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         ctx_ref = str(resume_data.get("context_ref") or "")
-        prefix = f"下游节点 {from_node} 被打断，上下文已保存。" if from_node else "下游节点被打断，上下文已保存。"
+        prefix = f"Downstream node {from_node} was interrupted; its context has been saved." if from_node else "Downstream node was interrupted; its context has been saved."
         if ctx_ref:
-            prefix += f"（context_ref: {ctx_ref}）"
+            prefix += f" (context_ref: {ctx_ref})"
         return [{"role": "user", "content": prefix}]
 
     # v2: compact_done (compactor 子 task 完成后恢复)
@@ -134,7 +134,7 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                 if atts:
                     all_atts.extend(atts)
             if all_atts:
-                msgs.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", all_atts)})
+                msgs.append({"role": "user", "content": build_multimodal_content("The tool executions above produced the following image results:", all_atts)})
             return msgs
         return []
 
@@ -232,6 +232,8 @@ def _select_attachments(
             if not p.is_file():
                 continue
             try:
+                if p.stat().st_size > 25 * 1024 * 1024:
+                    continue
                 data_bytes = p.read_bytes()
             except Exception:
                 continue
@@ -409,13 +411,15 @@ async def _emit_compact_done(
     node: Any,
     rctx: Any,
 ) -> None:
-    """Reset the compaction breaker and emit compact_done signal/event."""
-    # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
-    # [AutoC 2026-05-13] Why: compaction may have targeted the parent session
-    # while the task resumed on a branch. How: reset the breaker on
-    # parent_session_id when present. Purpose: success accounting stays
-    # consistent with parent-first compact targeting.
-    record_compact_success(rctx.parent_session_id or rctx.session_id)
+    """Record the compaction result and emit the compact_done signal/event."""
+    # [fix 2026-09-11] Why: a failed compactor task is resumed with compact_done
+    # success=False. Resetting the breaker for that resume made every failed
+    # attempt look successful, so the next before_step dispatched another
+    # compactor indefinitely. How: only clear consecutive failures after the
+    # supervisor actually reports a successful compaction. Purpose: a failed
+    # compaction remains bounded by the session circuit breaker.
+    if resume_data.get("success", True):
+        record_compact_success(rctx.parent_session_id or rctx.session_id)
     # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
     _cd_payload = {
         "node_id": node.id,

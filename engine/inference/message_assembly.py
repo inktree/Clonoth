@@ -157,7 +157,7 @@ def assemble_messages_with_injections(
         if _dynamic_parts:
             messages.append({
                 "role": "user",
-                "content": "以下是本轮动态上下文，每轮可能变化。\n\n" + "\n\n".join(_dynamic_parts),
+                "content": "Below is this turn's dynamic context; it may change between turns.\n\n" + "\n\n".join(_dynamic_parts),
                 "_dynamic": True,
             })
 
@@ -227,7 +227,7 @@ def assemble_messages_with_injections(
         if _dynamic_parts_s:
             messages.append({
                 "role": "user",
-                "content": "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n" + "\n\n".join(_dynamic_parts_s),
+                "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
                 "_dynamic": True,
             })
 
@@ -363,7 +363,7 @@ def assemble_initial_messages(
         if _dynamic_parts:
             messages.append({
                 "role": "user",
-                "content": "以下是本轮动态上下文，每轮可能变化。\n\n" + "\n\n".join(_dynamic_parts),
+                "content": "Below is this turn's dynamic context; it may change between turns.\n\n" + "\n\n".join(_dynamic_parts),
                 "_dynamic": True,
             })
 
@@ -433,7 +433,7 @@ def assemble_initial_messages(
         if _dynamic_parts_s:
             messages.append({
                 "role": "user",
-                "content": "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n" + "\n\n".join(_dynamic_parts_s),
+                "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
                 "_dynamic": True,
             })
 
@@ -491,9 +491,9 @@ def rebuild_dynamic_context(
     if not parts:
         return
     prefix = (
-        "以下是本轮动态上下文，每轮可能变化。\n\n"
+        "Below is this turn's dynamic context; it may change between turns.\n\n"
         if is_block_mode
-        else "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n"
+        else "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n"
     )
     messages.append({
         "role": "user",

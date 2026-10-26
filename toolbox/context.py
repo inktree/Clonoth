@@ -121,10 +121,21 @@ class ToolContext:
         while True:
             if await self.check_cancelled():
                 return {"approval_id": approval_id, "status": "cancelled"}
-            r = await self.http.get(f"{self.supervisor_url}/v1/approvals/{approval_id}")
-            r.raise_for_status()
-            approval = r.json()
-            if approval.get("status") != "pending":
+            try:
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/approvals/{approval_id}",
+                    timeout=5.0,
+                )
+                r.raise_for_status()
+                approval = r.json()
+            except httpx.RequestError:
+                approval = None
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code >= 500:
+                    approval = None
+                else:
+                    raise
+            if isinstance(approval, dict) and approval.get("status") != "pending":
                 return approval
             # Renew task lease during approval wait to prevent zombie reaper timeout.
             # This is defense-in-depth alongside the heartbeat in engine/runner.py.

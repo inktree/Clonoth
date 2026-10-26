@@ -60,6 +60,15 @@ def is_compact_circuit_open(session_id: str) -> bool:
 _MICROCOMPACT_PLACEHOLDER = "[tool result cleared — cache expired]"
 
 
+def _build_microcompact_content(content: str, tool_name: str) -> str:
+    """Build one consistent compact placeholder for runtime and stored messages."""
+    if content.startswith('Tool result for "'):
+        first_line = content.split("\n", 1)[0][:200]
+        return first_line + "\n" + _MICROCOMPACT_PLACEHOLDER
+    preview = content[:120].replace("\n", " ")
+    return f"[tool result ({tool_name}): {preview}...]\n{_MICROCOMPACT_PLACEHOLDER}"
+
+
 def microcompact_messages(
     messages: list[dict[str, Any]],
     *,
@@ -102,17 +111,21 @@ def microcompact_messages(
     if gap < gap_minutes:
         return messages, 0
 
-    # Collect tool_result indices
+    # Collect tool_result indices (only count non-trivial tool results > 200 chars)
     tr_indices: list[int] = []
     for i, msg in enumerate(messages):
         meta = msg.get("_meta", {})
         is_tr = False
-        if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
+        if msg.get("role") == "tool" or msg.get("message_type") == "tool_result":
+            is_tr = True
+        elif isinstance(meta, dict) and meta.get("message_type") == "tool_result":
             is_tr = True
         elif isinstance(msg.get("content"), str) and msg["content"].startswith('Tool result for "'):
             is_tr = True
         if is_tr:
-            tr_indices.append(i)
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > 200:
+                tr_indices.append(i)
 
     if len(tr_indices) < min_tool_results:
         return messages, 0
@@ -121,11 +134,17 @@ def microcompact_messages(
     to_clear = tr_indices[:-keep_recent] if keep_recent > 0 else tr_indices
     cleared = 0
     for idx in to_clear:
-        content = messages[idx].get("content", "")
-        if isinstance(content, str) and content != _MICROCOMPACT_PLACEHOLDER:
-            # Preserve the tool name header, clear the body
-            first_line = content.split("\n", 1)[0]
-            messages[idx]["content"] = first_line + "\n" + _MICROCOMPACT_PLACEHOLDER
+        msg = messages[idx]
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > 200 and not content.endswith(_MICROCOMPACT_PLACEHOLDER):
+            tname = str(msg.get("name") or (msg.get("_meta") or {}).get("name") or "tool")
+            new_content = _build_microcompact_content(content, tname)
+            msg["content"] = new_content
+            meta = msg.get("_meta")
+            if isinstance(meta, dict):
+                if "tool_result_raw_inline" in meta:
+                    meta["tool_result_raw_inline"] = new_content
+                meta.pop("tool_result_structured", None)
             cleared += 1
 
     if cleared:
@@ -135,6 +154,48 @@ def microcompact_messages(
         )
 
     return messages, cleared
+
+
+def microcompact_store(
+    stored_msgs: list[Any],
+    *,
+    keep_recent: int = 5,
+    min_tool_results: int = 3,
+) -> tuple[list[Any], int]:
+    """Apply microcompact clearing to ConversationStore Message objects for persistence."""
+    tr_indices: list[int] = []
+    for i, msg in enumerate(stored_msgs):
+        meta = getattr(msg, "meta", None)
+        is_tr = (
+            getattr(msg, "role", "") == "tool"
+            or getattr(msg, "message_type", "") == "tool_result"
+            or (isinstance(meta, dict) and meta.get("message_type") == "tool_result")
+            or (isinstance(getattr(msg, "content", ""), str) and msg.content.startswith('Tool result for "'))
+        )
+        if is_tr and isinstance(getattr(msg, "content", ""), str) and len(msg.content) > 200:
+            tr_indices.append(i)
+
+    if len(tr_indices) < min_tool_results:
+        return stored_msgs, 0
+
+    to_clear = tr_indices[:-keep_recent] if keep_recent > 0 else tr_indices
+    cleared = 0
+    for idx in to_clear:
+        msg = stored_msgs[idx]
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and len(content) > 200 and not content.endswith(_MICROCOMPACT_PLACEHOLDER):
+            tname = str(getattr(msg, "name", "") or (getattr(msg, "meta", None) or {}).get("name") or "tool")
+            new_content = _build_microcompact_content(content, tname)
+            msg.content = new_content
+            if isinstance(getattr(msg, "meta", None), dict):
+                if "tool_result_raw_inline" in msg.meta:
+                    msg.meta["tool_result_raw_inline"] = new_content
+                msg.meta.pop("tool_result_structured", None)
+            cleared += 1
+
+    if cleared:
+        invalidate_stale_usage(stored_msgs)
+    return stored_msgs, cleared
 
 
 # ---------------------------------------------------------------------------
@@ -195,19 +256,13 @@ def should_compact(
         return False
     if last_prompt_tokens is not None:
         return last_prompt_tokens > threshold_tokens
-    # Fallback: estimate from characters
-    total_chars = 0
+    # Fallback: estimate from full message tokens (content + tool_calls + multimodal)
+    total_tokens = 0
     for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    total_chars += len(part["text"])
-        if total_chars // 3 > threshold_tokens:
+        total_tokens += estimate_message_tokens(m)
+        if total_tokens > threshold_tokens:
             return True
-    return total_chars // 3 > threshold_tokens
+    return total_tokens > threshold_tokens
 
 
 def _source_task_id_from_message_like(message: Any) -> str:
@@ -225,25 +280,155 @@ def _source_task_id_from_message_like(message: Any) -> str:
     return str(meta_tid or getattr(message, "source_task_id", "") or "")
 
 
-def count_real_task_segments(messages: list[Any]) -> int:
-    """Count consecutive task segments, excluding existing compact summaries."""
-    # [2026-05-17] Why: an old compact_summary is already summarized history and
-    # must be compressed together with older task messages, not retained as one
-    # keep_recent segment. How: skip source_task_id=compact_summary and count only
-    # transitions between consecutive real task ids. Purpose: prevent automatic
-    # compaction from dispatching forever when only the old summary can be removed.
-    count = 0
-    previous_tid: str | None = None
-    in_real_segment = False
-    for message in messages:
-        task_id = _source_task_id_from_message_like(message)
-        if task_id == "compact_summary":
+def _content_from_message_like(message: Any) -> Any:
+    if isinstance(message, dict):
+        return message.get("content", "")
+    return getattr(message, "content", "")
+
+
+def is_snipped_message(message: Any) -> bool:
+    """Return True if message is an L2 snipped task stub."""
+    content = _content_from_message_like(message)
+    return isinstance(content, str) and content.startswith("[Task summary — original messages snipped]")
+
+
+def estimate_message_tokens(message: Any) -> int:
+    """Estimate tokens of a Message or dict (including text, tool_calls, raw_parts, and images)."""
+    content = _content_from_message_like(message)
+    chars = 0
+    if isinstance(content, str):
+        chars += len(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                t = part.get("text")
+                if isinstance(t, str):
+                    chars += len(t)
+                elif part.get("type") in ("image_url", "image") or "inlineData" in part:
+                    chars += 4800  # ~1600 tokens per image
+    tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+    if tool_calls:
+        chars += len(json.dumps(tool_calls, ensure_ascii=False, default=str))
+    meta = (message.get("_meta") or message.get("meta")) if isinstance(message, dict) else getattr(message, "meta", None)
+    if isinstance(meta, dict):
+        md = meta.get("metadata")
+        if isinstance(md, dict) and md and not chars:
+            chars += len(json.dumps(md, ensure_ascii=False, default=str))
+    return max(chars // 3, 1)
+
+
+def invalidate_stale_usage(messages: list[Any]) -> None:
+    """Mark historical assistant usage.prompt_tokens as stale after compaction/snip."""
+    for m in messages:
+        meta = (m.get("_meta") or m.get("meta")) if isinstance(m, dict) else getattr(m, "meta", None)
+        if isinstance(meta, dict):
+            usage = meta.get("usage")
+            if isinstance(usage, dict) and "prompt_tokens" in usage:
+                usage["_compacted_stale"] = True
+
+
+def split_task_segments(messages: list[Any]) -> tuple[list[Any], list[list[Any]]]:
+    """Split messages into (prefix_msgs, real_segments) consistently across Engine and Supervisor.
+
+    - Messages with source_task_id == 'compact_summary' or L2 snipped stubs go into prefix_msgs.
+    - Mid-task messages with empty source_task_id (e.g. output_rejected / async_tool dispatch_result)
+      are merged into the surrounding task segment so one task is not split into multiple segments.
+    """
+    filtered: list[Any] = []
+    for m in messages:
+        if isinstance(m, dict):
+            if m.get("role") == "system" or m.get("_dynamic"):
+                continue
+        else:
+            if getattr(m, "role", "") == "system":
+                continue
+        filtered.append(m)
+
+    tids = [_source_task_id_from_message_like(m) for m in filtered]
+    n = len(filtered)
+    for i in range(n):
+        if not tids[i]:
+            prev_tid = tids[i - 1] if i > 0 else ""
+            next_tid = ""
+            for j in range(i + 1, n):
+                if tids[j]:
+                    next_tid = tids[j]
+                    break
+            c = _content_from_message_like(filtered[i])
+            is_mid_task = isinstance(c, str) and (
+                c.startswith("reject by ") or c.startswith("<dispatch_result")
+            )
+            if prev_tid and prev_tid != "compact_summary" and (prev_tid == next_tid or is_mid_task):
+                tids[i] = prev_tid
+
+    prefix_msgs: list[Any] = []
+    segments: list[list[Any]] = []
+    cur_seg: list[Any] = []
+    cur_tid: str | None = None
+
+    for m, tid in zip(filtered, tids):
+        if tid == "compact_summary" or is_snipped_message(m):
+            if cur_seg:
+                segments.append(cur_seg)
+                cur_seg = []
+                cur_tid = None
+            prefix_msgs.append(m)
             continue
-        if not in_real_segment or task_id != previous_tid:
-            count += 1
-        previous_tid = task_id
-        in_real_segment = True
-    return count
+        if cur_tid is None or tid != cur_tid:
+            if cur_seg:
+                segments.append(cur_seg)
+            cur_seg = [m]
+            cur_tid = tid
+        else:
+            cur_seg.append(m)
+    if cur_seg:
+        segments.append(cur_seg)
+
+    return prefix_msgs, segments
+
+
+def compute_effective_keep_recent(
+    segments: list[list[Any]],
+    keep_recent: int = 6,
+    threshold_tokens: int = 0,
+    prefix_msgs: list[Any] | None = None,
+) -> int:
+    """Compute effective keep_recent with hysteresis (low watermark) and minimum batch size."""
+    total_segs = len(segments)
+    if total_segs <= 1:
+        return total_segs
+    actual_keep = max(1, min(int(keep_recent or 6), total_segs - 1))
+    seg_tokens = [sum(estimate_message_tokens(m) for m in seg) for seg in segments]
+
+    if threshold_tokens > 0:
+        # Low watermark: target ~55% of threshold_tokens ( reserving ~45k for system prompt + tools + summary )
+        target_total = int(threshold_tokens * 0.55)
+        system_and_summary_overhead = 48_000
+        kept_budget = max(32_000, target_total - system_and_summary_overhead)
+        while actual_keep > 1 and sum(seg_tokens[-actual_keep:]) > kept_budget:
+            actual_keep -= 1
+
+    # Ensure every compaction frees a meaningful chunk of history (at least ~10% of threshold
+    # or 45% of total conversation tokens) rather than just 1-2k tokens of a tiny leading segment.
+    total_conv_tokens = sum(seg_tokens)
+    snipped_tokens = sum(estimate_message_tokens(m) for m in (prefix_msgs or []) if is_snipped_message(m))
+    min_free_target = min(
+        max(16_000, int((threshold_tokens or 200_000) * 0.10)),
+        int(total_conv_tokens * 0.45),
+    )
+    while (
+        actual_keep > 1
+        and (sum(seg_tokens[:-actual_keep]) + snipped_tokens) < min_free_target
+    ):
+        actual_keep -= 1
+
+    return max(1, actual_keep)
+
+
+def count_real_task_segments(messages: list[Any]) -> int:
+    """Count consecutive real (non-summary, non-snipped) task segments."""
+    _, segments = split_task_segments(messages)
+    return len(segments)
 
 
 # ---------------------------------------------------------------------------
@@ -289,38 +474,28 @@ def apply_compact_summary(
         else:
             conversation.append(msg)
 
-    # --- 按 task 边界划分 segments ---
-    # 每个 segment 是一个 task 的所有连续消息，无 task_id 的连续消息归为匿名 segment
-    segments: list[list[dict[str, Any]]] = []
-    _cur_seg: list[dict[str, Any]] = []
-    _cur_tid: str = ""
-    for msg in conversation:
-        _meta = msg.get("_meta") or {}
-        _tid = _meta.get("source_task_id", "") if isinstance(_meta, dict) else ""
-        if _tid != _cur_tid and _cur_seg:
-            segments.append(_cur_seg)
-            _cur_seg = []
-        _cur_tid = _tid
-        _cur_seg.append(msg)
-    if _cur_seg:
-        segments.append(_cur_seg)
+    # --- 按统一规则划分 prefix_msgs 与 real segments ---
+    prefix_msgs, segments = split_task_segments(conversation)
 
     # keep_recent 现在是「保留最近 N 个完整 task segment」
-    keep_recent = max(keep_recent, 1)  # 至少保留当前活跃 task
-    if len(segments) <= keep_recent:
+    keep_recent = compute_effective_keep_recent(
+        segments, keep_recent=keep_recent, threshold_tokens=threshold_tokens, prefix_msgs=prefix_msgs,
+    )
+    if len(segments) <= keep_recent and not any(is_snipped_message(m) for m in prefix_msgs):
         return messages
 
-    kept_segments = segments[-keep_recent:]
-    compressed_segments = segments[:-keep_recent]
+    kept_segments = segments[-keep_recent:] if keep_recent > 0 else []
+    compressed_segments = segments[:-keep_recent] if keep_recent > 0 else list(segments)
     to_keep: list[dict[str, Any]] = []
     for seg in kept_segments:
         to_keep.extend(seg)
+    invalidate_stale_usage(to_keep)
 
     # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
     # 存入摘要消息的 _meta 中，防止 L2 snip 因 ID 丢失而重复触发 L3 LLM 压缩。
     # [2026-04-26] 累积继承：当旧的 compact_summary 被再次压缩时，
     # 继承其 compressed_task_ids，避免更早被压缩的任务 ID 丢失。
-    _compressed: list[dict[str, Any]] = []
+    _compressed: list[dict[str, Any]] = list(prefix_msgs)
     for seg in compressed_segments:
         _compressed.extend(seg)
     _compressed_tids = set()
@@ -341,7 +516,7 @@ def apply_compact_summary(
     summary_msg: dict[str, Any] = {
         "role": "user",
         "content": (
-            "[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary
+            "[Below is a structured summary of the previous conversation; the original context has been compacted]\n\n" + summary
         ),
         "_meta": {
             "source_task_id": "compact_summary",
@@ -439,15 +614,22 @@ def _format_messages_for_summary(
                     continue
                 function = call.get("function") if isinstance(call.get("function"), dict) else {}
                 name = str(call.get("name") or function.get("name") or "").strip()
-                raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
-                args_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
-                call_lines.append(f"[tool_call] {name} {args_text}".strip())
+                if name in ("finish", "ask"):
+                    raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if isinstance(raw_args, dict):
+                        _text = str(raw_args.get("text") or "").strip()
+                        if _text:
+                            call_lines.append(f"[delivered via {name}] {_text[:3000]}")
+                            continue
+                    call_lines.append(f"[used tool: {name}]")
+                elif name:
+                    call_lines.append(f"[used tool: {name}]")
             if call_lines:
-                # [2026-05-07] 摘要输入显式渲染 assistant.tool_calls。
-                # 原因：finish 现在保留为真实工具轮，assistant.content 可能为空；若不渲染 tool_calls，
-                # compactor 看不到 finish 名称和 text 参数。
-                # 做法：把每个工具调用追加为可读文本行，普通 content 保持原样。
-                # 目的：摘要保留最终交付内容，同时不破坏 provider 工具配对历史。
                 text = "\n".join(part for part in [text, *call_lines] if part)
         if len(text) > 20_000:
             text = text[:20_000] + "\n...[truncated]"

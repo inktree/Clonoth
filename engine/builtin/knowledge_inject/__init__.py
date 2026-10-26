@@ -866,6 +866,8 @@ def _filter_entries(
         elif entry.get("kind") == "memory":
             if memory_mode == "none":
                 continue
+            if memory_mode == "constant" and entry.get("strategy") != "constant":
+                continue
             # Why: the legacy memory builder filtered allowlist only when the
             # allow collection was truthy. How: keep that condition here.
             # Purpose: knowledge.max_budget_chars=0 remains behavior-compatible.
@@ -1097,7 +1099,7 @@ def _render_skill_messages(
             dynamic_parts.append("")
         dynamic_parts.append("[SKILLS:INDEX]")
         dynamic_parts.append(
-            "以下 skill 未被激活。如果当前任务需要，可通过 read_file 读取对应 path 的全文。"
+            "The following skills are not activated. If the current task needs one, read its full text at the listed path via read_file."
         )
         for entry in index_only_skills:
             dynamic_parts.append(f"- name: {entry['id']}")
@@ -1227,6 +1229,18 @@ def build_knowledge_context(
     # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
     # 目的：节点只看到自己 namespace 下的记忆条目。
     _mb = _effective_memory_ns(node.extra, node.id)
+    _effective_node_id = node.id
+    if node.id in ("system.memory_extractor", "system.dream") and not str(node.extra.get("memory_book") or "").strip():
+        from clonoth_runtime import get_entry_node_id
+        _routed_ns = str((task_context or {}).get("_memory_route_ns") or "").strip()
+        if not _routed_ns:
+            _route_tbl = (task_context or {}).get("_memory_route")
+            if isinstance(_route_tbl, dict) and _route_tbl:
+                _first_rt = next(iter(_route_tbl.values()), None)
+                if isinstance(_first_rt, dict):
+                    _routed_ns = str(_first_rt.get("ns") or "").strip()
+        _mb = _routed_ns or get_entry_node_id(safe_runtime_cfg) or _mb
+        _effective_node_id = _mb
     # [AutoC 2026-08-10] Workspace-scoped memory: load workspace dir first, then node dir.
     _ws_name = str((task_context or {}).get("workspace_name") or "").strip()
     mem_entries = []
@@ -1268,7 +1282,7 @@ def build_knowledge_context(
     return build_knowledge_messages(
         workspace_root,
         entries,
-        node_id=node.id,
+        node_id=_effective_node_id,
         instruction_text=instruction_text,
         history=history,
         skill_mode=node.skill_access.mode,
@@ -1413,7 +1427,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # filesystem scan and metadata coercion. Purpose: preserve tool output shape.
     skills_dir = ctx.workspace_root / "skills"
     if not skills_dir.exists():
-        return _tool_ok("0 skills", skills=[])
+        return _tool_ok("0 skills (skills/ is empty)", skills=[])
 
     items: list[dict[str, Any]] = []
     for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
@@ -1426,6 +1440,9 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             strategy = str(meta.get("strategy") or "normal").strip().lower()
             if strategy not in ("constant", "normal"):
                 strategy = "normal"
+            visibility = str(meta.get("visibility") or "public").strip().lower()
+            if visibility not in ("public", "private"):
+                visibility = "public"
             raw_kw = meta.get("keywords")
             kw_list: list[str] = []
             if isinstance(raw_kw, list):
@@ -1445,6 +1462,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                     "description": str(meta.get("description") or ""),
                     "enabled": bool(meta.get("enabled", True)),
                     "strategy": strategy,
+                    "visibility": visibility,
                     "keywords": kw_list,
                     "order": item_order,
                     "priority": item_priority,
@@ -1455,7 +1473,26 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         except Exception as e:
             items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
 
-    return _tool_ok(f"{len(items)} skills", skills=items)
+    if not items:
+        return _tool_ok("0 skills (skills/ is empty)", skills=[])
+    lines = [f"{len(items)} skills (read full content via read_file skills/<name>/SKILL.md):"]
+    for it in items:
+        sname = str(it.get("name") or "?")
+        if "error" in it:
+            lines.append(f"- {sname} | ERROR: {it['error']}")
+            continue
+        sstrat = str(it.get("strategy") or "normal")
+        senabled = "enabled" if it.get("enabled", True) else "disabled"
+        svis = ", private" if it.get("visibility") == "private" else ""
+        spath = str(it.get("path") or "")
+        sdesc = " ".join(str(it.get("description") or "").split())
+        if len(sdesc) > 100:
+            sdesc = sdesc[:100] + "…"
+        line = f"- {sname} | {sstrat} | {senabled}{svis} | {spath}"
+        if sdesc:
+            line += f" | {sdesc}"
+        lines.append(line)
+    return _tool_ok("\n".join(lines), skills=items)
 
 
 async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1580,6 +1617,11 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     constant = bool(args.get("constant", False))
     enabled = bool(args.get("enabled", True))
+    _caller_nid = str(getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or "").strip()
+    _is_sys_mem_node = _caller_nid in ("system.memory_extractor", "system.dream")
+    if _is_sys_mem_node and constant:
+        # System extraction/dream nodes are strictly forbidden from creating constant memories
+        constant = False
 
     # Why: existing memory tools accepted node_ids as a list or comma-separated
     # string. How: preserve both forms. Purpose: node-scoped memory entries keep
@@ -1619,6 +1661,15 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     else:
         _target_ns = _ns_memory_book
     book_path = memory_dir(ctx.workspace_root, _target_ns) / f"{book}.yaml"
+    if _is_sys_mem_node:
+        # Cross-book & cross-scope protection: prevent system nodes from overwriting or shadowing
+        # ANY existing constant=true memory in the node namespace, workspace, or root.
+        for _check_ns in dict.fromkeys([_target_ns, _ns_memory_book, ""]):
+            for _cat_item in load_memory_catalog(ctx.workspace_root, memory_book=_check_ns):
+                if _cat_item.get("id") == mid and bool(_cat_item.get("constant", False)):
+                    return _tool_err(
+                        f"system node ({_caller_nid}) cannot modify or shadow constant memory: {_cat_item.get('book')}/{mid}"
+                    )
     data = _load_book(book_path)
     data.setdefault("book", book)
 
@@ -1638,12 +1689,18 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "priority": priority,
         "scan_depth": scan_depth,
     }
+    if node_ids:
+        new_entry["node_ids"] = node_ids
 
     entries = data["entries"]
     found = False
     for i, e in enumerate(entries):
         if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
-            # 更新：保留原 created_at 和 source，刷新 updated_at
+            if _is_sys_mem_node and bool(e.get("constant", False)):
+                return _tool_err(f"system node ({_caller_nid}) cannot modify constant memory: {mid}")
+            # 更新：保留原 created_at 和 source，刷新 updated_at；未显式传 node_ids 时保留原 node_ids
+            if raw_node_ids is None and e.get("node_ids"):
+                new_entry["node_ids"] = e.get("node_ids")
             new_entry["created_at"] = str(e.get("created_at") or "").strip() or _now_iso
             new_entry["source"] = str(e.get("source") or "").strip()
             new_entry["updated_at"] = _now_iso
@@ -1652,6 +1709,8 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             break
     if not found:
         # 新建：写入 created_at，source 由调用方决定（memory_extract 会补 auto）
+        if _caller_nid == "system.memory_extractor" and not new_entry.get("source"):
+            new_entry["source"] = "auto"
         new_entry["created_at"] = _now_iso
         new_entry["updated_at"] = _now_iso
         entries.append(new_entry)
@@ -1718,7 +1777,22 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
             except Exception:
                 continue
 
-    return _tool_ok(f"{len(result)} memories", entries=result)
+    if not result:
+        return _tool_ok("0 memories", entries=[])
+    lines = [f"{len(result)} memories:"]
+    for m in result:
+        mbook = str(m.get("book") or "default")
+        mid_str = str(m.get("id") or "?")
+        mscope = str(m.get("scope") or "node")
+        mws = str(m.get("workspace") or "")
+        scope_label = f"{mscope}(@{mws})" if mws else mscope
+        trig_label = "constant" if m.get("constant") else f"kw={len(m.get('keywords') or [])}"
+        en_label = "enabled" if m.get("enabled", True) else "disabled"
+        preview = " ".join(str(m.get("content") or "").split())
+        if len(preview) > 100:
+            preview = preview[:100] + "…"
+        lines.append(f"- {mbook}/{mid_str} | {scope_label} | {trig_label} | {en_label} | {preview}")
+    return _tool_ok("\n".join(lines), entries=result)
 
 
 async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1865,6 +1939,11 @@ PLUGIN_META["tools"] = [
                 "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
                 "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
                 "scope": {"type": "string", "enum": ["workspace", "node"], "description": "Storage scope. 'workspace' (default): saved under the active workspace, isolated per-project. 'node': saved at node level, shared across all workspaces."},
+                "node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of node IDs allowed to see this memory entry (omit for all nodes in the namespace).",
+                },
             },
             "required": ["id", "content"],
         },
@@ -2416,14 +2495,13 @@ def _register_admin_routes(routes: Any) -> None:
     mem_router.add_api_route("/memory/entry", _memory_delete_route, methods=["DELETE"])
     routes.register(mem_router, mount="admin/config", description="memory 配置端点")
 
-    # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身
-    # 不含秘密，数据全部经鉴权 XHR 获取。
+    # 面板与依赖资源需要鉴权；宿主用 Bearer 换取短期静态资源 Cookie。
     client = APIRouter()
     client.include_router(
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="knowledge_inject 设置面板静态资源")
+    routes.register(client, description="knowledge_inject 设置面板静态资源（需鉴权）")
 
 
 class KnowledgeInjector:
@@ -2477,7 +2555,7 @@ class KnowledgeInjector:
             sctx.instruction,
             conversational_history(sctx.history),
             sctx.runtime_cfg,
-            task_context={"workspace_name": sctx.workspace_name},
+            task_context={**(sctx.task_context or {}), "workspace_name": sctx.workspace_name},
         )
         self._cache_key = key
         self._cache_val = result

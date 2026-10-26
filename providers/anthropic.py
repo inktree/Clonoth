@@ -202,9 +202,10 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                 for tb in _saved_blocks:
                     tb_type = tb.get("type", "")
                     if tb_type == "thinking":
+                        # [2026-10-25] 不回传思维链摘要正文（thinking 设为空串 ""），仅回传 signature
                         blocks.append({
                             "type": "thinking",
-                            "thinking": tb.get("thinking", ""),
+                            "thinking": "",
                             "signature": tb.get("signature", ""),
                         })
                     elif tb_type == "redacted_thinking":
@@ -297,22 +298,20 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
 
 
 def _parse_response_content(content_blocks: list[dict]) -> tuple[str, str, list[ToolCall], list[dict]]:
-    """Parse Anthropic response content blocks into (text, reasoning, tool_calls, thinking_blocks).
+    """Parse Anthropic response content blocks into (text, thought_summary, tool_calls, thinking_blocks).
 
     Content block types:
-    - {"type": "thinking", "thinking": "...", "signature": "..."} -> reasoning + thinking_blocks
+    - {"type": "thinking", "thinking": "...", "signature": "..."} -> thought_summary + thinking_blocks (with thinking="")
     - {"type": "redacted_thinking", "data": "..."} -> thinking_blocks (opaque, must round-trip)
     - {"type": "text", "text": "..."} -> text
     - {"type": "tool_use", "id": "...", "name": "...", "input": {...}} -> tool_calls
 
-    [2026-05-01] 新增 thinking_blocks 返回值：保留含 signature 的原始 thinking block，
-    用于多轮对话时回传给 Anthropic API，满足 extended thinking 签名验证要求。
+    [2026-10-25] 思维链摘要仅保存在 thought_summary（落盘到 _meta["thought_summary"]），
+    存入 thinking_blocks 时将 thinking 置为空串 ""、仅保留 signature，避免重复存储与回传摘要。
     """
     text_parts: list[str] = []
-    reasoning_parts: list[str] = []
+    summary_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    # [2026-05-01] 收集原始 thinking/redacted_thinking blocks，
-    # 保留 signature 字段以供后续轮次回传
     thinking_blocks: list[dict] = []
 
     for block in content_blocks:
@@ -320,12 +319,13 @@ def _parse_response_content(content_blocks: list[dict]) -> tuple[str, str, list[
         if btype == "thinking":
             thinking_text = block.get("thinking", "")
             if thinking_text:
-                reasoning_parts.append(thinking_text)
-            # 保留整个 block（含 signature）用于 round-trip
-            thinking_blocks.append(block)
+                summary_parts.append(thinking_text)
+            tb: dict[str, Any] = {"type": "thinking", "thinking": ""}
+            if "signature" in block:
+                tb["signature"] = block["signature"]
+            thinking_blocks.append(tb)
         elif btype == "redacted_thinking":
-            # redacted_thinking 是不透明的加密块，必须原样回传
-            thinking_blocks.append(block)
+            thinking_blocks.append({"type": "redacted_thinking", "data": block.get("data", "")})
         elif btype == "text":
             t = block.get("text", "")
             if t:
@@ -339,7 +339,7 @@ def _parse_response_content(content_blocks: list[dict]) -> tuple[str, str, list[
                 arguments=args,
             ))
 
-    return "\n".join(text_parts), "\n".join(reasoning_parts), tool_calls, thinking_blocks
+    return "\n".join(text_parts), "\n".join(summary_parts), tool_calls, thinking_blocks
 
 
 def _parse_usage(data: dict) -> dict:
@@ -349,21 +349,26 @@ def _parse_usage(data: dict) -> dict:
     Anthropic 的 cache_read_input_tokens（缓存命中）和
     cache_creation_input_tokens（缓存写入）归一化为
     cached_prompt_tokens 和 cache_write_prompt_tokens。
+    [2026-10-23] Anthropic 的 input_tokens 仅包含最后一个缓存断点之后的未缓存输入，
+    真实总输入 prompt_tokens 必须加上 cache_read_input_tokens 与 cache_creation_input_tokens。
     """
     usage = data.get("usage", {})
-    cache_read = usage.get("cache_read_input_tokens") or 0
-    cache_write = usage.get("cache_creation_input_tokens") or 0
-    inp = (usage.get("input_tokens") or 0) + cache_read + cache_write
-    out = usage.get("output_tokens") or 0
+    raw_inp = usage.get("input_tokens", 0) or 0
+    cache_read = usage.get("cache_read_input_tokens")
+    cache_write = usage.get("cache_creation_input_tokens")
+    cr_val = cache_read if isinstance(cache_read, int) and cache_read > 0 else 0
+    cw_val = cache_write if isinstance(cache_write, int) and cache_write > 0 else 0
+    inp = raw_inp + cr_val + cw_val
+    out = usage.get("output_tokens", 0) or 0
     result = {
         "prompt_tokens": inp,
         "completion_tokens": out,
         "total_tokens": inp + out,
     }
-    if cache_read > 0:
-        result["cached_prompt_tokens"] = cache_read
-    if cache_write > 0:
-        result["cache_write_prompt_tokens"] = cache_write
+    if cr_val > 0:
+        result["cached_prompt_tokens"] = cr_val
+    if cw_val > 0:
+        result["cache_write_prompt_tokens"] = cw_val
     return result
 
 
@@ -384,6 +389,9 @@ class AnthropicProvider(BaseProvider):
     # 原因：engine 不再硬编码 AnthropicProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "anthropic" 映射回这个类。
     provider_name = "anthropic"
+    default_max_tokens: int = 64000
+    default_reasoning_effort: str | None = None
+    default_thought_summary: bool = True
 
     def __init__(
         self,
@@ -443,10 +451,18 @@ class AnthropicProvider(BaseProvider):
         system_text, converted = _convert_messages(messages)
         converted_tools = _convert_tools(tools)
 
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_completion_tokens")
+        try:
+            eff_max_tokens = int(_raw_max_tok) if _raw_max_tok is not None and int(_raw_max_tok) > 0 else max_tokens
+        except (TypeError, ValueError):
+            eff_max_tokens = max_tokens
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": converted,
-            "max_tokens": max_tokens,
+            "max_tokens": eff_max_tokens,
         }
         if system_text:
             payload["system"] = system_text
@@ -456,9 +472,42 @@ class AnthropicProvider(BaseProvider):
             payload["temperature"] = temperature
         if stream:
             payload["stream"] = True
-        # 注入 thinking 参数（如 {"type": "adaptive"} 或 {"type": "enabled", "budget_tokens": N}）
-        _thinking = self._options.get("thinking")
-        if _thinking and isinstance(_thinking, dict):
+
+        # 注入 thinking / output_config / display 参数
+        _thinking: dict[str, Any] = {}
+        _raw_t_dict = self._options.get("thinking")
+        if isinstance(_raw_t_dict, dict):
+            _thinking.update(_raw_t_dict)
+            _thinking.pop("budget_tokens", None)
+
+        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if _raw_effort is not None:
+            _effort_str = str(_raw_effort).strip().lower()
+            if _effort_str == "none":
+                _thinking = {"type": "disabled"}
+            elif _effort_str:
+                _thinking.setdefault("type", "adaptive")
+                _out_cfg = dict(payload.get("output_config") or {})
+                _out_cfg["effort"] = _effort_str
+                payload["output_config"] = _out_cfg
+                payload.pop("temperature", None)
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if isinstance(_raw_ts, bool):
+            _ts_enabled = _raw_ts
+        elif isinstance(_raw_ts, str):
+            _ts_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none", "omitted")
+        else:
+            _ts_enabled = bool(_raw_ts)
+
+        if _thinking.get("type") == "disabled":
+            _thinking.pop("display", None)
+        else:
+            _thinking.setdefault("type", "adaptive")
+            if _thinking.get("type") in ("adaptive", "enabled"):
+                _thinking["display"] = "summarized" if _ts_enabled else "omitted"
+
+        if _thinking:
             payload["thinking"] = _thinking
         self._last_payload = payload
         return payload
@@ -492,12 +541,11 @@ class AnthropicProvider(BaseProvider):
 
         data = resp.json()
         content_blocks = data.get("content", [])
-        text, reasoning, tool_calls, thinking_blocks = _parse_response_content(content_blocks)
+        text, thought_summary, tool_calls, thinking_blocks = _parse_response_content(content_blocks)
         usage = _parse_usage(data)
 
-        # [2026-05-01] 将含 signature 的原始 thinking blocks 存入 provider_meta，
-        # engine 会自动持久化到消息 _meta.metadata.anthropic，
-        # 下一轮 _convert_messages 读取后原样回传给 API
+        # [2026-10-25] thinking_blocks 中仅保存 {"type": "thinking", "thinking": "", "signature": "..."}，
+        # 思维链摘要文本只保存在 thought_summary（落盘到 _meta["thought_summary"]）
         provider_meta: dict[str, Any] = {}
         if thinking_blocks:
             provider_meta["thinking_blocks"] = thinking_blocks
@@ -505,7 +553,8 @@ class AnthropicProvider(BaseProvider):
         return ProviderResponse(
             ok=True,
             text=text,
-            reasoning=reasoning or None,
+            reasoning=None,
+            thought_summary=thought_summary or None,
             tool_calls=tool_calls,
             usage=usage,
             raw=data,
@@ -678,8 +727,8 @@ class AnthropicProvider(BaseProvider):
                         # [2026-05-01] 完成 thinking block：组装含 signature 的完整 block
                         if idx in active_thinking:
                             info = active_thinking.pop(idx)
-                            full_thinking = "".join(info.get("thinking_parts", []))
-                            tb: dict[str, Any] = {"type": "thinking", "thinking": full_thinking}
+                            # [2026-10-25] thinking_blocks 存盘和回传时将 thinking 设为空串 ""，只保留 signature
+                            tb: dict[str, Any] = {"type": "thinking", "thinking": ""}
                             if "signature" in info:
                                 tb["signature"] = info["signature"]
                             thinking_blocks.append(tb)
@@ -723,12 +772,16 @@ class AnthropicProvider(BaseProvider):
             return ProviderResponse(ok=False, error=str(exc), status_code=0)
 
         # Build final usage combining message_start and message_delta
-        final_usage = _parse_usage({"usage": {**input_usage, **usage}})
+        merged_raw_usage = dict(input_usage)
+        for _uk, _uv in usage.items():
+            if _uv:
+                merged_raw_usage[_uk] = _uv
+        final_usage = _parse_usage({"usage": merged_raw_usage})
 
         text = "".join(text_parts)
-        reasoning = "".join(reasoning_parts)
+        thought_summary = "".join(reasoning_parts)
 
-        # [2026-05-01] 与非流式路径对齐：将含 signature 的 thinking blocks 存入 provider_meta
+        # [2026-10-25] thinking_blocks 仅保存空 thinking + signature，摘要保存在 thought_summary
         provider_meta: dict[str, Any] = {}
         if thinking_blocks:
             provider_meta["thinking_blocks"] = thinking_blocks
@@ -736,7 +789,8 @@ class AnthropicProvider(BaseProvider):
         return ProviderResponse(
             ok=True,
             text=text,
-            reasoning=reasoning or None,
+            reasoning=None,
+            thought_summary=thought_summary or None,
             tool_calls=tool_calls,
             usage=final_usage,
             provider_meta=provider_meta,

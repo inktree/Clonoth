@@ -498,7 +498,13 @@ ${text}` : text;
           slot has no contribution. */}
       <div className="pointer-events-none absolute inset-x-2 bottom-full z-10 sm:inset-x-3">
         <PluginSlotHost
-          className="pointer-events-auto mb-1 flex flex-wrap items-center justify-end gap-1"
+          // [2026-09-08] Why: the container previously spanned the composer's
+          // full width with pointer-events-auto, so the entire strip above the
+          // input swallowed clicks meant for the chat flow beneath it. How:
+          // shrink the flex row to its content width and pin it right; the
+          // completer dropdown (max-width 480px) still expands when open.
+          // Purpose: only real chip/dropdown pixels intercept pointer events.
+          className="pointer-events-auto mb-1 ml-auto flex w-fit max-w-full flex-wrap items-center justify-end gap-1"
           data={inputSlotData}
           slot="input_above"
         />

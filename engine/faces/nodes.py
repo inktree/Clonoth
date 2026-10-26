@@ -10,7 +10,7 @@ discovery, the supervisor node list) can query them. Purpose: a plugin
 declares a capability, the framework consumes it — unloading the plugin
 reverts the override through the shared disposal ledger.
 
-Precedence: plugin declaration > engine/system_nodes/ > config/nodes/.
+Precedence: plugin declaration > config/nodes/.
 Conflict rule matches the routes face: the same node id declared by two
 different plugins is rejected; re-registration by the same plugin (reload)
 replaces.
@@ -130,5 +130,6 @@ class PluginNodesFace:
                 _bump()
 
         if self._ledger is not None:
-            self._ledger.record(_dispose)
+            # Node declarations are process-global, independent of the thin face.
+            self._ledger.record(_dispose, key=("node", nid))
         return _dispose

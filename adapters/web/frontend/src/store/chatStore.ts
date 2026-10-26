@@ -276,6 +276,11 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         ...state.childSessionMessages,
         [trimmed]: [],
       },
+      // [2026-09-13] 进入子会话视图时重置空态标记，历史加载完成后重新写入。
+      childSessionEmpty: {
+        ...state.childSessionEmpty,
+        [trimmed]: false,
+      },
       contextUsage: state.contextUsageBySession[trimmed] || state.contextUsage,
     }));
     void loadChildSessionHistoryIntoStore(trimmed, set, trimmedTaskId || undefined);

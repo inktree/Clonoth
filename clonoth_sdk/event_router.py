@@ -577,6 +577,19 @@ class EventRouter:
     #  outbound_message — 主节点回复 / fallback 发送
     # ------------------------------------------------------------------
 
+    async def _notify_response_info(self, event: Event, trigger=None) -> None:
+        """Optional presentation callback; never append notices to reply text."""
+        info = event.payload.get("response_info")
+        callback = getattr(self._cb, "send_response_notice", None)
+        if not callable(callback) or not isinstance(info, dict) or not info.get("notices"):
+            return
+        if not event.payload.get("text") and not event.payload.get("attachments"):
+            return
+        try:
+            await callback(trigger, self._state.get_conversation_key(event.session_id) or "", info)
+        except Exception:
+            logger.exception("send_response_notice failed")
+
     async def _handle_outbound_message(self, event: Event) -> None:
         """处理 outbound_message 事件。
 
@@ -601,15 +614,19 @@ class EventRouter:
                 await self._cb.send_reply(
                     trigger, text, attachments, main_state=main_state,
                 )
+                await self._notify_response_info(event, trigger)
             except Exception as e:
                 logger.error("send_reply failed: %s", e)
             return
 
         # Path 2: Fallback（子节点 / 调度任务输出）
         node_id = p.get("node_id", "") or ""
-        # 过滤系统内部节点，不向平台发送
-        if node_id.startswith("system."):
-            logger.debug("Skip system node outbound: %s", node_id)
+        # Output-chain processing does not change the outward-facing speaker.
+        # Preserve raw execution IDs; older events have only node_id.
+        reply_node_id = p.get("reply_node_id") or node_id
+        # Neither an internal owner nor an internal executor is public output.
+        if node_id.startswith("system.") or reply_node_id.startswith("system."):
+            logger.debug("Skip system node outbound: %s / %s", node_id, reply_node_id)
             return
 
         conv_key = self._state.get_conversation_key(event.session_id) or ""
@@ -620,8 +637,9 @@ class EventRouter:
 
         try:
             await self._cb.send_to_channel(
-                conv_key, text, attachments, node_id=node_id,
+                conv_key, text, attachments, node_id=reply_node_id,
             )
+            await self._notify_response_info(event)
         except Exception as e:
             logger.error("send_to_channel failed: %s", e)
 
@@ -661,6 +679,7 @@ class EventRouter:
             if text or attachments:
                 try:
                     await self._cb.send_intermediate_reply(trigger, text, attachments)
+                    await self._notify_response_info(event, trigger)
                 except Exception as e:
                     logger.error("send_intermediate_reply failed: %s", e)
             return
@@ -688,6 +707,7 @@ class EventRouter:
                 await self._cb.send_to_channel(
                     conv_key, text, attachments, node_id=node_id,
                 )
+                await self._notify_response_info(event)
             except Exception as e:
                 logger.error(
                     "intermediate_reply send_to_channel failed: %s", e,

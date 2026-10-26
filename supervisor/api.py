@@ -80,6 +80,7 @@ from engine.model import resolve_provider
 from engine.node import load_node
 from clonoth_runtime import load_runtime_config
 from .local_onnx_tts import LocalOnnxTts, config_from_mapping
+from .panel_auth import PanelAuth
 
 
 logger = logging.getLogger(__name__)
@@ -321,6 +322,7 @@ def create_app(
     # [AutoC 2026-08-20] 插件路由面用 public=True 写入此集合；中间件闭包持有
     # 同一对象引用，运行期新增的公开路径立即生效，无需重建中间件。
     app.state.auth_exempt_paths = _AUTH_EXEMPT_PATHS
+    app.state.panel_auth = PanelAuth(app)
 
     @app.middleware("http")
     async def _auth_middleware(request: Request, call_next):
@@ -338,6 +340,8 @@ def create_app(
             try:
                 verify_admin_token(request)
             except HTTPException:
+                if app.state.panel_auth.permits(request):
+                    return await call_next(request)
                 return Response(
                     content=json.dumps({"detail": "Unauthorized"}),
                     status_code=401,
@@ -376,7 +380,7 @@ def create_app(
         uptime = (_now() - st.started_at).total_seconds()
         return HealthOut(
             run_id=st.eventlog.run_id, started_at=st.started_at,
-            uptime_seconds=uptime,
+            uptime_seconds=uptime, workspace_root=str(st.workspace_root),
         )
 
     @app.get("/v1/admin/usage/stats")
@@ -1006,11 +1010,35 @@ def create_app(
                     if isinstance(_reg, dict):
                         _reg.setdefault("is_child", True)
                         _reg["parent_session_id"] = _resolved_parent
+                        # [2026-09-14] Why: 该条目由 get_or_create_session 创建，
+                        # 不走 on_child_session_created，可能缺 last_active_at，
+                        # 导致 24h TTL 与 session_children 的宽限判定只能退回
+                        # created_at。How: 缺失时补当前时间，后续由终态写回刷新。
+                        # Purpose: registry 字段与正常子会话保持一致。
+                        _reg.setdefault("last_active_at", datetime.now(timezone.utc).isoformat())
                         if _entry_node:
                             _reg["node_id"] = _entry_node
                         if _ctx_mode:
                             _reg["context_mode"] = _ctx_mode
                         st._session_store._flush()
+
+                    # [AutoC 2026-09-13] Inherit parent workspace for dispatch children.
+                    # Why: spawn_worker and dispatch create child sessions via /v1/inbound
+                    # but never copy the parent's workspace binding, so children fall back
+                    # to the engine install directory and operate on production files.
+                    # How: when the child session has no workspace and the resolved parent
+                    # does, copy it before any task is created. Purpose: child agents work
+                    # in the same workspace as their parent without a race window.
+                    _parent_info = st.sessions.get(_resolved_parent)
+                    _child_info = st.sessions.get(session_id)
+                    if (
+                        _parent_info is not None
+                        and _child_info is not None
+                        and getattr(_parent_info, "workspace", None)
+                        and not getattr(_child_info, "workspace", None)
+                    ):
+                        _child_info.workspace = dict(_parent_info.workspace)
+                        st._session_store.update_workspace(session_id, _child_info.workspace)
 
         # [2026-05-28] 异步 dispatch 统一走 inbound：透传新增的 dispatch 字段到 payload。
         # 为什么：model_dump() 已包含这些字段，但 record_inbound_message_event 依赖
@@ -1105,10 +1133,29 @@ def create_app(
         return st.is_task_preempted(task_id)
 
     @app.post("/v1/tasks/{task_id}/preempt_consumed")
-    async def task_preempt_consumed(task_id: str) -> dict[str, Any]:
-        """Engine 读取完 preempt message 后调用，清空 message 防止重复注入。"""
+    async def task_preempt_consumed(
+        task_id: str, body: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        """Engine 读取完 preempt message 后调用，清空 message 防止重复注入。
+
+        [2026-09-13] 可选 body 携带实际消费内容。Why: 无条件全清会丢失消费期间
+        并发追加的消息（异步工具结果/子任务回调）。How: engine 传 consumed_message
+        与 consumed_attachment_count，旧调用不带 body 时退化为全清保持兼容。
+        """
+        body = body or {}
+        # None denotes the legacy call; an explicit empty string acknowledges
+        # an interrupt without consuming text appended while the engine worked.
+        consumed_message = str(body.get("consumed_message") or "") if "consumed_message" in body else None
+        try:
+            consumed_attachment_count = int(body.get("consumed_attachment_count", 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "consumed_attachment_count must be an integer") from exc
         st: SupervisorState = app.state.state
-        result = st.consume_preempt_message(task_id)
+        result = st.consume_preempt_message(
+            task_id,
+            consumed_message=consumed_message,
+            consumed_attachment_count=consumed_attachment_count,
+        )
         return {"ok": True, **result}
 
     @app.post("/v1/sessions/{session_id}/async_tool_result")

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from .stream_buffer import _StreamBuffer
@@ -143,13 +144,16 @@ def _build_messages_for_provider(
     modes, then performs its own final API conversion.  Other providers keep
     the existing L2 formatter path.
     """
+    # Defensive boundary for callers passing storage-shaped rows. Presentation
+    # history must never reach a model, including Responses/Gemini bypass paths.
+    messages = [{k: v for k, v in message.items() if k != "response_info"} for message in messages]
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
     # [2026-05-01] Responses conversion needs storage-level tool_calls and _meta.
     # Bypass both true native and fake-native L2; fake-native would text-collapse,
     # while true native would strip provider metadata needed for raw_output replay.
     # Gemini also needs _meta for raw_parts (thoughtSignature + functionCall round-trip)
-    if provider_name in {"openai-responses", "gemini"} and formatter_mode in {"native", "fake-native"}:
+    if provider_name in {"openai-responses", "gemini", "gemini-vertex", "gemini-aistudio"} and formatter_mode in {"native", "fake-native"}:
         # Keep storage-level tool_calls/_meta for the provider, but match
         # build_llm_messages by dropping ephemeral retry/control messages.
         # [2026-05-07] 旁路 provider 也必须执行控制流历史清洗。
@@ -163,6 +167,24 @@ def _build_messages_for_provider(
 # ---------------------------------------------------------------------------
 #  LLM 调用（含重试）
 # ---------------------------------------------------------------------------
+
+async def call_provider_once(ls: _LoopState, step: int, provider: Any, *, messages=None):
+    """Implementation of after_llm_call's call_provider capability.
+
+    A local call view reuses the request pipeline, without changing the default
+    provider or exposing private loop state to the plugin. No recursive hooks:
+    after_llm_call is fired only by the outer inference loop.
+    """
+    call = replace(ls, provider=provider, messages=ls.messages if messages is None else messages,
+                   use_stream=False, retry_max=0)
+    # A replacement call does not start another reactive-compaction attempt.
+    call._reactive_compact_done = True
+    try:
+        return await _call_llm_with_retry(call, step)
+    finally:
+        ls.preempt_after_step = call.preempt_after_step
+        ls.preempt_inject_info = call.preempt_inject_info
+
 
 async def _call_llm_with_retry(ls: _LoopState, step: int):
     """LLM 调用（含重试）。
@@ -393,30 +415,32 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             llm_task = asyncio.create_task(
                 ls.provider.chat(messages=llm_messages, tools=tools_arg)
             )
-            while True:
-                done, _ = await asyncio.wait({llm_task}, timeout=0.3)
-                if llm_task in done:
-                    resp = llm_task.result()
-                    break
-                if await ls.rctx.check_cancelled():
+            try:
+                while True:
+                    done, _ = await asyncio.wait({llm_task}, timeout=0.3)
+                    if llm_task in done:
+                        resp = llm_task.result()
+                        break
+                    if await ls.rctx.check_cancelled():
+                        await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
+                        _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
+                        _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
+                        return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
+                    if not ls.preempt_after_step and ls.preempt_inject_info is None:
+                        _pi_n = await ls.rctx.check_preempted()
+                        if _pi_n.get("preempted"):
+                            if _pi_n.get("message"):
+                                ls.preempt_inject_info = _pi_n
+                            else:
+                                ls.preempt_after_step = True
+            finally:
+                # Also cancel the transport when the worker task itself is cancelled.
+                if not llm_task.done():
                     llm_task.cancel()
                     try:
                         await llm_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                    await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
-                    # Phase 1: Signal — 取消时也发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
-                    # [硬取消-场景2] 非流式调用中取消：同上，不存盘未完成的 assistant 消息。
-                    return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
-                    _pi_n = await ls.rctx.check_preempted()
-                    if _pi_n.get("preempted"):
-                        if _pi_n.get("message"):
-                            ls.preempt_inject_info = _pi_n
-                        else:
-                            ls.preempt_after_step = True
 
         assert resp is not None
 
@@ -537,9 +561,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
 
 def _build_failure_action(ls: _LoopState, resp, step: int, retry_attempt: int = 0) -> TaskAction:
     """LLM 调用失败（重试耗尽），构建 FAIL action。"""
-    _fail_msg = resp.error or "LLM 调用失败"
+    _fail_msg = resp.error or "LLM call failed"
     if retry_attempt > 0:
-        _fail_msg = f"{_fail_msg} (已重试 {retry_attempt} 次)"
+        _fail_msg = f"{_fail_msg} (retried {retry_attempt} times)"
     ctx_ref = _persist_ctx(ls, step + 1)
     return TaskAction(
         action=ACTION_FAIL, node_id=ls.node.id,

@@ -10,10 +10,11 @@
 // host theme changes and plugin styles overrides propagate automatically.
 // Purpose: plugins get a full UI surface with zero frontend build involvement,
 // visually indistinguishable from host chrome.
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { getStoredAdminToken } from '../../api/supervisorClient';
+import { pluginApiRequest } from '../../api/supervisorClient';
 import { useViewStore } from '../../store/viewStore';
+import { useSettingsStore } from '../../store/settingsStore';
 import { Icon } from '../common';
 import { applyHostTheme } from './themeBridge';
 
@@ -37,8 +38,58 @@ interface PluginPanelProps {
 export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrome = true }: PluginPanelProps) => {
   // remount the frame whenever entry or session changes; the effect below
   // re-publishes the boot object before the new page's scripts run.
-  const frameKey = useMemo(() => `${entry}::${sessionId}`, [entry, sessionId]);
+  const adminToken = useSettingsStore((state) => state.adminToken);
+  const [attempt, setAttempt] = useState(0);
+  const frameKey = useMemo(() => `${entry}::${sessionId}::${adminToken}::${attempt}`, [entry, sessionId, adminToken, attempt]);
+  const [access, setAccess] = useState<{key: string; error?: string} | null>(null);
+  const panelReady = !!adminToken && access?.key === frameKey && !access.error;
   const frameRef = useRef<HTMLIFrameElement>(null);
+
+  useEffect(() => {
+    if (!adminToken) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending = false;
+    const renew = async () => {
+      if (pending || controller.signal.aborted) return;
+      pending = true;
+      clearTimeout(timer);
+      try {
+        const url = new URL(entry, window.location.origin);
+        if (url.origin !== window.location.origin || url.username || url.password || url.hash
+            || !/^\/v1\/plugins\/[A-Za-z0-9_-]{1,64}\/web\//.test(url.pathname)) {
+          throw new Error('面板地址必须是本站插件静态资源');
+        }
+        const result = await pluginApiRequest('/admin/auth/panel-session', {
+          method: 'POST', signal: controller.signal, credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}`},
+          body: JSON.stringify({entry: url.pathname + url.search}),
+        }) as {expires_in?: number};
+        if (controller.signal.aborted) return;
+        if (!result || typeof result.expires_in !== 'number' || result.expires_in <= 0) {
+          throw new Error('面板认证响应无效');
+        }
+        setAccess({key: frameKey});
+        timer = setTimeout(() => void renew(), result.expires_in * 500);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setAccess({key: frameKey, error: error instanceof Error ? error.message : '面板认证失败'});
+        }
+      } finally {
+        pending = false;
+      }
+    };
+    const onFocus = () => { if (!document.hidden) void renew(); };
+    void renew();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [frameKey, entry, adminToken]);
 
   useEffect(() => {
     const w = window as unknown as { __CLONOTH_BOOT__?: unknown };
@@ -49,14 +100,14 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
     // -1，归零才真正清除。Purpose: 并发面板共存期间 boot 始终可用。
     bootRefCount += 1;
     w.__CLONOTH_BOOT__ = {
-      token: getStoredAdminToken(),
+      token: adminToken || '',
       sessionId,
     };
     return () => {
       bootRefCount = Math.max(0, bootRefCount - 1);
       if (bootRefCount === 0) delete w.__CLONOTH_BOOT__;
     };
-  }, [sessionId]);
+  }, [sessionId, adminToken]);
 
   // inject the host theme after every (re)load of the panel document
   useEffect(() => {
@@ -67,7 +118,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
     // a remounted frame may already be complete before the listener attaches
     if (frame.contentDocument?.readyState === 'complete') inject();
     return () => frame.removeEventListener('load', inject);
-  }, [frameKey]);
+  }, [frameKey, panelReady]);
 
   // [AutoC 2026-08-25] Forward the open intent to the panel page.
   // The intent is opaque to the host; the panel page listens for
@@ -104,7 +155,7 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
       frame.removeEventListener('load', send);
       window.removeEventListener('message', onMessage);
     };
-  }, [frameKey, overlayId, rightIntent]);
+  }, [frameKey, panelReady, overlayId, rightIntent]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -124,13 +175,20 @@ export const PluginPanel = ({ entry, title, sessionId, onClose, overlayId, chrom
           </button>
         </div>
       )}
-      <iframe
+      {!panelReady && (
+        <div className="p-3 text-sm text-[var(--duties-secondary)]" role="status">
+          {!adminToken ? '请先登录' : access?.key === frameKey && access.error ? (
+            <><p>{access.error}</p><button type="button" className="mt-2 underline" onClick={() => setAttempt(n => n + 1)}>重试</button></>
+          ) : '正在验证面板访问权限…'}
+        </div>
+      )}
+      {panelReady && <iframe
         key={frameKey}
         ref={frameRef}
         src={entry}
         title={title}
         className="min-h-0 w-full flex-1 border-0 bg-[var(--duties-bg)]"
-      />
+      />}
     </div>
   );
 };

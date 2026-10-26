@@ -46,7 +46,17 @@ def _is_websocket(route: Any) -> bool:
 
 
 def _iter_http_routes(router: Any) -> list[Any]:
-    return [r for r in (getattr(router, "routes", None) or []) if not _is_websocket(r)]
+    """Include effective paths from FastAPI's lazy router wrappers (0.141+).
+
+    Older FastAPI exposes the already-expanded APIRoute objects directly.
+    Keep this compatibility detail shared by auth, listing and conflict checks.
+    """
+    routes: list[Any] = []
+    for route in getattr(router, "routes", None) or []:
+        expand = getattr(route, "effective_route_contexts", None)
+        candidates = expand() if callable(expand) else [route]
+        routes.extend(r for r in candidates if getattr(r, "methods", None))
+    return routes
 
 
 class _Declaration:
@@ -268,9 +278,9 @@ def static_router(directory: "str | PathLike[str]") -> Any:
     the requested relative path inside ``directory`` with a resolve()
     containment check (path traversal refused), maps directory requests to
     index.html, and returns a FileResponse (Starlette guesses the media type);
-    no directory listing. Declare with ``public=True`` on the routes face so
-    iframes can load the entry without an Authorization header. Purpose:
-    plugins get a web UI surface with zero frontend involvement.
+    no directory listing. Keep the declaration authenticated; the web host
+    exchanges its Bearer credential for a short-lived panel cookie before
+    loading the iframe. Purpose: standalone plugin pages without public files.
     """
     from pathlib import Path
 
@@ -283,7 +293,7 @@ def static_router(directory: "str | PathLike[str]") -> Any:
 
     router = APIRouter()
 
-    @router.get("/{file_path:path}", include_in_schema=False)
+    @router.api_route("/{file_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     async def _serve_static(file_path: str) -> FileResponse:
         cleaned = (file_path or "").strip("/")
         if not cleaned:
@@ -293,6 +303,9 @@ def static_router(directory: "str | PathLike[str]") -> Any:
             raise HTTPException(status_code=404, detail="Not Found")
         if not target.is_file():
             raise HTTPException(status_code=404, detail="Not Found")
-        return FileResponse(target)
+        return FileResponse(target, headers={"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"})
 
+    # Only this read-only handler may be reached with a panel cookie. Merely
+    # registering an API below /web/ does not give it the same permission.
+    _serve_static._clonoth_panel_static = True
     return router

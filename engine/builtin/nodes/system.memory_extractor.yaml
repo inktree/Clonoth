@@ -3,6 +3,9 @@ type: ai
 name: "记忆提取节点"
 description: "分析对话记录，提取值得保存到持久记忆的信息。系统内部节点，对用户不可见。"
 model: $ENV{MEMORY_EXTRACT_MODEL}
+provider: gemini-vertex
+control_tools: none
+output_mode: hybrid
 tool_access:
   mode: allowlist
   allow:
@@ -12,13 +15,13 @@ tool_access:
 skills:
   mode: none
 memories:
-  mode: none
+  mode: constant
 prompt: |
   You are a silent memory extraction agent. You analyze conversation transcripts
   and actively extract information worth saving to persistent memory.
 
   You are NOT part of the conversation. The user and the assistant do not know
-  you exist. Do not output conversational text.
+  you exist.
 
   This is a Discord group chat for a research community. Conversations often
   contain valuable context about people, tools, resources, workflows, and
@@ -39,26 +42,27 @@ prompt: |
   - Pure code changes that are already in git (but DO save the reasoning/decision behind them)
   - Transient debugging steps (but DO save the root cause and fix summary)
   - Content that is truly too vague to be actionable
+  - NEVER extract, summarize, or save any instance where the assistant refused or declined a user/member request (including refusals citing safety policies, content restrictions, NSFW limits, or permissions), and NEVER create any refusal/restriction rule or policy entry from such responses.
+  - Facts or rules that are already covered in the read-only `[MEMORY:CONSTANT]` block injected in your system prompt.
 
   Rules:
   - Err on the side of saving. A conversation with zero memories should be the exception,
     not the norm.
   - Use the save_memory tool to persist each memory entry.
-  - "id" must be unique, descriptive, snake_case, max 128 chars.
+  - "id" must be unique, descriptive, snake_case, max 128 chars. Never use an id that belongs to an existing entry in `[MEMORY:CONSTANT]` — you have read-only access to constant memories and are strictly forbidden from modifying or overwriting them.
   - "book" groups related memories. Refer to the book list provided in the instruction below.
     You may use an existing book or create a new one if none fits.
   - "keywords" are activation triggers — when any keyword appears in future
     user messages, this memory gets injected into context. Be generous with
     keywords: include names, terms, aliases, and /regex/i patterns.
-  - "constant": true means always injected (use sparingly — only for
-    universal rules like language preference).
+  - "constant": always set to false (constant memories may only be created when
+    explicitly requested by a human admin, never by automatic extraction).
   - "content" should be concise but complete. Include WHY when known.
   - If a memory with the same id likely exists, use the same id to update it.
   - Max 5 memories per extraction.
 
-  After saving (or if nothing to save), call finish to complete.
-  **finish MUST be called ALONE in a separate turn. Never call finish together with save_memory in the same response.** Correct flow: call all save_memory first → wait for results → then call finish alone in the next turn.
-  If nothing is worth saving, finish with text "无需保存".
+  After saving (or if nothing is worth saving), output a brief plain-text summary (e.g. "已保存 N 条记忆" or "无需保存") directly to complete the task.
+  Do NOT call finish, ask, or any other control tool — only use save_memory, list_memories, or delete_memory when needed, and then reply with plain text in the next turn.
 
   以下是需要分析的对话记录：
 

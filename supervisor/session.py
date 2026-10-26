@@ -718,7 +718,15 @@ class SessionMixin:
         action_type: str | None = None,
         llm_request_id: str | None = None,
         task_id: str | None = None,
+        response_info: dict[str, Any] | None = None,
+        reply_node_id: str | None = None,
     ) -> dict[str, Any]:
+        """Emit a reply with separate display ownership and execution metadata.
+
+        reply_node_id is the outward-facing node (output-chain entry); node_id,
+        task_id and llm_request_id continue to identify the final executor.
+        Legacy producers can omit reply_node_id; clients then use node_id.
+        """
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
         # 空 outbound_message 事件用于触发 Bot 侧 trigger/status_msg 的清理收尾。
@@ -751,12 +759,16 @@ class SessionMixin:
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if response_info:
+                payload["response_info"] = dict(response_info)
             if attachments:
                 payload["attachments"] = list(attachments)
             if src_seq is not None:
                 payload["source_inbound_seq"] = src_seq
             if node_id:
                 payload["node_id"] = node_id
+            if reply_node_id:
+                payload["reply_node_id"] = reply_node_id
             if llm_request_id:
                 # [AutoC 2026-06-04] Why: outbound_message is emitted after the task
                 # has already finished, but it must finalize the card for one LLM
@@ -818,6 +830,7 @@ class SessionMixin:
 
             # 方案 A: 标记 session 为已重置
             self._session_store.on_session_reset(old_session_id)
+            self._purge_context_usage_for_session(old_session_id)
 
             # Child Session 隔离（Phase C）：级联清理所有关联的 child session
             cleared_children = 0
@@ -1228,6 +1241,8 @@ class SessionMixin:
                     # refreshed inbound messages render the same image/file cards as
                     # realtime WebSocket messages.
                     entry["attachments"] = list(_attachments)
+                if msg.response_info:
+                    entry["response_info"] = dict(msg.response_info)
                 _provider = str(msg.meta.get("provider") or "").strip()
                 if _provider:
                     entry["provider"] = _provider
@@ -1350,24 +1365,25 @@ class SessionMixin:
         from engine.conversation_store import ConversationStore
 
         with self._lock:
-            usage: dict[str, Any] = {}
-            best_prompt = -1
+            si_obj = self.sessions.get(session_id)
+            entry_nid = str(getattr(si_obj, "entry_node_id", "") or "")
+            candidates: list[dict[str, Any]] = []
             for (sid, nid), entry in self._session_context_usage.items():
                 entry_node = str(entry.get("node_id") or nid or "")
                 if entry_node.startswith("system."):
                     continue
-                if sid == session_id:
-                    pt = entry.get("prompt_tokens") or 0
-                    if pt > best_prompt:
-                        best_prompt = pt
-                        usage = dict(entry)
-                else:
-                    resolved = self._route_session_id_for_session_locked(sid)
-                    if resolved == session_id:
-                        pt = entry.get("prompt_tokens") or 0
-                        if pt > best_prompt:
-                            best_prompt = pt
-                            usage = dict(entry)
+                if sid == session_id or self._route_session_id_for_session_locked(sid) == session_id:
+                    if (entry.get("prompt_tokens") or 0) > 0:
+                        candidates.append(dict(entry))
+
+            # Prefer the session's entry_node_id, then pick the most recently updated entry (not historical max)
+            if candidates:
+                entry_matches = [c for c in candidates if entry_nid and c.get("node_id") == entry_nid]
+                pool = entry_matches if entry_matches else candidates
+                pool.sort(key=lambda c: str(c.get("updated_at") or ""), reverse=True)
+                usage = dict(pool[0])
+            else:
+                usage = {}
 
         # [2026-06-06] Read from ConversationStore (persistent JSONL), not EventLog.
         # Priority: 1) in-memory usage from context_usage WS event
@@ -1387,7 +1403,7 @@ class SessionMixin:
             for msg in reversed(stored_msgs):
                 if msg.role == "assistant" and isinstance(msg.meta, dict):
                     msg_usage = msg.meta.get("usage")
-                    if isinstance(msg_usage, dict) and msg_usage.get("prompt_tokens"):
+                    if isinstance(msg_usage, dict) and not msg_usage.get("_compacted_stale") and msg_usage.get("prompt_tokens"):
                         prompt_tokens = msg_usage["prompt_tokens"]
                         usage["completion_tokens"] = msg_usage.get("completion_tokens")
                         usage["total_tokens"] = msg_usage.get("total_tokens")

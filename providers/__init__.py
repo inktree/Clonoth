@@ -43,7 +43,7 @@ class ProviderRegistry:
         # collecting block is active. Purpose: one unload undoes all surfaces.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("provider", self, provider_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:
@@ -94,7 +94,7 @@ auto_discover()
 # from providers. Discovery above does not depend on these imports; they only keep
 # the public package surface stable while routing moves to the registry.
 from .anthropic import AnthropicProvider  # noqa: E402
-from .gemini import GeminiProvider  # noqa: E402
+from .gemini import GeminiProvider, GeminiVertexProvider, GeminiAIStudioProvider  # noqa: E402
 from .openai import OpenAIProvider  # noqa: E402
 from .openai_responses import OpenAIResponsesProvider  # noqa: E402
 
@@ -108,5 +108,7 @@ __all__ = [
     "OpenAIProvider",
     "AnthropicProvider",
     "GeminiProvider",
+    "GeminiVertexProvider",
+    "GeminiAIStudioProvider",
     "OpenAIResponsesProvider",
 ]

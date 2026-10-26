@@ -1323,10 +1323,13 @@ export interface StructuredMessage {
   tool_result_format?: string;
   elapsed_ms?: number;
   tool_result_elapsed_ms?: number;
+  tool_summary?: string;
+  tool_result_summary?: string;
   tool_attachments?: Array<{ name?: string; size?: number; url?: string; type?: string; path?: string; mime_type?: string }>;
   provider?: string;
   tool_mode?: string;
   provider_metadata?: Record<string, unknown>;
+  response_info?: import('../types/message').ResponseInfo;
   usage?: Record<string, unknown>;
   tool_call_ids?: string[];
   // [thinking-time 2026-06-01] Precise reasoning timing from backend meta.

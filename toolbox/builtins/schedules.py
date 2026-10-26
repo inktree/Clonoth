@@ -114,7 +114,30 @@ async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
     from supervisor.scheduler import load_schedules
 
     schedules = load_schedules(ctx.workspace_root)
-    return _ok(f"{len(schedules)} schedules", schedules=schedules)
+    # [fix 2026-09-14] Why: result_to_raw 把 data.result 作为模型可见的全部文本
+    # （第一短路路径），旧写法只给计数导致模型拿不到列表，工具无意义。How:
+    # 每条一行纯索引（id/cron/类型/启停/once/ck，条数不限——单行长度固定，
+    # 几十条也只有几 KB）；单项内容（text/command）不进清单，需要时凭 id
+    # read_file data/schedules.yaml 查看。结构化 schedules 字段全量保留给
+    # 前端/审计。Purpose: 一次调用掌握全部任务概貌，内容量由单行紧凑控制。
+    if not schedules:
+        return _ok("0 schedules (data/schedules.yaml is empty)", schedules=schedules)
+    lines = [f"{len(schedules)} schedules (full entry details: read_file data/schedules.yaml):"]
+    for s in schedules:
+        sid = str(s.get("id") or "?")
+        cron = str(s.get("cron") or "?")
+        stype = "script" if s.get("type") == "script" else "message"
+        enabled = "enabled" if s.get("enabled", True) else "disabled"
+        once = ", once" if s.get("once") else ""
+        ck = str(s.get("conversation_key") or "")
+        # [fix 2026-09-14] 单行只保留索引性字段（id/cron/类型/启停/once/ck），
+        # 不携带 text/command 内容——清单用于定位与决策，内容细节凭 id 去
+        # read_file data/schedules.yaml 查询，避免单项描述堆占用上下文。
+        line = f"- {sid} | cron '{cron}' | {stype} | {enabled}{once}"
+        if ck:
+            line += f" | ck={ck}"
+        lines.append(line)
+    return _ok("\n".join(lines), schedules=schedules)
 
 
 async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:

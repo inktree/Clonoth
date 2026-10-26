@@ -51,21 +51,31 @@ _SYNTHETIC_TOOL_OUTPUT = "[No tool result was recorded by the engine.]"
 
 
 def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove encrypted_content from reasoning items, keeping summary."""
+    """Remove encrypted_content from reasoning items, keeping empty summary."""
     cleaned: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, dict) and item.get("type") == "reasoning":
-            # [2026-05-06] Why: OpenAI can reject stale encrypted reasoning
-            # content when verifying prior turns. How: copy only reasoning items
-            # and drop encrypted_content while preserving summary. Purpose: keep
-            # useful visible reasoning summaries without resending unverifiable
-            # encrypted blobs.
             new_item = {k: v for k, v in item.items() if k != "encrypted_content"}
-            if "summary" not in new_item:
-                new_item["summary"] = []
+            new_item["summary"] = []
             cleaned.append(new_item)
         else:
             cleaned.append(item)
+    return cleaned
+
+
+def _strip_reasoning_summary_from_output(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Empty the summary array on reasoning output items so thought summaries are not duplicated or resent."""
+    cleaned: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "reasoning":
+            new_item = dict(item)
+            new_item["summary"] = []
+            new_item.pop("content", None)
+            cleaned.append(new_item)
+        else:
+            cleaned.append(dict(item))
     return cleaned
 
 
@@ -121,6 +131,9 @@ class OpenAIResponsesProvider(BaseProvider):
     # 原因：engine 不再硬编码 OpenAIResponsesProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "openai-responses" 映射回这个类。
     provider_name = "openai-responses"
+    default_max_tokens: int | None = None
+    default_reasoning_effort: str | None = None
+    default_thought_summary: bool = False
 
     def __init__(
         self,
@@ -262,10 +275,11 @@ class OpenAIResponsesProvider(BaseProvider):
                     for _raw_item in _raw_output:
                         if not isinstance(_raw_item, dict):
                             continue
-                        # Copy before adding a missing summary so stored history is not mutated.
+                        # Copy and strip summary text so stored thought_summary is never resent to OpenAI.
                         _item = dict(_raw_item)
-                        if _item.get("type") == "reasoning" and "summary" not in _item:
+                        if _item.get("type") == "reasoning":
                             _item["summary"] = []
+                            _item.pop("content", None)
                         items.append(_item)
                         if _item.get("type") == "function_call" and _item.get("call_id"):
                             pending_calls.append({
@@ -362,10 +376,11 @@ class OpenAIResponsesProvider(BaseProvider):
 
         body = resp.json()
         result = self._parse_response(body)
-        # [2026-05-01] 存储原始 output items（含 reasoning encrypted_content）到 provider_meta
+        # [2026-05-01] 存储原始 output items（含 reasoning encrypted_content）到 provider_meta，
+        # [2026-10-25] 清空 reasoning 项的 summary 数组，避免重复存储与回传摘要
         raw_output = body.get("output")
         if raw_output and isinstance(raw_output, list):
-            result.provider_meta["raw_output"] = raw_output
+            result.provider_meta["raw_output"] = _strip_reasoning_summary_from_output(raw_output)
         return result
 
     # ------------------------------------------------------------------
@@ -397,6 +412,7 @@ class OpenAIResponsesProvider(BaseProvider):
             # -- Accumulators for the full response ----------------------
             text_parts: list[str] = []
             thinking_parts: list[str] = []
+            summary_parts: list[str] = []
             # tool_calls keyed by output index so we can accumulate arguments
             pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
             # [tool-stream 2026-05-19] 记录已发送 done 的 output index。
@@ -462,13 +478,16 @@ class OpenAIResponsesProvider(BaseProvider):
                                     await on_text(delta)
 
                         # --- reasoning / thinking deltas ---
-                        elif etype in (
-                            "response.reasoning_text.delta",
-                            "response.reasoning_summary_text.delta",
-                        ):
+                        elif etype == "response.reasoning_text.delta":
                             delta = event.get("delta", "")
                             if delta:
                                 thinking_parts.append(delta)
+                                if on_thinking:
+                                    await on_thinking(delta)
+                        elif etype == "response.reasoning_summary_text.delta":
+                            delta = event.get("delta", "")
+                            if delta:
+                                summary_parts.append(delta)
                                 if on_thinking:
                                     await on_thinking(delta)
 
@@ -586,10 +605,10 @@ class OpenAIResponsesProvider(BaseProvider):
                 continue
 
             # -- Build final ProviderResponse ----------------------------
-            # raw_output_items 在 response.completed 事件中捕获
+            # raw_output_items 在 response.completed 事件中捕获（清空 summary 避免重复存储与回传）
             provider_meta: dict[str, Any] = {}
             if raw_output_items:
-                provider_meta["raw_output"] = raw_output_items
+                provider_meta["raw_output"] = _strip_reasoning_summary_from_output(raw_output_items)
 
             tool_calls: list[ToolCall] = []
             for _idx, pc in sorted(pending_calls.items()):
@@ -606,6 +625,7 @@ class OpenAIResponsesProvider(BaseProvider):
                 text="".join(text_parts) or None,
                 tool_calls=tool_calls,
                 reasoning="".join(thinking_parts) or None,
+                thought_summary="".join(summary_parts) or None,
                 usage=_normalize_usage(usage),
                 provider_meta=provider_meta,
             )
@@ -650,9 +670,42 @@ class OpenAIResponsesProvider(BaseProvider):
                 else:
                     resp_tools.append(t)
             payload["tools"] = resp_tools
-        # 注入 reasoning 参数（如 {"effort": "medium", "summary": "auto"}）
-        _reasoning = self._options.get("reasoning")
-        if _reasoning and isinstance(_reasoning, dict):
+        # max_tokens / max_completion_tokens -> max_output_tokens
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_completion_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self.default_max_tokens
+        try:
+            if _raw_max_tok is not None and int(_raw_max_tok) > 0:
+                payload["max_output_tokens"] = int(_raw_max_tok)
+        except (TypeError, ValueError):
+            pass
+
+        # 注入 reasoning 参数（支持 reasoning_effort 与 thought_summary，thought_summary 默认为 False）
+        _reasoning: dict[str, Any] = {}
+        _raw_r_dict = self._options.get("reasoning")
+        if isinstance(_raw_r_dict, dict):
+            _reasoning.update(_raw_r_dict)
+
+        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if _raw_effort is not None:
+            _effort_str = str(_raw_effort).strip().lower()
+            if _effort_str:
+                _reasoning["effort"] = _effort_str
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if _raw_ts is True or (isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("true", "1", "yes", "auto")):
+            _reasoning["summary"] = "auto"
+        elif isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("concise", "detailed"):
+            _reasoning["summary"] = _raw_ts.strip().lower()
+        elif "thought_summary" in self._options:
+            _reasoning.pop("summary", None)
+
+        if _reasoning.get("effort") == "none":
+            _reasoning.pop("summary", None)
+
+        if _reasoning:
             payload["reasoning"] = _reasoning
         return payload
 
@@ -665,6 +718,7 @@ class OpenAIResponsesProvider(BaseProvider):
         """Parse a non-streaming Responses API JSON body into ProviderResponse."""
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        summary_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
         for item in body.get("output", []):
@@ -676,9 +730,13 @@ class OpenAIResponsesProvider(BaseProvider):
                         text_parts.append(block.get("text", ""))
 
             elif itype == "reasoning":
-                # Reasoning summary blocks
+                # Reasoning summary blocks -> thought_summary
                 for block in item.get("summary", []):
                     if block.get("type") == "summary_text":
+                        summary_parts.append(block.get("text", ""))
+                # Raw reasoning content blocks (if any) -> reasoning
+                for block in item.get("content", []) or []:
+                    if isinstance(block, dict) and block.get("type") == "reasoning_text":
                         thinking_parts.append(block.get("text", ""))
 
             elif itype == "function_call":
@@ -695,6 +753,7 @@ class OpenAIResponsesProvider(BaseProvider):
             text="".join(text_parts) or None,
             tool_calls=tool_calls,
             reasoning="".join(thinking_parts) or None,
+            thought_summary="".join(summary_parts) or None,
             usage=_normalize_usage(usage),
         )
 

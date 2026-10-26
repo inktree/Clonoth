@@ -103,6 +103,12 @@ export async function loadChildSessionHistoryIntoStore(
         ...state.childSessionMessages,
         [sessionId]: selectOrderedMessagesFromState(hydrated, conversationId),
       },
+      // [2026-09-13] 记录空结果：区分“还在加载”与“已确认无记录”，子会话
+      // 视图据此显示明确提示（会话已被 TTL 清理或本身无输出）。
+      childSessionEmpty: {
+        ...state.childSessionEmpty,
+        [sessionId]: history.length === 0,
+      },
     };
   });
 }

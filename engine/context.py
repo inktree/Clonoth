@@ -53,10 +53,23 @@ class RunContext:
     completed_steps: int = 0
     current_llm_request_id: str = ""
     llm_request_index: int = 0
+    # Presentation-only facts for the current response; never part of prompts.
+    response_info: dict[str, Any] = field(default_factory=dict)
     workspace: Path | None = None
     workspace_name: str = ""
+    sticky_session_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.sticky_session_id:
+            self.sticky_session_id = self.parent_session_id or self.child_session_id or self.session_id
+        try:
+            from .model import _current_sticky_sid_var
+            _current_sticky_sid_var.set(self.sticky_session_id)
+        except Exception:
+            pass
 
     def begin_llm_request(self) -> str:
+        self.response_info = {}
         self.llm_request_index += 1
         base = self.task_id or self.session_id or "llm"
         self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
@@ -73,6 +86,10 @@ class RunContext:
             payload.setdefault("is_system_task", True)
         if self.current_llm_request_id:
             payload.setdefault("llm_request_id", self.current_llm_request_id)
+        if self.response_info and event_type in {
+            "assistant_text", "intermediate_reply", "stream_text_final", "tool_call_start", "tool_call_end",
+        }:
+            payload.setdefault("response_info", dict(self.response_info))
         route_session_id = self.parent_session_id or self.session_id
         if self.parent_session_id and self.parent_session_id != self.session_id:
             payload.setdefault("parent_session_id", self.parent_session_id)
@@ -118,14 +135,86 @@ class RunContext:
             pass
         return {"preempted": False, "message": "", "attachments": []}
 
-    async def consume_preempt(self) -> None:
+    async def consume_preempt(self, message: str = "", attachment_count: int = 0) -> None:
+        # [2026-09-13] 携带实际消费内容做前缀切除。Why: 注入到持久化之间若
+        # supervisor 侧又追加了新消息，无条件全清会把后到消息一并删除。
+        # How: 把 check_preempted 返回并已注入的文本与附件数随消费上报，
+        # supervisor 只切除已消费前缀。Purpose: 并发追加的消息保留到下轮轮询。
         try:
             if self.task_id:
                 await self.http.post(
-                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed"
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed",
+                    json={
+                        "consumed_message": str(message or ""),
+                        "consumed_attachment_count": int(attachment_count or 0),
+                    },
                 )
         except Exception:
             pass
+
+    async def list_active_child_tasks(self) -> list[dict[str, Any]]:
+        """Return active child-agent tasks routed under this conversation."""
+        # [AutoC 2026-09-12] Combine both Supervisor child-task representations.
+        # [fix 2026-09-13] Reduced timeout 10s->3s and run both queries concurrently
+        # via asyncio.gather to cut worst-case hot-path delay from 20s to 3s.
+        import asyncio as _asyncio
+        route_session_id = str(self.parent_session_id or self.session_id or "").strip()
+        if not route_session_id:
+            return []
+
+        active_statuses = {"pending", "running", "suspended", "awaiting_approval"}
+        tasks_by_id: dict[str, dict[str, Any]] = {}
+
+        def _add(raw: Any, *, child_session: bool = False) -> None:
+            if not isinstance(raw, dict):
+                return
+            task_id = str(raw.get("task_id") or "").strip()
+            status = str(raw.get("status") or "").strip()
+            if not task_id or task_id == self.task_id or status not in active_statuses:
+                return
+            if not child_session and bool(raw.get("is_user_entry")):
+                return
+            tasks_by_id[task_id] = {
+                "task_id": task_id,
+                "node_id": str(raw.get("node_id") or ""),
+                "status": status,
+                "created_at": str(raw.get("created_at") or raw.get("started_at") or ""),
+                "session_id": str(raw.get("session_id") or raw.get("branch_session_id") or ""),
+                "caller_task_id": str(raw.get("caller_task_id") or ""),
+            }
+
+        async def _fetch_running() -> None:
+            try:
+                response = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{route_session_id}/running_tasks",
+                    timeout=3.0,
+                )
+                if response.status_code == 200:
+                    payload = response.json()
+                    rows = payload.get("tasks") if isinstance(payload, dict) else payload
+                    if isinstance(rows, list):
+                        for row in rows:
+                            _add(row)
+            except Exception:
+                pass
+
+        async def _fetch_children() -> None:
+            try:
+                response = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{route_session_id}/children",
+                    timeout=3.0,
+                )
+                if response.status_code == 200:
+                    rows = response.json()
+                    if isinstance(rows, list):
+                        for row in rows:
+                            _add(row, child_session=True)
+            except Exception:
+                pass
+
+        await _asyncio.gather(_fetch_running(), _fetch_children())
+
+        return sorted(tasks_by_id.values(), key=lambda item: (item.get("created_at", ""), item["task_id"]))
 
 
 class Contributions:
@@ -182,7 +271,7 @@ class Contributions:
                     setter(None)
 
         if self._ledger is not None:
-            self._ledger.record(_dispose)
+            self._ledger.record(_dispose, key=("face", self, clean))
         return _dispose
 
     def get(self, name: str) -> Any | None:

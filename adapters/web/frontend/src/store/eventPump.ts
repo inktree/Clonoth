@@ -6,8 +6,7 @@
 // as parameters. Purpose: this module owns realtime side effects without importing the store singleton or
 // creating store dependency cycles.
 
-import { connectGlobalWS, disconnectGlobalWS } from '../api';
-import { maybeAutoApproveApprovalRequest, resetApprovalState } from './approvalManager';
+import { connectGlobalWS, disconnectGlobalWS, getSessionChildren } from '../api';import { maybeAutoApproveApprovalRequest, resetApprovalState } from './approvalManager';
 export { autoApprovedApprovalIds } from './approvalManager';
 import { dispatchPluginEvent } from './pluginRuntime';
 import { reduceChatEvent } from './eventReducer';
@@ -33,6 +32,7 @@ import {
   getActiveConversation,
   getChildConversationId,
   getStringValue,
+  mergeChildNodesFromSessionChildren,
   selectOrderedMessagesFromState,
   sortConversationsByRecency,
 } from './chatTypes';
@@ -53,12 +53,46 @@ function clearReconnectTimer() {
   }
 }
 
+// [2026-09-13] /children 兜底轮询：事件驱动之外补齐子节点列表刷新。
+// Why: 会话激活期间 /children 只在切换会话/启动/重连时拉取，子节点的创建与
+// 终态在页面停留时只能依赖 WS 任务事件，事件丢失时侧边栏长期不同步。
+// How: 每 30s 对当前活跃会话拉一次 /children 增量合并（幂等，按 sessionId
+// 覆写）。Purpose: 子节点列表在事件遗漏时也能在半分钟内白愈。
+let childrenPollTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopChildrenPolling(): void {
+  if (childrenPollTimer) {
+    clearInterval(childrenPollTimer);
+    childrenPollTimer = null;
+  }
+}
+
+function startChildrenPolling(set: StoreSetter, get: StoreGetter): void {
+  stopChildrenPolling();
+  childrenPollTimer = setInterval(() => {
+    void (async () => {
+      const state = get();
+      const active = getActiveConversation(state);
+      if (!active?.sessionId) return;
+      try {
+        const children = await getSessionChildren(active.sessionId);
+        set((s) => ({
+          childNodes: mergeChildNodesFromSessionChildren(s.childNodes, children, active.id),
+        }));
+      } catch {
+        // 后端暂不可达时跳过本轮，下个周期重试
+      }
+    })();
+  }, 30_000);
+}
+
 export function stopEventPump(): void {
   // [AutoC 2026-06-16] Stop the realtime connection from one exported function.
   // Why: resetState must close WebSocket without knowing eventPump internals. How:
   // clear the reconnect timer and delegate socket closure to the API client. Purpose:
   // chatStore reset remains small and deterministic.
   clearReconnectTimer();
+  stopChildrenPolling();
   disconnectGlobalWS();
 }
 
@@ -68,6 +102,7 @@ export function resetEventPumpState(): void {
   // here. How: clear this module's timer and delegate approval cleanup. Purpose:
   // tests and user logout flows return to the same clean state as before.
   clearReconnectTimer();
+  stopChildrenPolling();
   resetApprovalState();
 }
 
@@ -81,6 +116,7 @@ export function startEventPump(set: StoreSetter, get: StoreGetter): void {
   if (currentConnectionStatus !== 'open' && currentConnectionStatus !== 'reconnecting') {
     set({ connectionStatus: 'connecting' });
   }
+  startChildrenPolling(set, get);
 
   connectGlobalWS(
     0,

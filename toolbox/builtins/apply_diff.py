@@ -45,11 +45,26 @@ def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
     return lines
 
 
+def _find_match_positions(content: str, search: str, limit: int = 200) -> list[tuple[int, int]]:
+    """Return list of (char_offset, 1-based_line_no) for all occurrences of search in content."""
+    positions: list[tuple[int, int]] = []
+    start = 0
+    while len(positions) < limit:
+        idx = content.find(search, start)
+        if idx == -1:
+            break
+        line_no = content[:idx].count('\n') + 1
+        positions.append((idx, line_no))
+        start = idx + max(1, len(search))
+    return positions
+
+
 def _find_and_replace(
     content: str,
     search: str,
     replace: str,
     start_line: int | None,
+    raw_start_line: int | None = None,
 ) -> tuple[str, str | None, list[int] | None]:
     """Apply a single search/replace on *content*.
 
@@ -76,29 +91,42 @@ def _find_and_replace(
                 "Please verify the content matches exactly."
             ), None
 
-        # count > 1: 多匹配场景，使用 start_line 定位（原有逻辑）
+        # count > 1: 多匹配场景，使用 start_line 定位
         lines = content.split("\n")
-        if start_line < 1 or start_line > len(lines):
+        check_line = raw_start_line if raw_start_line is not None else start_line
+        if check_line < 1 or (start_line > len(lines) and check_line > len(lines)):
             return content, (
-                f"start_line {start_line} is out of range "
+                f"start_line {check_line} is out of range "
                 f"(file has {len(lines)} lines)."
             ), None
 
-        # Build the prefix (lines before start_line) and the search region.
-        prefix = "\n".join(lines[: start_line - 1])
-        region = "\n".join(lines[start_line - 1:])
+        positions = _find_match_positions(content, search)
+        # If raw_start_line (post-diff line number) matches an occurrence exactly,
+        # while adjusted start_line does not, honor the exact match.
+        chosen_idx: int | None = None
+        if raw_start_line is not None and raw_start_line != start_line:
+            for char_idx, m_line in positions:
+                if m_line == raw_start_line:
+                    chosen_idx = char_idx
+                    break
+        if chosen_idx is None:
+            for char_idx, m_line in positions:
+                if m_line >= start_line:
+                    chosen_idx = char_idx
+                    break
+        if chosen_idx is None and raw_start_line is not None:
+            for char_idx, m_line in positions:
+                if m_line >= raw_start_line:
+                    chosen_idx = char_idx
+                    break
 
-        idx = region.find(search)
-        if idx == -1:
+        if chosen_idx is None:
             return content, (
                 "No exact match found starting from line "
-                f"{start_line}. Please verify the content matches exactly."
+                f"{check_line}. Please verify the content matches exactly."
             ), None
 
-        # Replace the *first* occurrence in region.
-        new_region = region[:idx] + replace + region[idx + len(search):]
-        separator = "\n" if prefix else ""
-        new_content = prefix + separator + new_region
+        new_content = content[:chosen_idx] + replace + content[chosen_idx + len(search):]
         return new_content, None, None
 
     # Global search: require unique match.
@@ -223,9 +251,8 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     failed_count = 0
     failed_diffs: list[dict[str, Any]] = []
 
-    # 改进3: lineDelta 行号偏移维护 —— 前面的 diff 增删行后，后续 diff
-    # 的 start_line 需要相应调整，避免因行号漂移导致定位失败。
-    line_delta = 0
+    # 改进3: 按位置记录已应用 diff 的 (当前文件起始行, 行数变化)，仅对位于前序编辑下方的 start_line 补偿行号偏移
+    applied_shifts: list[tuple[int, int]] = []
 
     for i, diff_entry in enumerate(diffs):
         if not isinstance(diff_entry, dict):
@@ -261,13 +288,20 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 })
                 continue
 
-        # 改进3: 用累积的 line_delta 调整 start_line，补偿前序 diff 的行数增减
+        # 改进3: 仅累加位于当前 start_line 之前的前序 diff 行数增减
         adjusted_start_line = start_line
         if start_line is not None:
-            adjusted_start_line = start_line + line_delta
+            shift = sum(delta for edit_line, delta in applied_shifts if edit_line < start_line)
+            adjusted_start_line = max(1, start_line + shift)
+
+        # Find match line before replacement for shift tracking
+        match_line_before = start_line or 1
+        if search and search in content:
+            _first_idx = content.find(search)
+            match_line_before = content[:_first_idx].count('\n') + 1
 
         new_content, error, candidate_lines = _find_and_replace(
-            content, search, replace, adjusted_start_line,
+            content, search, replace, adjusted_start_line, raw_start_line=start_line,
         )
         if error is not None:
             failed_count += 1
@@ -279,10 +313,10 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             # Don't update content — skip this diff and continue with next.
             continue
 
-        # 改进3: 计算本次 diff 的行数变化并累加到 line_delta
+        # 改进3: 计算本次 diff 的行数变化并记录其原始行位置
         old_line_count = search.count('\n') + 1
         new_line_count = replace.count('\n') + 1
-        line_delta += new_line_count - old_line_count
+        applied_shifts.append((match_line_before, new_line_count - old_line_count))
 
         content = new_content
         applied_count += 1

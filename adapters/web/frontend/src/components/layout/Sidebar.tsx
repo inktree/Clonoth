@@ -38,6 +38,15 @@ function groupChildNodesByConversation(
     if (!knownConversationIds.has(child.parentConversationId)) return;
     // [AutoC 2026-06-04] Filter out system nodes.
     if (child.nodeId.startsWith('system.')) return;
+    // [2026-09-14] 与浮动面板（ChildNodePanel）保持同一条规则：终态子节点在
+    // completedAt 超过 30 秒后从会话树隐藏。Why: 旧行为下 registry 里保留 24 小时
+    // 的已结束子会话（dispatch/_worker 等）会一直挂在侧边栏，任务早已结束却像
+    // 遗留的幽灵行。How: 复用面板的 30 秒规则过滤。Purpose: 侧边栏只呈现近期
+    // 与进行中的子节点。
+    if (child.completedAt) {
+      const elapsed = Date.now() - new Date(child.completedAt).getTime();
+      if (elapsed > 30_000) return;
+    }
     grouped[child.parentConversationId] = [...(grouped[child.parentConversationId] || []), child];
   });
 

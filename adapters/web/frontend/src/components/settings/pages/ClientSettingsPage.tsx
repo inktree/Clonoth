@@ -127,7 +127,7 @@ const APPROVAL_LEVEL_OPTIONS: Array<{ value: ApprovalLevel; label: string; descr
   // Purpose: copy and behavior stay aligned when the settings section renders.
   { value: 'manual', label: '手动审批', description: '所有工具操作都需要手动确认。最安全。' },
   { value: 'smart', label: '智能放行', description: '除重启外自动放行；后端路径策略仍然生效。推荐。' },
-  { value: 'yolo', label: '全部放行', description: '包括重启在内全部自动放行。' },
+  { value: 'yolo', label: '全部放行', description: '包括重启与工作区外路径在内全部自动放行；服务端 deny 规则仍会拒绝。' },
 ];
 
 const TITLE_OPTIONS: Array<{ value: TitleGenerationMode; label: string; description: string }> = [

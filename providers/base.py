@@ -45,6 +45,8 @@ class ProviderResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     # [refactor 2026-04-18] thinking → reasoning：统一命名，保留思维链内容
     reasoning: str | None = None
+    # [2026-10-25] 闭源模型的思维链摘要（如 Gemini includeThoughts 摘要），与明文思维链 reasoning 隔离存储
+    thought_summary: str | None = None
     error: str | None = None
     status_code: int | None = None
     raw: dict[str, Any] | None = None

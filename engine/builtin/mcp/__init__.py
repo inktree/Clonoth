@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -69,7 +70,27 @@ async def create_or_update_mcp_client(args: dict[str, Any], ctx: Any) -> dict[st
 async def list_mcp_clients(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     try:
         clients = mcp_runtime.list_clients(ctx.workspace_root)
-        return _ok(f"{len(clients)} MCP clients", clients=clients)
+        if not clients:
+            return _ok("0 MCP clients (data/mcp_clients.yaml is empty)", clients=clients)
+        lines = [f"{len(clients)} MCP clients (config: data/mcp_clients.yaml):"]
+        for c in clients:
+            cid = str(c.get("id") or "?")
+            transport = str(c.get("transport") or "stdio")
+            enabled = "enabled" if c.get("enabled", True) else "disabled"
+            if transport == "stdio":
+                cmd = str(c.get("command") or "")
+                cargs = " ".join(str(x) for x in (c.get("args") or []))
+                target = f"{cmd} {cargs}".strip()
+            else:
+                target = str(c.get("url") or "")
+            desc = " ".join(str(c.get("description") or "").split())
+            line = f"- {cid} | {transport} | {enabled}"
+            if target:
+                line += f" | {target}"
+            if desc:
+                line += f" | {desc}"
+            lines.append(line)
+        return _ok("\n".join(lines), clients=clients)
     except Exception as e:
         return _err(e)
 
@@ -166,6 +187,43 @@ def _config_mtime(workspace_root: Path) -> int | None:
         return None
 
 
+def _sanitize_schema_patterns(schema: dict[str, Any]) -> None:
+    # [2026-09-29] Why: MCP servers may publish regex `pattern` values with
+    # escapes that are invalid in ECMA-262 (observed: "^agent\\_run\\_" from
+    # the exa server — markdown escaping leaking into a machine field).
+    # OpenAI-compatible providers such as DeepSeek compile patterns and reject
+    # the whole request on failure, while Anthropic treats schemas as opaque,
+    # so the defect only surfaces on fallback. How: walk the schema, rewrite
+    # `\_` to `_` (identical literal match), then drop any pattern that still
+    # fails to compile locally. Purpose: one upstream defect must not break an
+    # entire channel; sanitizing at registration covers every provider at one
+    # place. Dropping is transport-safe because pattern is advisory only.
+    stack: list[Any] = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in list(node.items()):
+                if key == "pattern" and isinstance(value, str):
+                    fixed = value.replace("\\_", "_")
+                    try:
+                        re.compile(fixed)
+                    except re.error:
+                        logger.warning(
+                            "MCP tool schema pattern dropped (invalid regex): %r", value
+                        )
+                        del node[key]
+                        continue
+                    if fixed != value:
+                        logger.info(
+                            "MCP tool schema pattern sanitized: %r -> %r", value, fixed
+                        )
+                    node[key] = fixed
+                elif isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(item for item in node if isinstance(item, (dict, list)))
+
+
 async def refresh_mcp_tools(registry: Any) -> int:
     """重发现 MCP 客户端并把其工具注册为一等工具。
 
@@ -182,6 +240,10 @@ async def refresh_mcp_tools(registry: Any) -> int:
                 dispose()
             except Exception:
                 pass
+            else:
+                forget = getattr(_BRIDGE.get("hooks"), "remove_plugin_disposer", None)
+                if callable(forget):
+                    forget(dispose)
         _BRIDGE["disposers"].clear()
 
         count = 0
@@ -219,6 +281,7 @@ async def refresh_mcp_tools(registry: Any) -> int:
                 schema = tool.get("input_schema")
                 if not isinstance(schema, dict):
                     schema = {"type": "object", "properties": {}, "required": []}
+                _sanitize_schema_patterns(schema)
                 dispose = registry.register_builtin_tool(
                     reg_name,
                     f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
@@ -335,14 +398,13 @@ def _register_admin_routes(routes: Any) -> None:
     router.add_api_route("/mcp-clients/raw", update_mcp_clients_raw_endpoint, methods=["PUT"])
     routes.register(router, mount="admin/config", description="MCP 客户端配置端点")
 
-    # 设置面板静态资源。public：iframe 无法携带 Authorization 头，页面本身不含
-    # 秘密，数据全部经鉴权 XHR 获取。
+    # 面板与依赖资源需要鉴权；宿主用 Bearer 换取短期静态资源 Cookie。
     client = APIRouter()
     client.include_router(
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="MCP 设置面板静态资源")
+    routes.register(client, description="MCP 设置面板静态资源（需鉴权）")
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ Crontab every 6h. Pure Python, no LLM calls.
 
 import logging
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -196,6 +197,38 @@ def purge_expired_child_sessions():
     logging.info("[child_sessions] deleted %d expired files", deleted)
 
 
+def prune_stats_db():
+    """Prune timestamped local statistics older than 30 days, then reclaim pages.
+
+    Only timestamp columns are eligible. Tables without one are left intact.
+    SQLite handles either Unix seconds or ISO timestamps through its date parser.
+    """
+    db_path = DATA_DIR / "stats.db"
+    if not db_path.is_file():
+        return
+    cutoff = time.time() - 30 * 24 * 3600
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (table,) in tables:
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            columns = {row[1] for row in conn.execute(f"PRAGMA table_info({quoted_table})")}
+            timestamp = next((name for name in ("timestamp", "created_at", "ts") if name in columns), None)
+            if timestamp is None:
+                continue
+            col = '"' + timestamp + '"'
+            conn.execute(
+                f"DELETE FROM {quoted_table} WHERE "
+                f"CASE WHEN typeof({col}) IN ('integer', 'real') THEN {col} "
+                f"ELSE unixepoch({col}) END < ?",
+                (cutoff,),
+            )
+        conn.commit()
+        conn.execute("VACUUM")
+    logging.info("[stats_db] pruned old statistics and vacuumed %s", db_path)
+
+
 # ── main ──────────────────────────────────────
 def main():
     _log_init()
@@ -204,6 +237,7 @@ def main():
     tasks = [
         (rotate_events, {}),
         (rotate_signals, {}),
+        (prune_stats_db, {}),
         # Phase D：node_contexts 已被 child session 替代，启用定期清理
         (purge_dir, dict(directory=DATA_DIR / "node_contexts",
                          max_age=NODE_CONTEXTS_MAX_AGE, label="node_contexts",

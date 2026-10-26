@@ -11,7 +11,7 @@ from toolbox.registry import ToolRegistry
 from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names
 from .resume_builder import apply_resume_messages, collect_resume_attachments
 from .loop_state import _LoopState, _build_loop_state, _persist_ctx, _short
-from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES
+from .llm_call import _call_llm_with_retry, _build_failure_action, _is_retryable_error, _RETRYABLE_STATUS_CODES, call_provider_once
 from .pseudo_handlers import _handle_pseudo_tool
 # [AutoC 2026-08-19] 执行策略（async_mode 分流、execute_command 自适应升级）已迁入
 # engine/builtin/async_scheduler.py；循环仅保留默认同步执行入口与 execute_tool 触发。
@@ -111,6 +111,8 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
             message_type=message_type,
             created_at=datetime.now(timezone.utc).isoformat(),
             meta=msg_dict.get('_meta', {}),
+            response_info=dict(getattr(ls.rctx, 'response_info', {}) or {})
+                if msg_dict.get('role') == 'assistant' else {},
             source_node_id=getattr(ls.node, 'id', ''),
             source_task_id=getattr(ls.rctx, 'task_id', ''),
             tool_calls=msg_dict.get('tool_calls', []),
@@ -234,7 +236,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # provider_meta 由 ProviderResponse 透传；engine 只搬运不解读
     # [fix 2026-04-18] provider 名称改为动态获取，不再硬编码 "openai"。
     # ls.provider.name 由 BaseProvider.name 提供，各 provider 子类在初始化时传入。
-    _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
+    _provider_name = (getattr(ls.rctx, 'response_info', {}) or {}).get('provider') or getattr(ls.provider, 'name', '') or 'unknown'
     _tc_meta = MessageMeta(
         provider=_provider_name,
         tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
@@ -245,6 +247,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
         reasoning=resp.reasoning or "",
         has_reasoning=bool(resp.reasoning),
+        thought_summary=getattr(resp, "thought_summary", None) or "",
         inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
         # [thinking-time 2026-06-01] Persist precise reasoning timing from stream.
@@ -252,11 +255,6 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
     )
     set_message_meta(_assistant_msg, _tc_meta)
-    # [2026-05-07] Store reasoning_content at top level for API round-trip.
-    # DeepSeek V4 and similar models require this field in the message dict.
-    # _meta.reasoning is kept for internal use but top-level survives L2 stripping.
-    if resp.reasoning:
-        _assistant_msg["reasoning_content"] = resp.reasoning
     ls.messages.append(_assistant_msg)
     # Phase 1: 影子写入 assistant 消息到 ConversationStore
     # [2026-05-07] 含 finish 的 assistant 消息也直接持久化。
@@ -672,7 +670,7 @@ async def _execute_real_tools(
                 "elapsed_ms": _t_elapsed_ms,
             })
             await ls.rctx.emit_event("handoff_progress", {
-                "message": f"[{ls.node.id}] {_t_name}: {str(_t_result.get('handoff_message') or '异步执行已启动')}",
+                "message": f"[{ls.node.id}] {_t_name}: {str(_t_result.get('handoff_message') or 'Async execution started')}",
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
             })
@@ -782,9 +780,10 @@ async def _execute_real_tools(
             "elapsed_ms": _t_elapsed_ms,
         })
 
-        # [AutoC 2026-08-10] Propagate workspace changes from set_workspace tool
-        # back to RunContext so subsequent LLM rounds inherit the new cwd.
-        if _tool_ctx.workspace is not None and _tool_ctx.workspace != getattr(ls.rctx, 'workspace', None):
+        # Propagate the effective cwd for tools and dynamic prompt context. An
+        # abstract set_workspace intentionally clears the path; ignoring None
+        # left later tool batches and LLM requests pointing at the old project.
+        if _tool_ctx.workspace is not None or (_t_name == 'set_workspace' and _tool_ctx.workspace_name):
             ls.rctx.workspace = _tool_ctx.workspace
         if _tool_ctx.workspace_name and _tool_ctx.workspace_name != getattr(ls.rctx, 'workspace_name', ''):
             ls.rctx.workspace_name = _tool_ctx.workspace_name
@@ -851,7 +850,7 @@ def _persist_tool_results(
         _tool_att_msg = {
             "role": "user",
             "content": build_multimodal_content(
-                "以上工具执行产生了以下图片结果：", tool_atts, workspace_root=ls.rctx.workspace_root,
+                "The tool executions above produced the following image results:", tool_atts, workspace_root=ls.rctx.workspace_root,
             ),
             "_meta": {"attachments": list(tool_atts)},
         }
@@ -1032,6 +1031,19 @@ async def run_ai_node(
         )
 
     # ---- 构建工具列表 ----
+    # [AutoC 2026-09-12] Discover active child agents before composing control tools.
+    # Why: manage_workers should not occupy idle prompts. How: ask RunContext for the
+    # normalized legacy/new child-task view and degrade to no injection on transport
+    # errors or lightweight test contexts. Purpose: management appears only when the
+    # current routed session actually has an active child.
+    _has_active_children = False
+    _list_children = getattr(rctx, "list_active_child_tasks", None)
+    if callable(_list_children):
+        try:
+            _has_active_children = bool(await _list_children())
+        except Exception:
+            _has_active_children = False
+
     # [AutoC 2026-08-20] Why: tool-list composition (node filtering, dispatch
     # expansion, switch gating, control-tool injection) is presentation policy.
     # How: delegate to the pseudo-tools builder and receive the authorization
@@ -1040,6 +1052,7 @@ async def run_ai_node(
         registry=registry, node=node,
         downstream_info=downstream_info, switch_info=switch_info,
         task_context=rctx.task_context,
+        has_active_children=_has_active_children,
     )
     # [fix 2026-09-03] Why: pseudo calls were accepted by static name only, so a
     # hallucinated control call (e.g. switch_node imitated from a summarized log)
@@ -1074,15 +1087,13 @@ async def run_ai_node(
         allowed_pseudo_tools=_allowed_pseudo_tools,
     )
 
-    # [fix 2026-09-03] Why: supervisor dedupes concurrent compact dispatches for
-    # the same target session — late callers get a no-op compact_done resume while
-    # the shared compactor is still in flight. Without a marker the fresh loop
-    # state would immediately re-detect the over-threshold history and dispatch
-    # yet another compactor, spinning cheap resume loops until the first one
-    # lands. How: a deduped resume marks this task's loop state compacted, so the
-    # before_step check passes and the task proceeds with its current context.
-    # Purpose: dedupe actually saves the duplicate LLM call instead of looping.
-    if str((resume_data or {}).get("type") or "") == "compact_done" and (resume_data or {}).get("deduped"):
+    # [fix 2026-09-11] Why: a compactor failure resumes the caller with
+    # compact_done success=False. Marking only deduplicated resumes as compacted
+    # made the same caller immediately dispatch another compactor. How: every
+    # completed compaction attempt consumes this loop's automatic compaction
+    # opportunity; the session circuit breaker controls later tasks. Purpose:
+    # one failed upstream compaction cannot create a resume loop.
+    if str((resume_data or {}).get("type") or "") == "compact_done":
         ls.compacted = True
 
     # ---- 推理循环 ----
@@ -1128,6 +1139,11 @@ async def run_ai_node(
         # 原因：token 累加是 after_llm_call 的典型横切逻辑。做法：传入响应和
         # loop state，由 handler 更新 rctx.total_usage。目的：保持 TaskRecord
         # 用量统计不变，同时从 ai_step.py 中抽出 bookkeeping。
+        # The hook can request one alternate call without knowing LoopState or
+        # duplicating formatting, request IDs, cancellation and preempt handling.
+        async def _call_provider(candidate, *, messages=None):
+            return await call_provider_once(ls, step, candidate, messages=messages)
+
         _usage_ctx = HookContext(
             messages=ls.messages,
             tools=ls.openai_tools,
@@ -1136,11 +1152,13 @@ async def run_ai_node(
             rctx=ls.rctx,
             step=step,
             response=resp,
-            extra={"loop_state": ls},
+            extra={"loop_state": ls, "call_provider": _call_provider},
         )
         _usage_result = await hook_registry.afire("after_llm_call", _usage_ctx)
         if _usage_result.action is not None:
             return _usage_result.action
+        if _usage_result.skip_step:
+            continue
         # [2026-05-24] Allow after_llm_call hooks (e.g. fallback_provider) to
         # replace the response. Without this, a hook that sets ctx.response to
         # a successful fallback result would be ignored because the local `resp`
@@ -1148,23 +1166,30 @@ async def run_ai_node(
         if _usage_ctx.response is not resp:
             resp = _usage_ctx.response
 
-        if resp.ok and resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
-            ls.last_prompt_tokens = resp.usage["prompt_tokens"]
-            ls.last_usage = dict(resp.usage)
+        if not resp.ok:
+            return _build_failure_action(ls, resp, step)
+
+        # Final response provenance is known only after all after_llm_call hooks.
+        _p_meta = resp.provider_meta or {}
+        ls.rctx.response_info = {
+            "provider": _p_meta.get("_fallback_provider") or getattr(_usage_ctx.provider, "name", "") or _p_meta.get("provider") or "unknown",
+            "model": _p_meta.get("_fallback_model") or getattr(_usage_ctx.provider, "model", "") or _p_meta.get("model") or "",
+            "notices": list(_usage_result.channels.get("response_notices") or []),
+            "usage": dict(resp.usage or {}),
+        }
+        ls.last_usage = dict(resp.usage or {})
+        if isinstance(ls.last_usage.get("prompt_tokens"), int):
+            ls.last_prompt_tokens = ls.last_usage["prompt_tokens"]
             ls.compacted = False
-            _p_meta = resp.provider_meta or {}
             await ls.rctx.emit_event("context_usage", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
-                "provider": _p_meta.get("_fallback_provider") or getattr(ls.provider, "name", "") or "",
-                "model": _p_meta.get("_fallback_model") or getattr(ls.provider, "model", "") or "",
+                "provider": ls.rctx.response_info["provider"],
+                "model": ls.rctx.response_info["model"],
                 "elapsed_ms": _p_meta.get("_elapsed_ms", 0.0),
                 "step": step,
                 "usage": resp.usage,
             })
-
-        if not resp.ok:
-            return _build_failure_action(ls, resp, step)
 
         # ---- 从文本中解析工具调用（formatter 统一处理）----
         if not resp.tool_calls:
@@ -1180,6 +1205,7 @@ async def run_ai_node(
                     ],
                     # [refactor 2026-04-18] thinking → reasoning
                     reasoning=resp.reasoning,
+                    thought_summary=resp.thought_summary,
                     status_code=resp.status_code,
                     usage=resp.usage,
                     inline_data=resp.inline_data,
@@ -1248,6 +1274,6 @@ async def run_ai_node(
         ctx_ref = _persist_ctx(ls, max_steps)
     return TaskAction(
         action=ACTION_FAIL, node_id=ls.node.id,
-        error="达到最大步数限制。",
+        error="Maximum step limit reached.",
         context_ref=ctx_ref,
     )

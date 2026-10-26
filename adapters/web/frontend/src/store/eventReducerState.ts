@@ -187,13 +187,15 @@ export function buildMessageSource(state: ChatState, event: SupervisorEvent): Me
   const llmRequestId = getString(payload.llm_request_id);
   // [AutoC 2026-08-24] 实时事件的 provider/usage：context_usage 事件在 payload
   // 顶层携带；outbound/stream 类事件通常不带，空值由 mergeSource 跳过。
-  const provider = getString(payload.provider);
-  const usage = getRecord(payload.usage);
+  const responseInfo = getRecord(payload.response_info);
+  const provider = getString(responseInfo?.provider) || getString(payload.provider);
+  const usage = getRecord(responseInfo?.usage) || getRecord(payload.usage);
 
   return {
     inboundSeq,
     llmRequestId: llmRequestId || undefined,
     provider: provider || undefined,
+    responseInfo: responseInfo || undefined,
     usage: usage ? { ...usage } : undefined,
     taskId: childTaskId || undefined,
     childTaskId: childTaskId || undefined,
@@ -201,6 +203,9 @@ export function buildMessageSource(state: ChatState, event: SupervisorEvent): Me
     childNodeId: childNodeId || undefined,
     callerNodeId: getString(payload.caller_node_id)
       || (input ? getString(input.caller_node_id) || getString(input.inbound_caller_node_id) : '')
+      || undefined,
+    summary: getString(payload.summary)
+      || (input ? getString(input.summary) || getString(input.inbound_summary) : '')
       || undefined,
     nodeName: getString(payload.node_name) || nodeInfo?.nodeName,
     branchSessionId: getString(payload.branch_session_id) || (input ? getString(input.branch_session_id) : ''),
@@ -237,6 +242,7 @@ export function mergeSource(current: MessageSource, patch: MessageSource): Messa
     nodeId: patch.nodeId || current.nodeId,
     childNodeId: patch.childNodeId || current.childNodeId,
     callerNodeId: patch.callerNodeId || current.callerNodeId,
+    summary: patch.summary || current.summary,
     nodeName: patch.nodeName || current.nodeName,
     branchSessionId: patch.branchSessionId || current.branchSessionId,
     parentSessionId: patch.parentSessionId || current.parentSessionId,
@@ -248,6 +254,9 @@ export function mergeSource(current: MessageSource, patch: MessageSource): Messa
     // context_usage 事件或 outbound 事件补齐，合并时后到的有效值覆盖。
     provider: patch.provider || current.provider,
     providerMetadata: patch.providerMetadata || current.providerMetadata,
+    responseInfo: patch.responseInfo || (
+      patch.llmRequestId && patch.llmRequestId !== current.llmRequestId ? undefined : current.responseInfo
+    ),
     usage: patch.usage || current.usage,
   };
 }
@@ -278,7 +287,7 @@ export function summarizeEvent(event: SupervisorEvent): string | undefined {
     return getString(payload.tool_name) || undefined;
   }
   if (event.type === 'tool_call_end') {
-    return getString(payload.tool_name) || undefined;
+    return getString(payload.summary) || getString(payload.tool_name) || undefined;
   }
   if (event.type === 'node_switch') {
     return getString(payload.target_node_id) || 'default';

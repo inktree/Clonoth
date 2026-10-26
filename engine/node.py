@@ -73,7 +73,7 @@ class Node:
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
     # [AutoC 2026-08-30] control_tools: 控制类伪工具（finish/ask/intermediate_reply/
-    # compact_context/preempt_task/switch_node）的注入开关。Why: 此前这些工具无条件
+    # compact_context/preempt_task/spawn_worker/manage_workers/switch_node）的注入开关。Why: 此前这些工具无条件
     # 注入，无法声明一个只有 execute_command 的最小节点。How: "all"（默认，旧行为）/
     # "none"（全部不注入）/ 名称列表（只注入列出的）。Purpose: 插件声明的极简节点
     # 不再被框架强行塞入控制面工具。
@@ -101,13 +101,10 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         logger.warning(
             "plugin-declared node %r failed to parse; falling back to file sources", nid
         )
-    # 系统节点目录分离：优先从 engine/system_nodes/ 加载内建系统节点，
-    # 找不到时回退到 config/nodes/ 用户配置目录。确保系统节点跟随代码仓库同步。
-    _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
     _usr_path = workspace_root / "config" / "nodes" / f"{nid}.yaml"
-    _local_path = workspace_root / "config" / "nodes" / f"{nid}.local.yaml"
-    _user_path = _local_path if _local_path.is_file() else _usr_path
-    _node_path = _sys_path if _sys_path.is_file() else _user_path
+    _local_path = _usr_path.with_name(f"{nid}.local.yaml")
+    _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
+    _node_path = next((p for p in (_local_path, _usr_path, _sys_path) if p.is_file()), _usr_path)
     data = load_yaml_dict(_node_path)
     if not isinstance(data, dict):
         return None
@@ -199,11 +196,11 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     ma_raw = data.get("memories")
     if isinstance(ma_raw, str):
         mm = ma_raw.strip().lower()
-        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all")
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "constant", "none"} else "all")
     elif isinstance(ma_raw, dict):
         mm = str(ma_raw.get("mode") or "all").strip().lower()
         ma_allow = [str(x).strip() for x in (ma_raw.get("allow") or []) if isinstance(x, str) and x.strip()]
-        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all", allow=ma_allow)
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "constant", "none"} else "all", allow=ma_allow)
     else:
         ma = MemoryAccess()
 
@@ -258,8 +255,13 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
 
     # control_tools：字符串 "all"/"none"，或工具名列表。非法值回退 "all"。
     _ct_raw = data.get("control_tools")
+    # [AutoC 2026-09-12] Recognize worker controls in explicit control-tool lists.
+    # Why: build_node_tool_specs respects this parsed allowlist, so omitting either
+    # name would silently remove spawn/manage controls from opt-in nodes. How: add
+    # both beside the other non-terminal control tools. Purpose: "all" and list-based
+    # node policies expose the same supported pseudo-tool vocabulary.
     _CONTROL_NAMES = {"finish", "ask", "intermediate_reply", "compact_context",
-                      "preempt_task", "switch_node"}
+                      "preempt_task", "spawn_worker", "manage_workers", "switch_node"}
     if isinstance(_ct_raw, str):
         control_tools: Any = _ct_raw.strip().lower() if _ct_raw.strip().lower() in {"all", "none"} else "all"
     elif isinstance(_ct_raw, list):

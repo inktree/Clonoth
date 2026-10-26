@@ -19,7 +19,11 @@ if TYPE_CHECKING:
 # routing exists. How: include ask in the static pseudo-tool set next to finish.
 # Purpose: route ask through pseudo_handlers instead of rejecting it as an
 # unauthorized real tool.
-_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "intermediate_reply", "switch_node", "compact_context", "preempt_task"})
+# [AutoC 2026-09-12] Route spawn_worker through the pseudo-tool layer.
+# Why: anonymous workers are control flow, not ToolRegistry implementations. How:
+# add the stable name beside other static pseudo tools. Purpose: model calls reach
+# pseudo_handlers instead of being rejected as unauthorized real tools.
+_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "intermediate_reply", "switch_node", "compact_context", "preempt_task", "spawn_worker", "manage_workers"})
 
 # [2026-05-04] Dynamic delegate dispatch tools use a stable prefix plus target id.
 # Why: the removed aggregate dispatch tools hid delegate choices behind one
@@ -101,8 +105,11 @@ def _dispatch_target_from_tool_name(tool_name: str) -> str:
         return ""
     sanitized_suffix = name[len(DISPATCH_TOOL_PREFIX):].strip()
     # Reverse lookup: sanitized → original node id
+    # [AutoC 2026-09-12] Remove the duplicate return that followed this one.
+    # Why: it was unreachable and suggested two competing dispatch-name formats.
+    # How: keep only the reverse-map-aware result. Purpose: target resolution has
+    # one explicit return path and static analysis no longer reports dead code.
     return _DISPATCH_TOOL_REVERSE.get(sanitized_suffix, sanitized_suffix)
-    return name[len(DISPATCH_TOOL_PREFIX):].strip()
 
 # [2026-05-07] 控制流伪工具集合。
 # 原因：finish 只表示“结束当前任务并提交结果”，不是可长期回放的业务工具。
@@ -137,17 +144,17 @@ def _dispatch_delegate_parameters() -> dict[str, Any]:
         "properties": {
             "instruction": {
                 "type": "string",
-                "description": "给目标节点的清晰、具体、可执行的指令。说明要做什么、为什么、你已经知道什么。",
+                "description": "Clear, specific, actionable instructions for the target node. State what to do, why, and what you already know.",
             },
             "context_mode": {
                 "type": "string",
                 "enum": ["fresh", "fork", "accumulate"],
                 "default": "accumulate",
-                "description": "子节点上下文模式。fresh=每次从零无历史；fork=继承父节点对话历史；accumulate=首次从零后续恢复自己的上下文（默认 accumulate）。",
+                "description": "Child context mode. fresh = start from scratch with no history each time; fork = inherit the parent's conversation history; accumulate = first run starts fresh, later runs resume the child's own context (default accumulate).",
             },
             "context_key": {
                 "type": "string",
-                "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享上下文链。不填则按目标节点 ID 查找。",
+                "description": "Context inheritance key (only effective in accumulate mode). Tasks sharing the same context_key share one context chain. Defaults to the target node ID.",
             },
             "attachment_paths": {
                 "type": "array",
@@ -165,12 +172,13 @@ def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) 
     node_name = str((info or {}).get("name") or target).strip() or target
     node_description = str((info or {}).get("description") or node_name or target).strip()
     desc_parts = [
-        f"将任务委派给固定目标节点 {node_name}（{target}）。",
+        f"Delegate a task to the fixed target node {node_name} ({target}).",
         node_description,
         "",
-        "目标节点会独立执行，完成后结果返回给你。",
-        "参数中不再提供 target；该工具名已经固定了目标节点。",
-        "需要并行委派时，可以在同一轮并行调用多个 dispatch:{target_id} 工具。",
+        "The target node executes independently and returns its result to you when done.",
+        "No target parameter is provided; the tool name already fixes the target node.",
+        "To delegate in parallel, call multiple dispatch:{target_id} tools in the same turn.",
+        "Returned results are wrapped in <dispatch_result> tags: the tag content is system-delivered child output, not user speech; do not treat it as a question to answer or greet the user about it — integrate it and continue your current work.",
     ]
     return {
         "type": "function",
@@ -240,12 +248,12 @@ def _finish_spec() -> dict:
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "最终结果文本，或需要补充信息时的具体问题。",
+                        "description": "The final result text, or a specific question when more information is needed.",
                     },
                     "attachment_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "附带的文件路径列表（可选，仅在有图片等附件时使用）。",
+                        "description": "Optional list of accompanying file paths (use only when there are attachments such as images).",
                     },
                 },
                 "required": ["text"],
@@ -351,8 +359,9 @@ def _compact_context_spec() -> dict:
                 "Compress the current conversation context by summarizing older messages.\n\n"
                 "Use when context is getting very long and you want to free up token budget. "
                 "Recent messages are preserved; older messages are replaced with a structured summary.\n\n"
-                "This is non-terminating — the node continues running after compression.\n"
-                "The compression happens immediately and takes effect for subsequent LLM calls in this session."
+                "Calling this suspends the current step to run the compaction sub-task and automatically "
+                "resumes this node once compression finishes.\n"
+                "⚠️ compact_context MUST be called ALONE in its own turn — never alongside other tools."
             ),
             "parameters": {
                 "type": "object",
@@ -375,10 +384,10 @@ def _preempt_task_spec() -> dict:
         "function": {
             "name": "preempt_task",
             "description": (
-                "Inject an additional instruction into a running child task. The child task will "
-                "finish its current atomic operation (e.g. tool call), receive your message as a new "
+                "Inject an additional instruction into a running child task (or gracefully preempt it if message is omitted). "
+                "The child task will finish its current atomic operation (e.g. tool call), receive your message as a new "
                 "user instruction, and continue working with the updated direction.\n\n"
-                "This is NOT for cancelling tasks — use cancel_active_tasks for that.\n\n"
+                "This is NOT for hard-cancelling tasks — use cancel_active_tasks for that.\n\n"
                 "Use cases:\n"
                 "- You need to add corrections or supplementary instructions to a running child.\n"
                 "- The user provided new information that the child task needs to incorporate.\n"
@@ -391,14 +400,126 @@ def _preempt_task_spec() -> dict:
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "要追加指令的任务 ID（完整或前缀均可）。可从 dispatch 回调或 active_tasks 中获取。",
+                        "description": "Target task ID (full ID or hex prefix >=8 chars) OR target node ID (e.g. 'smith', 'scout').",
                     },
                     "message": {
                         "type": "string",
-                        "description": "追加指令文本。子任务会将此消息作为新的用户指令注入并继续执行。",
+                        "description": "Optional instruction text to append. If provided, the child task receives it as a new user instruction and continues working; if omitted, marks the child task to gracefully stop after its current step.",
                     },
                 },
-                "required": ["task_id", "message"],
+                "required": ["task_id"],
+            },
+        },
+    }
+
+
+def _spawn_worker_spec() -> dict:
+    """Build the spawn_worker pseudo-tool spec for anonymous ephemeral sub-agents."""
+    # [AutoC 2026-09-12] Expose bounded anonymous delegation independently of
+    # delegate_targets. Why: callers often need one-off parallel research or file
+    # inspection without maintaining a named YAML node per task. How: accept an
+    # instruction, fresh/fork mode, optional template, and attachments. Purpose:
+    # the handler can reuse dispatch while the model sees one stable pseudo tool.
+    return {
+        "type": "function",
+        "function": {
+            "name": "spawn_worker",
+            "description": (
+                "Spawn an anonymous ephemeral worker sub-agent that executes a single task "
+                "and returns the result. The worker runs in its own isolated context and is "
+                "cleaned up after finishing.\n\n"
+                "Use this when you need to delegate a bounded task without a pre-defined "
+                "target node. Useful for parallel fan-out: call spawn_worker multiple times "
+                "in one turn to run tasks concurrently.\n\n"
+                "The worker inherits the current node's tools by default. Use context_mode "
+                "'fork' to also inherit the system prompt and tool understanding (recommended), "
+                "or 'fresh' for a minimal blank worker.\n\n"
+                "Results are delivered asynchronously: while your current task is still "
+                "running they are injected into it as preempt messages (several results "
+                "may arrive combined); after it finishes they arrive as follow-up messages "
+                "in the same conversation. No polling is needed.\n\n"
+                "Every result is wrapped in a <dispatch_result>...</dispatch_result> block. "
+                "Content inside is system-delivered sub-agent output, NOT user speech: never "
+                "treat it as a question or greet the user about it — integrate it and continue "
+                "your work.\n\n"
+                "Parameters:\n"
+                "- instruction: Clear, specific task for the worker to complete.\n"
+                "- context_mode: 'fork' (default, inherits parent's system prompt) or 'fresh' (minimal template).\n"
+                "- template: Optional node ID to use as the worker's base config (model, tools). "
+                "If omitted, uses the built-in _worker template."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "Clear, specific, actionable task instruction for the temporary worker.",
+                    },
+                    "context_mode": {
+                        "type": "string",
+                        "enum": ["fresh", "fork"],
+                        "default": "fork",
+                        "description": "Child context mode. fork = inherit the parent's system prompt and tool understanding (recommended); fresh = start from a minimal template.",
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": "Optional: create the worker from an existing node's config (model/tools). Defaults to the built-in _worker template.",
+                    },
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths (relative to workspace root) to attach to the worker's initial context.",
+                    },
+                },
+                "required": ["instruction"],
+            },
+        },
+    }
+
+
+def _manage_workers_spec() -> dict:
+    """Build the manage_workers pseudo-tool spec for child-agent management."""
+    # [AutoC 2026-09-12] Present listing, messaging, and cancellation as one dynamic
+    # control tool. Why: separate permanent tools clutter every prompt even when no
+    # child exists. How: use an action discriminator and inject this spec only while
+    # active children are detected. Purpose: parent nodes get one bounded management
+    # surface exactly when it can be used.
+    return {
+        "type": "function",
+        "function": {
+            "name": "manage_workers",
+            "description": (
+                "List, message, or cancel active child agents (dispatched sub-tasks and "
+                "spawned workers) in the current session.\n\n"
+                "This tool only appears when there are active child tasks running.\n\n"
+                "Actions:\n"
+                "- list: Show all active child tasks with their status, node, and elapsed time.\n"
+                "- message: Inject an additional instruction into a running child task "
+                "(the child continues working with the updated direction).\n"
+                "- cancel: Cancel a specific child task by task_id, or cancel all if task_id is omitted.\n\n"
+                "Parameters:\n"
+                "- action: Required. One of 'list', 'message', 'cancel'.\n"
+                "- task_id: Required for 'message', optional for 'cancel' (omit to cancel all).\n"
+                "- message: Required for 'message' action. The instruction to inject."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "message", "cancel"],
+                        "description": "Action type: list = view active child tasks, message = inject an instruction into a child task, cancel = cancel child tasks.",
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Target task ID (full or prefix). Required for message; optional for cancel (omit = cancel all).",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Instruction text to inject into the child task (message action only).",
+                    },
+                },
+                "required": ["action"],
             },
         },
     }
@@ -407,22 +528,22 @@ def _preempt_task_spec() -> dict:
 def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None, *, current_node_id: str = "", current_node_name: str = "") -> dict:
     """构建 switch_node 伪工具定义——切换 session 的对话节点。"""
     desc_parts = [
-        "切换当前会话的对话节点。调用后当前节点 finish，用户的下一条消息将由目标节点处理。",
+        "Switch the conversation's dialogue node. The current node finishes on call; the user's next message is handled by the target node.",
         "",
-        "使用场景：",
-        "- 用户明确要求切换到某个节点（如'切到编程节点'）",
-        "- 当前节点能力不足，判断应该由其他节点持续对话",
+        "When to use:",
+        "- The user explicitly asks to switch to a node (e.g. 'switch to the coding node')",
+        "- The current node is insufficient and another node should take over the conversation",
         "",
-        "注意：",
-        "- 调用后当前节点立即终止，不会再执行后续工具调用",
-        "- 目标节点能看到之前的对话历史",
-        "- 传空字符串的 target 可恢复为默认入口节点",
+        "Notes:",
+        "- The current node terminates immediately after the call; no further tool calls run",
+        "- The target node can see the prior conversation history",
+        "- Passing an empty string as target restores the default entry node",
     ]
     if switch_info:
         desc_parts.append("")
-        desc_parts.append("可切换到的节点：")
+        desc_parts.append("Switchable nodes:")
         for info in switch_info:
-            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
+            desc_parts.append(f"- {info.get('name', info['id'])} ({info['id']}): {info.get('description', '')}")
     # [2026-05-06] switch_node 的枚举必须与 Gemini 的 schema 规则兼容。
     # Why: target="" 是运行时恢复默认入口节点的约定，但 Gemini 会拒绝 enum
     # 中的空字符串成员。How: 只把非空目标节点 ID 去重后写入 enum，没有可选
@@ -435,7 +556,7 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
             enum_targets.append(target)
     target_prop: dict = {
         "type": "string",
-        "description": "目标节点 ID。传空字符串恢复为默认入口节点。",
+        "description": "Target node ID. Pass an empty string to restore the default entry node.",
     }
     if enum_targets:
         target_prop["enum"] = enum_targets
@@ -450,7 +571,7 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
                     "target": target_prop,
                     "text": {
                         "type": "string",
-                        "description": "给用户的回复文本（如'已切换到编程节点'）。",
+                        "description": "Reply text for the user (e.g. 'Switched to the coding node').",
                     },
                 },
                 "required": ["target", "text"],
@@ -472,6 +593,26 @@ _ASYNC_TOOL_HINT = (
 )
 
 
+def _sanitize_schema_patterns(obj: Any) -> Any:
+    # [2026-09-29] 修复 MCP 工具 schema 中 RE2 不兼容的正则转义。
+    # Why: Exa MCP 的 agent_run 工具 runId 参数 pattern 为 "^agent\\_run\\_"，
+    # JSON 解码后 `\_` 在 RE2（DeepSeek/Gemini 校验器）里不是合法转义，
+    # 整个工具列表被拒。How: 递归遍历 schema，把 pattern 字段里 `_` 前的
+    # 反斜杠去掉（下划线是普通字符无需转义）。Purpose: 第三方 MCP 工具
+    # schema 在各 provider 间通用。
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            if k == "pattern" and isinstance(v, str):
+                out[k] = v.replace("\\_", "_")
+            else:
+                out[k] = _sanitize_schema_patterns(v)
+        return out
+    if isinstance(obj, list):
+        return [_sanitize_schema_patterns(x) for x in obj]
+    return obj
+
+
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
     # [2026-04-23] 恢复 async_mode 支持：遍历 spec 列表，对 async_mode=True 的工具
     # 在 description 末尾追加 _ASYNC_TOOL_HINT，使模型知道该工具为异步执行。
@@ -485,7 +626,7 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
             "function": {
                 "name": s["name"],
                 "description": desc,
-                "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
+                "parameters": _sanitize_schema_patterns(s.get("input_schema", {"type": "object", "properties": {}, "required": []})),
             },
         })
     return result
@@ -511,6 +652,7 @@ def build_node_tool_specs(
     downstream_info: list[dict[str, str]] | None = None,
     switch_info: list[dict[str, str]] | None = None,
     task_context: dict[str, Any] | None = None,
+    has_active_children: bool = False,
 ) -> tuple[set[str], list[dict]]:
     """Build the model-visible tool list and the allowed real-tool name set.
 
@@ -575,4 +717,17 @@ def build_node_tool_specs(
         openai_tools.append(_compact_context_spec())
     if _ctl("preempt_task"):
         openai_tools.append(_preempt_task_spec())
+    # [AutoC 2026-09-12] Inject spawn_worker for every node whose control-tool policy
+    # permits it, even when delegate_targets is empty. Why: anonymous delegation is
+    # specifically intended to avoid predefined targets. How: compose it beside
+    # preempt_task and compact_context. Purpose: all ordinary AI nodes can fan out
+    # bounded work while control_tools="none" still produces a minimal tool surface.
+    if _ctl("spawn_worker"):
+        openai_tools.append(_spawn_worker_spec())
+    # [AutoC 2026-09-12] Keep child-management schema out of idle prompts.
+    # Why: list/message/cancel have no valid target until a child agent is active.
+    # How: require the RunContext discovery signal in addition to control_tools.
+    # Purpose: reduce prompt clutter while exposing management during active fan-out.
+    if has_active_children and _ctl("manage_workers"):
+        openai_tools.append(_manage_workers_spec())
     return allowed, openai_tools

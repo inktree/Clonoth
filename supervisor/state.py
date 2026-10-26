@@ -753,6 +753,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         elif session_id and not target:
             self.session_entry_overrides.pop(session_id, None)
 
+    def _is_switchable_entry_node(self, node_id: str) -> bool:
+        """Use node metadata rather than deployment-specific node ID lists."""
+        from engine.node import load_node
+
+        if node_id.startswith("system."):
+            return False
+        node = load_node(self.workspace_root, node_id)
+        return node is None or node.extra.get("switchable", True) is not False
+
     def switch_session_node(self, session_id: str, target_node_id: str) -> dict[str, Any]:
         """设置或清除 session 级入口节点覆盖。"""
         sid = (session_id or "").strip()
@@ -769,11 +778,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if route_sid not in self.sessions:
                 return {"ok": False, "error": "session not found"}
             default_node = self._default_entry_node()
+            if target and not self._is_switchable_entry_node(target):
+                return {"ok": False, "error": f"node '{target}' is an internal/child node and cannot be used as session entry"}
             if target and target != default_node:
                 self.session_entry_overrides[route_sid] = target
+                self.session_last_entry_node[route_sid] = target
                 persisted_entry_node = target
             else:
                 self.session_entry_overrides.pop(route_sid, None)
+                self.session_last_entry_node[route_sid] = default_node
                 target = ""  # 清除覆盖
                 persisted_entry_node = ""
             info = self.sessions.get(route_sid)
@@ -1005,13 +1018,51 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                             context_key = context_key or mapped_key
                             break
 
+                # [2026-09-14] Why: accumulate 复用与嵌套派发的新任务运行在子会话的
+                # 入口分支（branch_*）上，旧行为只按 session_id/child_session_id 归属任务，
+                # 分支上的任务对不上任何行——worker 自身任务已终结而分支任务仍在跑时，
+                # /children、manage_workers、前端子节点面板全部漏看（实测 96edb136 会话
+                # 两个分支任务 20+ 分钟不可见）。How: 把子会话的活跃入口分支并入任务归属
+                # （与 running_tasks 端点同源的解析视图）。Purpose: 子会话行状态反映其
+                # 分支上的真实任务，工具与面板不再漏看嵌套/复用派发。
+                _child_branch_ids = self._entry_branch_ids_for_parent_locked(child_sid)
                 related_tasks = [
                     task for task in self.tasks.values()
                     if str(task.input.get("child_session_id") or "").strip() == child_sid
                     or task.session_id == child_sid
+                    or task.session_id in _child_branch_ids
                 ]
                 latest_task = max(related_tasks, key=_task_sort_key) if related_tasks else None
-                task_status = latest_task.status.value if latest_task is not None else "running"
+                if latest_task is not None:
+                    task_status = latest_task.status.value
+                else:
+                    # [2026-09-14] Why: 内存任务表会定期裁剪（scheduler 只保留最近
+                    # 200 个终态任务）且重启后仅回放 5000 条事件，子会话关联任务
+                    # 消失后旧行为无条件报 "running"，早已结束的子会话在前端常驻
+                    # 为运行中幽灵（实测挂 20+ 小时）。How: 无任务时回退 registry：
+                    # terminal_status 存在（终态写回）直接采用；否则按
+                    # last_active_at/created_at 距今是否超过宽限期（15 分钟）判定，
+                    # 超过则报 completed。Purpose: 任务被裁剪或重启丢失后，子会话
+                    # 状态立即收敛到真实终态，前端浮动面板自动隐藏。
+                    _reg_status = str(raw.get("terminal_status") or "").strip()
+                    if _reg_status in {"completed", "failed", "cancelled"}:
+                        task_status = _reg_status
+                    else:
+                        task_status = "running"
+                        _ref_str = str(
+                            raw.get("last_active_at")
+                            or raw.get("updated_at")
+                            or raw.get("created_at")
+                            or ""
+                        )
+                        try:
+                            _ref_dt = datetime.fromisoformat(_ref_str)
+                            if _ref_dt.tzinfo is None:
+                                _ref_dt = _ref_dt.replace(tzinfo=timezone.utc)
+                            if (_now() - _ref_dt) >= timedelta(minutes=15):
+                                task_status = "completed"
+                        except Exception:
+                            pass
                 started_at = latest_task.created_at.isoformat() if latest_task and latest_task.created_at else str(raw.get("created_at") or "")
                 updated_at = latest_task.updated_at.isoformat() if latest_task and latest_task.updated_at else str(raw.get("last_active_at") or raw.get("created_at") or "")
                 terminal = task_status in {"completed", "failed", "cancelled"}
@@ -1032,6 +1083,41 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
             rows.sort(key=lambda item: str(item.get("started_at") or ""))
             return rows
+
+    def _mark_child_session_terminal(self, task: Task) -> None:
+        """任务终态时把终态写回关联子会话 registry。
+
+        [2026-09-14] Why: dispatch/spawn_worker 子会话创建后 last_active_at 从不
+        更新（update_last_active 仅在 accumulate 复用时被调用，其文档串声称的
+        "子 task 创建/完成时调用" 接线从未存在），24h TTL 只能按创建时间算；
+        且 scheduler 会把终态任务裁剪出内存、重启后只回放 5000 条事件，
+        session_children() 找不到任务时无从得知终态。How: 在 complete_task 与
+        超时回收处调用，把 last_active_at / completed_at / terminal_status 写入
+        task.session_id 及 task.input.child_session_id 对应的 is_child registry
+        条目。Purpose: TTL 按真实活动时间计算；任务从内存消失后子会话仍能报出
+        准确终态。
+        """
+        candidates: list[str] = []
+        _sid = str(getattr(task, "session_id", "") or "").strip()
+        if _sid:
+            candidates.append(_sid)
+        if isinstance(task.input, dict):
+            _alt = str(task.input.get("child_session_id") or "").strip()
+            if _alt and _alt not in candidates:
+                candidates.append(_alt)
+        touched = False
+        _now_iso = _now().isoformat()
+        _status = str(getattr(getattr(task, "status", None), "value", "") or "")
+        for cid in candidates:
+            entry = self._session_store._registry.get(cid)
+            if isinstance(entry, dict) and entry.get("is_child"):
+                entry["last_active_at"] = _now_iso
+                entry["completed_at"] = _now_iso
+                if _status:
+                    entry["terminal_status"] = _status
+                touched = True
+        if touched:
+            self._session_store._flush()
 
     def get_or_create_child_session(
         self,
@@ -1240,6 +1326,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         if to_remove:
             for sid in to_remove:
+                # [2026-09-13] Why: dispatch 子会话改为 TTL 保留后，sweep 删除
+                # registry 但不删 JSONL 会遗留孤儿文件。How: 删除 registry 的同时
+                # 物理删除对应会话文件。Purpose: 磁盘与会话表保持一致。
+                _conv_file = self.workspace_root / "data" / "conversations" / f"{sid}.jsonl"
+                if _conv_file.exists():
+                    try:
+                        _conv_file.unlink()
+                    except OSError:
+                        pass
                 self._session_store._registry.pop(sid, None)
                 self.sessions.pop(sid, None)
                 self.session_generations.pop(sid, None)

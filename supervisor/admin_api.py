@@ -165,6 +165,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         # [AutoC 2026-08-30] 插件声明节点优先级最高（Paradox 式覆盖），
         # source 标记为 "plugin"（附带声明者插件名，便于 UI 区分）。
         from engine.faces.nodes import iter_declared_nodes
+        from engine.builtin.agent_manage import ensure_worker_node_yaml
+        ensure_worker_node_yaml(workspace_root)
         dirs = [
             (workspace_root / "engine" / "system_nodes", "system"),
             (workspace_root / "config" / "nodes", "user"),

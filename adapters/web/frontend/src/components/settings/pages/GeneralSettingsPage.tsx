@@ -4,7 +4,8 @@
 // authentication no longer requires editing App.tsx or unrelated settings pages.
 import { useEffect, useState } from 'react';
 
-import { checkAdminAuth, checkHealth, getModelConfig, getNodes } from '../../../api/supervisorClient';
+import { checkAdminAuth, checkHealth, getModelConfig, getNodes, pluginApiRequest } from '../../../api/supervisorClient';
+import { stopEventPump } from '../../../store/eventPump';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
 import { Button } from '../../common';
@@ -78,16 +79,29 @@ export const GeneralSettingsPage = () => {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     // [2026-06-01] Logout clears admin-only caches with the token.
     // Why: node and model lists are protected data and should not remain visible
     // after authentication is removed. How: reset token, auth flag, nodes, and model
     // config together. Purpose: later settings pages correctly show the login need.
+    const token = adminToken;
+    stopEventPump();
     setAdminToken(null);
     setAuthenticated(false);
     setAvailableNodes([]);
     setModelConfig(null);
     setTokenInput('');
+    // Clear local auth first so mounted panels stop renewal immediately. The
+    // captured Bearer credential is used only to revoke the short-lived grants.
+    if (token) {
+      try {
+        await pluginApiRequest('/admin/auth/panel-session', {
+          method: 'DELETE', headers: {Authorization: `Bearer ${token}`},
+        });
+      } catch {
+        console.warn('已退出本地登录；无法确认面板 Cookie 撤销，现有凭据最长两分钟后失效。');
+      }
+    }
   };
 
   return (
@@ -98,6 +112,11 @@ export const GeneralSettingsPage = () => {
         <p className="mt-2 max-w-xl text-sm text-[var(--duties-secondary)]">管理调度器连接和管理员访问。</p>
       </div>
 
+      {window.location.protocol === 'http:' && (
+        <p className="mb-4 text-sm text-[var(--duties-secondary)]" role="note">
+          当前使用 HTTP，连接未加密。可用于本地部署；通过不可信网络访问时请使用 HTTPS。
+        </p>
+      )}
       <div className="mb-4 border border-[var(--duties-border)] p-4">
         <p className="mb-2 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">连接</p>
         <div className="flex items-center gap-2 text-sm">

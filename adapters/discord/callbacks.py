@@ -237,6 +237,18 @@ class DiscordCallbacks:
         except Exception:
             pass
 
+    async def send_response_notice(self, trigger, conversation_key: str, response_info: dict) -> None:
+        """Send host annotations separately; do not record them in model history."""
+        message = trigger.platform_data.get("message") if trigger else None
+        channel = message.channel if message else await self._resolve_channel_from_conv_key(conversation_key)
+        if channel is None:
+            return
+        notices = response_info.get("notices") or []
+        text = "\n".join(n["text"] for n in notices if isinstance(n, dict) and isinstance(n.get("text"), str))
+        if text:
+            embed = discord.Embed(title="回复说明", description=discord.utils.escape_markdown(text[:3900]), colour=0x6E6E73)
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
     async def send_reply(
         self,
         trigger: TriggerInfo,

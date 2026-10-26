@@ -141,10 +141,25 @@ def snip_history(
     if not summaries:
         return messages, 0, set()
 
-    # Identify task_ids to keep (most recent N by order of appearance in records)
-    recent_task_ids: set[str] = set()
-    for r in records[-keep_recent_tasks:]:
-        recent_task_ids.add(r.task_id)
+    # Collect task_ids that actually have messages in this message list (in order of appearance).
+    # Child tasks (ereuna_qa, system.turn_summarizer, child_coder, system.compactor, etc.)
+    # write their messages to child session JSONLs, not the main session — so recent_task_ids
+    # must be computed from tasks actually present in messages rather than raw records[-N:].
+    present_ordered: list[str] = []
+    present_task_ids: set[str] = set()
+    for msg in messages:
+        _pmeta = msg.get("_meta", {})
+        if isinstance(_pmeta, dict):
+            _ptid = str(_pmeta.get("source_task_id") or "")
+            if _ptid and _ptid != "compact_summary":
+                if _ptid not in present_task_ids:
+                    present_ordered.append(_ptid)
+                present_task_ids.add(_ptid)
+
+    # Identify task_ids to keep (most recent N main tasks present in messages)
+    recent_task_ids: set[str] = (
+        set(present_ordered[-keep_recent_tasks:]) if keep_recent_tasks > 0 else set()
+    )
 
     # Collect eligible task_ids in order of appearance (oldest first)
     # Also exclude tasks that have already been snipped (content starts with marker)
@@ -169,19 +184,6 @@ def snip_history(
         if isinstance(c_tids, list):
             for _ctid in c_tids:
                 already_snipped.add(str(_ctid))
-
-    # Collect task_ids that actually have messages in this message list.
-    # Child tasks (child_coder, system.compactor, etc.) write their messages
-    # to child session JSONLs, not the main session — their task_ids won't
-    # appear in messages, so snipping them would waste max_snip slots and
-    # always fall through to LLM compaction.
-    present_task_ids: set[str] = set()
-    for msg in messages:
-        _pmeta = msg.get("_meta", {})
-        if isinstance(_pmeta, dict):
-            _ptid = str(_pmeta.get("source_task_id") or "")
-            if _ptid:
-                present_task_ids.add(_ptid)
 
     eligible_ordered: list[str] = []
     _seen_elig: set[str] = set()

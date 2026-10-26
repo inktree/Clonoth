@@ -57,7 +57,7 @@ _MCP_IMAGE_MIME_EXTENSIONS = {
 
 def _ensure_sdk() -> None:
     if _MCP_IMPORT_ERROR is not None:
-        raise RuntimeError(f"MCP Python SDK 未安装或导入失败：{_MCP_IMPORT_ERROR}")
+        raise RuntimeError(f"MCP Python SDK not installed or failed to import: {_MCP_IMPORT_ERROR}")
 
 
 def _config_path(workspace_root: Path) -> Path:
@@ -427,7 +427,11 @@ async def open_session(workspace_root: Path, client_id: str):
             _sh_kw: dict[str, Any] = {}
             if _hdrs:
                 import httpx as _httpx
-                _sh_kw["http_client"] = _httpx.AsyncClient(headers=_hdrs)
+                # The SDK closes only clients it creates itself. Own the supplied
+                # client here, after transport/session cleanup, including errors.
+                _sh_kw["http_client"] = await stack.enter_async_context(
+                    _httpx.AsyncClient(headers=_hdrs)
+                )
             transport_obj = await stack.enter_async_context(
                 streamable_http_client(url, **_sh_kw)
             )

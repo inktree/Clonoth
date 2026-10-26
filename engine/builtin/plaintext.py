@@ -79,7 +79,7 @@ class PlaintextRetryHandler:
         return hook_result(action=TaskAction(
             action=ACTION_FAIL,
             node_id=ls.node.id,
-            error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
+            error=f"The model did not use the finish tool; bare text is not accepted by the kernel as a valid ending. Raw text: {_short(text, 200)}",
             context_ref=ctx_ref,
         ))
 
@@ -89,7 +89,7 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
     from engine.inference.ai_step import _shadow_write
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
-    provider_name = getattr(ls.provider, "name", "") or "unknown"
+    provider_name = (ls.rctx.response_info or {}).get("provider") or getattr(ls.provider, "name", "") or "unknown"
     provider_meta = getattr(resp, "provider_meta", None)
     reasoning_text = getattr(resp, "reasoning", None) or ""
     implicit_meta = MessageMeta(
@@ -97,10 +97,12 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
         tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
+        llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         metadata={provider_name: provider_meta} if provider_meta else {},
         tool_call_ids=[],
         reasoning=reasoning_text,
         has_reasoning=bool(reasoning_text),
+        thought_summary=getattr(resp, "thought_summary", None) or "",
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(assistant_msg, implicit_meta)

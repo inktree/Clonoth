@@ -59,6 +59,8 @@ class Message:
     # 目的：ConversationStore 读取后可以还原 OpenAI/Responses 等原生工具历史。
     tool_call_id: str = ""           # role=tool 消息关联的 assistant.tool_calls[].id
     name: str = ""                   # role=tool 消息关联的工具名
+    # Host-only history: deliberately separate from content and replayable meta.
+    response_info: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为存储格式。仅包含非空字段以减小 JSONL 体积。"""
@@ -87,6 +89,8 @@ class Message:
             d["tool_call_id"] = self.tool_call_id
         if self.name:
             d["name"] = self.name
+        if self.response_info:
+            d["response_info"] = self.response_info
         return d
 
     @classmethod
@@ -112,6 +116,7 @@ class Message:
             # 目的：从 JSONL 恢复的历史与运行时内存消息保持同一结构。
             tool_call_id=str(data.get("tool_call_id") or ""),
             name=str(data.get("name") or ""),
+            response_info=dict(data.get("response_info") or {}),
         )
 
 
@@ -128,12 +133,22 @@ class ConversationStore:
     Each line is one Message serialized as JSON.
     """
 
+    _MAX_CACHED_SESSIONS = 16
+    _MAX_CACHEABLE_FILE_BYTES = 5 * 1024 * 1024
+    _MAX_LOAD_FILE_BYTES = 10 * 1024 * 1024
+
     def __init__(self, data_dir: str | Path):
         self._data_dir = Path(data_dir)
         # 确保存储目录存在
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        # session_id -> list[Message] 的内存缓存
+        # session_id -> list[Message] 的 LRU 内存缓存（按访问顺序维护）
         self._cache: dict[str, list[Message]] = {}
+
+    def _put_cache(self, session_id: str, messages: list[Message]) -> None:
+        self._cache.pop(session_id, None)
+        while len(self._cache) >= self._MAX_CACHED_SESSIONS:
+            self._cache.pop(next(iter(self._cache)), None)
+        self._cache[session_id] = messages
 
     # ── 写入 ──
 
@@ -148,9 +163,11 @@ class ConversationStore:
         path = self._data_dir / f"{session_id}.jsonl"
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(message.to_dict(), ensure_ascii=False) + "\n")
-        # 如果缓存中有该 session，同步追加
+        # 如果缓存中有该 session，同步追加并刷新 LRU 位置
         if session_id in self._cache:
-            self._cache[session_id].append(message)
+            msgs = self._cache.pop(session_id)
+            msgs.append(message)
+            self._cache[session_id] = msgs
 
     def append_batch(self, session_id: str, messages: list[Message]) -> None:
         """批量追加（一次文件 I/O）。写入后使缓存失效以保证一致性。"""
@@ -167,19 +184,42 @@ class ConversationStore:
     def load(self, session_id: str) -> list[Message]:
         """加载 session 的全部消息。优先从内存缓存读取，cache miss 时从文件加载。"""
         if session_id in self._cache:
-            return self._cache[session_id]
+            msgs = self._cache.pop(session_id)
+            self._cache[session_id] = msgs
+            return msgs
         path = self._data_dir / f"{session_id}.jsonl"
         messages: list[Message] = []
+        file_size = 0
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                file_size = 0
+            if file_size > self._MAX_LOAD_FILE_BYTES:
+                # 超大会话文件（>10MB）：只从文件尾部截取最近 _MAX_LOAD_FILE_BYTES 字节，防止单次加载撑爆 Worker 内存
+                with open(path, "rb") as bf:
+                    bf.seek(max(0, file_size - self._MAX_LOAD_FILE_BYTES))
+                    raw_tail = bf.read().decode("utf-8", errors="ignore")
+                if "\n" in raw_tail:
+                    raw_tail = raw_tail.split("\n", 1)[1]
+                for line in raw_tail.splitlines():
                     line = line.strip()
                     if line:
                         try:
                             messages.append(Message.from_dict(json.loads(line)))
                         except Exception:
-                            pass  # 跳过损坏行，不中断加载
-        self._cache[session_id] = messages
+                            pass
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                messages.append(Message.from_dict(json.loads(line)))
+                            except Exception:
+                                pass  # 跳过损坏行，不中断加载
+        if file_size <= self._MAX_CACHEABLE_FILE_BYTES:
+            self._put_cache(session_id, messages)
         return messages
 
     # ── 清理 ──
@@ -222,6 +262,7 @@ class ConversationStore:
                     merged.setdefault("source_node_id", m.source_node_id)
                     merged.setdefault("source_task_id", m.source_task_id)
                     merged.setdefault("message_type", m.message_type)
+                    merged.setdefault("response_info", m.response_info)
                     # Runtime _meta → storage meta
                     if "_meta" in merged and "meta" not in merged:
                         merged["meta"] = merged.pop("_meta")

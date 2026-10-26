@@ -67,8 +67,9 @@ class MessageMeta:
 
     # ── 提取层（bot/前端可读）──
     # [refactor 2026-04-18] thinking_text → reasoning, has_thinking → has_reasoning
-    reasoning: str = ""             # 思维链正文（给 debug/展示用）
-    has_reasoning: bool = False     # 快速判断是否含思维链
+    reasoning: str = ""             # 明文思维链正文（开源模型 CoT 等）
+    has_reasoning: bool = False     # 快速判断是否含明文思维链
+    thought_summary: str = ""       # 思维链摘要（如 Gemini includeThoughts 摘要，不混入 reasoning_content）
     inline_data: list = field(default_factory=list)
     # 附件引用列表（图片等 inlineData 的 mime_type + 引用信息，不含原始 base64）
 
@@ -118,6 +119,8 @@ class MessageMeta:
             d["reasoning"] = self.reasoning
         if self.has_reasoning:
             d["has_reasoning"] = True
+        if self.thought_summary:
+            d["thought_summary"] = self.thought_summary
         if self.inline_data:
             d["inline_data"] = self.inline_data
         if self.usage:
@@ -153,6 +156,7 @@ class MessageMeta:
         # ── 向后兼容：reasoning 优先新字段，回退 thinking_text ──
         reasoning = str(data.get("reasoning") or data.get("thinking_text") or "")
         has_reasoning = bool(data.get("has_reasoning") or data.get("has_thinking"))
+        thought_summary = str(data.get("thought_summary") or "")
 
         return cls(
             provider=str(data.get("provider") or ""),
@@ -169,6 +173,7 @@ class MessageMeta:
             tool_result_visibility=str(data.get("tool_result_visibility") or ""),
             reasoning=reasoning,
             has_reasoning=has_reasoning,
+            thought_summary=thought_summary,
             inline_data=list(data.get("inline_data") or []),
             usage=dict(data.get("usage") or {}),
             reasoning_started_at=str(data.get("reasoning_started_at") or ""),

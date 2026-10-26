@@ -32,7 +32,13 @@ HOOK_POINTS: dict[str, str] = {
         "注意：向 prompt 贡献内容应优先用 prompt_sections 声明型注册面。"
     ),
     "before_step": "每轮推理开始前触发。extra: step 序号等。返回 action 可终止。",
-    "after_llm_call": "LLM 返回后触发。extra: response/usage。可读取用量做统计。",
+    "after_llm_call": (
+        "LLM 返回后触发。ctx.response/provider 可替换本次响应及其来源，不改变后续默认渠道。"
+        "extra.call_provider(provider, messages=None) 异步执行一次非流式请求，复用格式转换、"
+        "before_llm_call、请求 ID 和取消处理；返回 ProviderResponse 或 TaskAction。"
+        "channels.response_notices 为本次响应的用户可见说明列表（首个非空值生效），"
+        "只进入事件及独立历史字段，不进入模型上下文。不得包含密钥、地址或原始错误。"
+    ),
     "before_tool_call": "工具执行前触发。extra: tool_name/arguments。返回 block 可拒绝执行。",
     "terminal_tool": (
         "终止型伪工具（finish/ask）实际执行前触发。extra: loop_state/terminal_call。"
@@ -120,6 +126,10 @@ class HookRegistry:
         """Archive an externally created disposer under a plugin name."""
         self._ledger.add(plugin_name, disposer)
 
+    def remove_plugin_disposer(self, disposer: Callable[[], None]) -> None:
+        """Forget an explicitly disposed resource, e.g. a replaced MCP tool."""
+        self._ledger.forget(disposer)
+
     def unload_plugin(self, plugin_name: str) -> dict[str, Any]:
         """Undo every registration owned by one plugin, in reverse order.
 
@@ -174,7 +184,7 @@ class HookRegistry:
             if not current:
                 self._hooks.pop(point, None)
 
-        self._ledger.record(_dispose)
+        self._ledger.record(_dispose, key=("hook", self, point, name))
         return _dispose
 
     def unregister(self, hook_point: str, handler_name: str) -> bool:

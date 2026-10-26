@@ -274,7 +274,11 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     except Exception:
         pass
 
-    await ls.rctx.consume_preempt()
+    # [2026-09-13] 携带实际消费内容：注入到清空之间并发追加的消息不会被误删。
+    await ls.rctx.consume_preempt(
+        str(new_instruction or ""),
+        len(new_attachments) if isinstance(new_attachments, list) else 0,
+    )
     await ls.rctx.emit_event("preempt_injected", {
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,

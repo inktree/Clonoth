@@ -20,10 +20,10 @@ from typing import Any
 
 PLUGIN_META = {
     "name": "ide",
-    "version": "0.14.0",
-    "description": "Web IDE：文件面板 + 编辑器 + @文件引用 + 文件管理（新建/重命名/删除/剪切移动）+ 工作区内容搜索",
+    "version": "0.16.5",
+    "description": "Web IDE：文件管理、编辑器、Git、搜索、@文件引用和会话待办清单",
     "author": "clonoth",
-    # supervisor：静态面板 + 写端点；engine：before_llm_call 引用展开。
+    # supervisor：静态面板与 API；engine：文件引用、待办工具与进度摘要。
     "processes": ["supervisor", "engine"],
     "web": {
         "panels": [
@@ -37,6 +37,13 @@ PLUGIN_META = {
             }
         ],
         "slots": [
+            {
+                "slot_id": "ide.todo_progress",
+                "slot": "chat_top",
+                "priority": 50,
+                "mode": "append",
+                "script": {"file": "web/todo_progress.js"},
+            },
             {
                 "slot_id": "ide.file_preview",
                 "slot": "workspace_file_preview",
@@ -126,6 +133,8 @@ PLUGIN_META = {
 
 _MENTION_RE = re.compile(r"@([A-Za-z0-9_./~:-]+)")
 _MAX_EXPAND_CHARS = 32 * 1024
+_MAX_EXPAND_READ_BYTES = _MAX_EXPAND_CHARS * 4 + 4
+_MAX_EXPAND_CACHE_ENTRIES = 128
 _expand_cache: dict[str, tuple[float, str | None]] = {}
 
 
@@ -133,7 +142,8 @@ def _read_truncated(target: Path) -> str | None:
     """读文件并截断，mtime 缓存；二进制或不可解码文件返回 None。"""
     key = target.as_posix()
     try:
-        mtime_ns = target.stat().st_mtime_ns
+        st = target.stat()
+        mtime_ns = st.st_mtime_ns
     except OSError:
         _expand_cache.pop(key, None)
         return None
@@ -141,17 +151,27 @@ def _read_truncated(target: Path) -> str | None:
     if cached and cached[0] == mtime_ns:
         return cached[1]
     try:
-        raw = target.read_bytes()
+        with target.open("rb") as f:
+            raw = f.read(_MAX_EXPAND_READ_BYTES)
     except OSError:
         return None
     text: str | None = None
     if b"\x00" not in raw[:4096]:
         try:
             text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            text = None
-    if text is not None and len(text) > _MAX_EXPAND_CHARS:
+        except UnicodeDecodeError as exc:
+            # Handle multi-byte UTF-8 sequence split at the _MAX_EXPAND_READ_BYTES boundary
+            if len(raw) == _MAX_EXPAND_READ_BYTES and exc.start >= len(raw) - 3:
+                try:
+                    text = raw[:exc.start].decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+            else:
+                text = None
+    if text is not None and (len(text) > _MAX_EXPAND_CHARS or st.st_size > len(raw)):
         text = text[:_MAX_EXPAND_CHARS] + "\n... (truncated)"
+    if len(_expand_cache) >= _MAX_EXPAND_CACHE_ENTRIES and key not in _expand_cache:
+        _expand_cache.pop(next(iter(_expand_cache)), None)
     _expand_cache[key] = (mtime_ns, text)
     return text
 
@@ -217,9 +237,12 @@ def _expand_file_mentions(ctx) -> None:
 
 
 def register(ctx) -> None:
-    """双进程入口：supervisor 挂路由；engine 挂 @引用展开 hook。"""
+    """双进程入口：Supervisor 注册 API，Engine 注册引用和待办能力。"""
     routes = getattr(ctx.contributions, "get", lambda _name: None)("routes")
     if routes is None:
+        if getattr(ctx.contributions, "get", lambda _name: None)("tools") is not None:
+            from .todo import register_engine
+            register_engine(ctx)
         # engine 进程：注册 before_llm_call 展开处理。
         dispose = ctx.hooks.register("before_llm_call", _expand_file_mentions, priority=50)
         return [dispose]
@@ -233,7 +256,10 @@ def register(ctx) -> None:
     # 鉴权依赖全局 /v1/ 中间件（public 默认 False）。
     MAX_WRITE_BYTES = 4 * 1024 * 1024
 
+    from .todo import add_routes
+
     api = APIRouter()
+    add_routes(api)
 
     def _state(request: Request):
         st = getattr(request.app.state, "state", None)
@@ -709,4 +735,4 @@ def register(ctx) -> None:
         static_router(Path(__file__).parent / "web"),
         prefix="/web",
     )
-    routes.register(client, public=True, description="ide 面板静态资源")
+    routes.register(client, description="ide 面板静态资源（需鉴权）")

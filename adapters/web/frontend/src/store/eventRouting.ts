@@ -267,6 +267,14 @@ function getChildNodeIdFromAgentConversationKey(conversationKey: string): string
 export function getChildNodeSessionId(event: SupervisorEvent, payload: Record<string, unknown>): string {
   const input = getNestedRecord(payload, 'input');
   const taskContext = getNestedRecord(input, 'task_context');
+  // [2026-09-13] dispatch 子任务（spawn_worker / dispatch:{id}）跑在 entry
+  // branch 上，事件 session_id 是 branch id；而 /children 返回的键是 dispatch
+  // session id（input.parent_session_id）。两条路径必须同键，否则同一子节点
+  // 在 store 里分裂成两条互不相通的记录，实时流也无法路由进子会话视图。
+  if (Object.keys(getNestedRecord(input, '_dispatch_origin')).length > 0) {
+    const dispatchSessionId = getStringValue(input.parent_session_id);
+    if (dispatchSessionId) return dispatchSessionId;
+  }
   return getStringValue(payload.child_session_id)
     || getStringValue(input.child_session_id)
     || getStringValue(taskContext.child_session_id)

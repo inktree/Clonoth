@@ -164,9 +164,19 @@ def assemble_prompt(
     nodes_dir = workspace_root / "config" / "nodes"
     expanded = _expand_includes(raw_str, nodes_dir)
 
+    # [2026-09-14] Why: 转义解码原先在变量替换之后执行，dispatch 指令作为
+    # {{instruction}} 注入模板后一同被 unicode_escape 解码，指令含字面反斜杠
+    # 序列（如正则 \x{...}、\u 字面量）时直接抛 "truncated \xXX escape"
+    # 崩掉整个引擎步骤。How: 把转义解码提前到变量替换之前，模板作者的转义
+    # 仍然生效，变量值作为字面数据不再参与解码；模板自身含非法转义时保留
+    # 原样而不是崩溃。Purpose: 模板能力不变，动态内容不再引爆渲染。
+    try:
+        expanded = expanded.encode('raw_unicode_escape').decode('unicode_escape')
+    except UnicodeDecodeError:
+        pass
+
     merged = _build_variables(workspace_root, node, variables)
     rendered = _render_variables(expanded, merged)
-    rendered = rendered.encode('raw_unicode_escape').decode('unicode_escape')
 
     # 拆分静态/动态段
     marker = "# %%DYNAMIC%%"

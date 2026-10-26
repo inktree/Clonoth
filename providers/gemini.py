@@ -24,12 +24,15 @@ log = logging.getLogger(__name__)
 
 
 class GeminiProvider(BaseProvider):
-    """Provider for Google Gemini (generativelanguage.googleapis.com)."""
+    """Provider for Google Gemini (defaults to Vertex AI behavior; 'gemini' compatibility alias)."""
 
     # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
     # 原因：engine 不再硬编码 GeminiProvider 分支；做法：类声明 provider_name；
     # 目的：registry 能把配置里的 "gemini" 映射回这个类。
     provider_name = "gemini"
+    default_is_vertex: bool = True
+    default_max_tokens: int = 65535
+    default_thought_summary: bool = True
 
     def __init__(
         self,
@@ -51,6 +54,27 @@ class GeminiProvider(BaseProvider):
             base = base[:-len("/v1beta")].rstrip("/")
         self._base_url = base
         self._options = provider_options or {}
+
+    def _is_vertex_backend(self) -> bool:
+        """Return True if this provider instance should use Vertex AI semantics, False for AI Studio."""
+        backend_opt = str(self._options.get("backend") or "").strip().lower()
+        if backend_opt in ("vertex", "gemini-vertex", "vertex-gemini"):
+            return True
+        if backend_opt in ("aistudio", "ai-studio", "gemini-aistudio", "aistudio-gemini"):
+            return False
+        if self.provider_name == "gemini-vertex":
+            return True
+        if self.provider_name == "gemini-aistudio":
+            return False
+        if "generativelanguage.googleapis.com" in (self._base_url or "").lower():
+            return False
+        return self.default_is_vertex
+
+    def _meta_namespaces(self) -> tuple[str, ...]:
+        """Return ordered metadata namespace keys accepted by this backend."""
+        if self._is_vertex_backend():
+            return ("gemini-vertex", "gemini")
+        return ("gemini-aistudio",)
 
     # ── URL helpers ──────────────────────────────────────────────────
 
@@ -77,6 +101,9 @@ class GeminiProvider(BaseProvider):
     @staticmethod
     def _convert_messages(
         messages: list[dict[str, Any]],
+        *,
+        strip_thoughts: bool = False,
+        meta_namespaces: tuple[str, ...] = ("gemini-vertex", "gemini"),
     ) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert OpenAI-format messages → Gemini contents + system instruction.
 
@@ -96,7 +123,7 @@ class GeminiProvider(BaseProvider):
         # when processing role=tool messages (which only carry tool_call_id).
         tc_id_to_name: dict[str, str] = {}
 
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "")
 
             # ── system ──
@@ -120,43 +147,71 @@ class GeminiProvider(BaseProvider):
                 _meta = msg.get("_meta")
                 _raw_parts = None
                 if isinstance(_meta, dict):
-                    _gem_meta = _meta.get("metadata", {}).get("gemini", {})
-                    _raw_parts = _gem_meta.get("raw_parts")
+                    _md = _meta.get("metadata")
+                    if isinstance(_md, dict):
+                        for _ns in meta_namespaces:
+                            _gem_meta = _md.get(_ns)
+                            if isinstance(_gem_meta, dict) and _gem_meta.get("raw_parts"):
+                                _raw_parts = _gem_meta.get("raw_parts")
+                                break
 
                 if _raw_parts and isinstance(_raw_parts, list):
-                    # 有原始 parts：直接用，保留所有 thoughtSignature
+                    # [2026-10-14] 先将流式切碎的连续 thought / text 分片合并，
+                    # 避免因流式分片未合并导致 Gemini 报 400 Corrupted thought signature
+                    _clean_parts = _coalesce_raw_parts(_raw_parts)
+                    # [2026-10-25] 绝不将思维链摘要（thought=True）回传给 Gemini；若其携带 thoughtSignature 则转移保留
+                    _clean_parts = _strip_thought_summary_parts(_clean_parts)
+                    if strip_thoughts:
+                        _clean_parts = _strip_thought_signatures(_clean_parts)
                     # 同时从 functionCall parts 中提取 tc_id_to_name 映射
                     # 使用独立计数器避免多轮 ID 冲突
                     _fc_idx = 0
-                    for rp in _raw_parts:
+                    for rp in _clean_parts:
                         fc = rp.get("functionCall")
                         if fc:
                             _fc_idx += 1
                             tc_id_to_name[f"call_{_fc_idx}"] = fc.get("name", "")
-                    contents.append({"role": "model", "parts": _raw_parts})
-                else:
-                    # 无原始 parts（旧消息或非 Gemini provider 产生的历史）：从 OpenAI 格式重建
-                    parts: list[dict[str, Any]] = []
-                    txt = _extract_text(msg)
-                    if txt:
-                        parts.append({"text": txt})
-                    for tc in msg.get("tool_calls") or []:
-                        # Support both OpenAI API format {function: {name, arguments}}
-                        # and Clonoth simplified storage format {name, arguments}
-                        fn = tc.get("function") or {}
-                        name = fn.get("name", "") or tc.get("name", "")
-                        tc_id = tc.get("id", "")
-                        if tc_id:
-                            tc_id_to_name[tc_id] = name
-                        raw_args = fn.get("arguments", tc.get("arguments", {}))
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except (json.JSONDecodeError, TypeError):
-                                raw_args = {}
-                        parts.append({"functionCall": {"name": name, "args": raw_args}})
-                    if parts:
-                        contents.append({"role": "model", "parts": parts})
+                    if _fc_idx > 0:
+                        _next_tool_msgs: list[dict[str, Any]] = []
+                        for _nxt in messages[msg_idx + 1:]:
+                            if not isinstance(_nxt, dict):
+                                continue
+                            if _nxt.get("role") == "tool":
+                                _next_tool_msgs.append(_nxt)
+                            else:
+                                break
+                        if _fc_idx > len(_next_tool_msgs):
+                            _clean_parts = _filter_unpaired_fc_parts(
+                                _clean_parts, _next_tool_msgs, fallback_text=_extract_text(msg),
+                            )
+                    if _clean_parts:
+                        _ensure_fc_thought_signature(_clean_parts)
+                        contents.append({"role": "model", "parts": _clean_parts})
+                        continue
+
+                # 无原始 parts（旧消息、非 Gemini provider 历史、或 strip_thoughts 后为空）：从 OpenAI 格式重建
+                parts: list[dict[str, Any]] = []
+                txt = _extract_text(msg)
+                if txt:
+                    parts.append({"text": txt})
+                for tc in msg.get("tool_calls") or []:
+                    # Support both OpenAI API format {function: {name, arguments}}
+                    # and Clonoth simplified storage format {name, arguments}
+                    fn = tc.get("function") or {}
+                    name = fn.get("name", "") or tc.get("name", "")
+                    tc_id = tc.get("id", "")
+                    if tc_id:
+                        tc_id_to_name[tc_id] = name
+                    raw_args = fn.get("arguments", tc.get("arguments", {}))
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            raw_args = {}
+                    parts.append({"functionCall": {"name": name, "args": raw_args}})
+                if parts:
+                    _ensure_fc_thought_signature(parts)
+                    contents.append({"role": "model", "parts": parts})
                 continue
 
             # ── tool result ──
@@ -193,6 +248,9 @@ class GeminiProvider(BaseProvider):
             if txt:
                 contents.append({"role": "user", "parts": [{"text": txt}]})
 
+        if contents and contents[-1].get("role") == "model":
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+
         system_text = "\n\n".join(system_parts) if system_parts else None
         return system_text, contents
 
@@ -228,21 +286,109 @@ class GeminiProvider(BaseProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        *,
+        strip_thoughts: bool = False,
+        strip_system_role: bool = False,
     ) -> dict[str, Any]:
-        system_text, contents = self._convert_messages(messages)
+        is_vertex = self._is_vertex_backend()
+        system_text, contents = self._convert_messages(
+            messages,
+            strip_thoughts=strip_thoughts,
+            meta_namespaces=self._meta_namespaces(),
+        )
+        if not contents:
+            contents = [{"role": "user", "parts": [{"thought": True, "text": " "}]}]
+        if is_vertex and not strip_system_role:
+            contents.append({"role": "system", "parts": [{"text": " "}]})
         body: dict[str, Any] = {"contents": contents}
         if system_text:
             body["systemInstruction"] = {"parts": [{"text": system_text}]}
         gem_tools = self._convert_tools(tools)
         if gem_tools:
             body["tools"] = gem_tools
-        # generationConfig: let model defaults govern most settings;
-        # only set maxOutputTokens as a reasonable ceiling.
-        gen_config: dict[str, Any] = {"maxOutputTokens": 65536}
-        # 注入 thinkingConfig（如 {"thinkingBudget": 8192, "includeThoughts": true}）
-        _thinking = self._options.get("thinking_config")
-        if _thinking and isinstance(_thinking, dict):
-            gen_config["thinkingConfig"] = _thinking
+
+        custom_safety = self._options.get("safety_settings")
+        if isinstance(custom_safety, list):
+            body["safetySettings"] = custom_safety
+        else:
+            model_lower = (self.model or "").lower()
+            thresh = (
+                "OFF"
+                if any(k in model_lower for k in ("gemini-2", "gemini-3", "gemini-4", "image"))
+                else "BLOCK_NONE"
+            )
+            cats = [
+                "HARM_CATEGORY_HARASSMENT",
+                "HARM_CATEGORY_HATE_SPEECH",
+                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "HARM_CATEGORY_CIVIC_INTEGRITY",
+                "HARM_CATEGORY_JAILBREAK",
+            ]
+            if is_vertex:
+                cats.extend([
+                    "HARM_CATEGORY_IMAGE_HATE",
+                    "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT",
+                    "HARM_CATEGORY_IMAGE_HARASSMENT",
+                    "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT",
+                ])
+            body["safetySettings"] = [{"category": c, "threshold": thresh} for c in cats]
+
+        # generationConfig:
+        # - max_tokens -> maxOutputTokens (default 65535)
+        # - reasoning_effort -> thinkingConfig.thinkingLevel (uppercase; omitted if unset or "NONE")
+        # - thought_summary -> thinkingConfig.includeThoughts (default True)
+        # - thinkingBudget is never sent
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_output_tokens")
+        try:
+            _max_tok = int(_raw_max_tok) if _raw_max_tok is not None and int(_raw_max_tok) > 0 else self.default_max_tokens
+        except (TypeError, ValueError):
+            _max_tok = self.default_max_tokens
+        gen_config: dict[str, Any] = {"maxOutputTokens": _max_tok}
+        if self._options.get("temperature") is not None:
+            gen_config["temperature"] = self._options["temperature"]
+        if self._options.get("top_p") is not None:
+            gen_config["topP"] = self._options["top_p"]
+        if self._options.get("top_k") is not None:
+            gen_config["topK"] = self._options["top_k"]
+
+        _tc_copy: dict[str, Any] = {}
+        _raw_tc = self._options.get("thinking_config")
+        if isinstance(_raw_tc, dict):
+            _tc_copy.update(_raw_tc)
+            _tc_copy.pop("thinkingBudget", None)
+
+        _raw_effort = self._options.get("reasoning_effort")
+        if _raw_effort is not None:
+            _effort_up = str(_raw_effort).strip().upper()
+            if _effort_up and _effort_up != "NONE":
+                _tc_copy["thinkingLevel"] = _effort_up
+            else:
+                _tc_copy.pop("thinkingLevel", None)
+        elif "thinkingLevel" in _tc_copy:
+            _tl_up = str(_tc_copy.get("thinkingLevel") or "").strip().upper()
+            if _tl_up and _tl_up != "NONE":
+                _tc_copy["thinkingLevel"] = _tl_up
+            else:
+                _tc_copy.pop("thinkingLevel", None)
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if isinstance(_raw_ts, bool):
+            _summary_enabled = _raw_ts
+        elif isinstance(_raw_ts, str):
+            _summary_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none")
+        else:
+            _summary_enabled = bool(_raw_ts)
+
+        if _summary_enabled:
+            _tc_copy["includeThoughts"] = True
+        elif "thought_summary" in self._options:
+            _tc_copy.pop("includeThoughts", None)
+
+        if _tc_copy:
+            gen_config["thinkingConfig"] = _tc_copy
         body["generationConfig"] = gen_config
         return body
 
@@ -266,7 +412,33 @@ class GeminiProvider(BaseProvider):
             return ProviderResponse(ok=False, error=f"Gemini request failed: {exc}")
 
         if resp.status_code != 200:
-            return _error_from_response(resp)
+            err_resp = _error_from_response(resp)
+            is_sig_err = _is_thought_signature_error(err_resp.error)
+            is_sys_err = _is_system_role_error(err_resp.error)
+            if resp.status_code == 400 and (is_sig_err or is_sys_err):
+                log.warning(
+                    "Gemini 400 (%s); retrying with strip_thoughts=%s, strip_system_role=%s",
+                    err_resp.error, is_sig_err, is_sys_err,
+                )
+                retry_body = self._build_body(
+                    messages,
+                    tools,
+                    strip_thoughts=is_sig_err,
+                    strip_system_role=is_sys_err,
+                )
+                try:
+                    resp = await self._http.post(
+                        self._endpoint(stream=False),
+                        headers=self._headers(),
+                        json=retry_body,
+                        timeout=300,
+                    )
+                except Exception as exc:
+                    return ProviderResponse(ok=False, error=f"Gemini retry request failed: {exc}")
+                if resp.status_code != 200:
+                    return _error_from_response(resp)
+            else:
+                return err_resp
 
         try:
             data = resp.json()
@@ -302,21 +474,36 @@ class GeminiProvider(BaseProvider):
             return ProviderResponse(ok=False, error=f"Gemini stream request failed: {exc}")
 
         if resp.status_code != 200:
-            # Need to read the body for error details
-            try:
-                raw_body = await resp.aread()
-                error_text = raw_body.decode("utf-8", errors="replace")
+            msg = await _read_stream_error(resp)
+            is_sig_err = _is_thought_signature_error(msg)
+            is_sys_err = _is_system_role_error(msg)
+            if resp.status_code == 400 and (is_sig_err or is_sys_err):
+                log.warning(
+                    "Gemini stream 400 (%s); retrying with strip_thoughts=%s, strip_system_role=%s",
+                    msg, is_sig_err, is_sys_err,
+                )
+                retry_body = self._build_body(
+                    messages,
+                    tools,
+                    strip_thoughts=is_sig_err,
+                    strip_system_role=is_sys_err,
+                )
                 try:
-                    err_data = json.loads(error_text)
-                    err_info = err_data.get("error", {})
-                    msg = err_info.get("message", error_text[:500])
-                except (json.JSONDecodeError, TypeError):
-                    msg = error_text[:500]
-            except Exception:
-                msg = f"HTTP {resp.status_code}"
-            finally:
-                await resp.aclose()
-            return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
+                    req = self._http.build_request(
+                        "POST",
+                        self._endpoint(stream=True),
+                        headers=self._headers(),
+                        json=retry_body,
+                        timeout=300,
+                    )
+                    resp = await self._http.send(req, stream=True)
+                except Exception as exc:
+                    return ProviderResponse(ok=False, error=f"Gemini stream retry failed: {exc}")
+                if resp.status_code != 200:
+                    retry_msg = await _read_stream_error(resp)
+                    return ProviderResponse(ok=False, error=retry_msg, status_code=resp.status_code)
+            else:
+                return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
 
         # Accumulate streaming chunks
         text_parts: list[str] = []
@@ -466,18 +653,24 @@ class GeminiProvider(BaseProvider):
                     pass
 
         full_text = "".join(text_parts) or None
-        reasoning = "".join(thinking_parts) or None
+        thought_summary = "".join(thinking_parts) or None
 
-        # [2026-05-01] 存储所有原始 parts，Gemini 3 要求整个 response 原样回传
+        # [2026-05-01] 存储原始 parts，但 [2026-10-25] 剔除 thought=True 思维链摘要分片
+        # （摘要仅存于 _meta["thought_summary"] 一份，不存入 raw_parts 也不回传给 Gemini；
+        # 若 thought 分片携带 thoughtSignature 则自动转移保留）
         provider_meta: dict[str, Any] = {}
         if all_raw_parts:
-            provider_meta["raw_parts"] = all_raw_parts
+            _coalesced = _coalesce_raw_parts(all_raw_parts)
+            _stripped = _strip_thought_summary_parts(_coalesced)
+            if _stripped:
+                provider_meta["raw_parts"] = _stripped
 
         return ProviderResponse(
             ok=True,
             text=full_text,
             tool_calls=tool_calls,
-            reasoning=reasoning,
+            reasoning=None,
+            thought_summary=thought_summary,
             usage=usage or None,
             inline_data=inline_data_list,
             raw=None,
@@ -515,7 +708,7 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
     """
     content = msg.get("content", "")
     if isinstance(content, str):
-        return [{"text": content}] if content else [{"text": ""}]
+        return [{"text": content}] if content else [{"text": " "}]
     if isinstance(content, list):
         parts: list[dict[str, Any]] = []
         for item in content:
@@ -534,7 +727,7 @@ def _user_parts(msg: dict[str, Any]) -> list[dict[str, Any]]:
                     # for http(s) URLs, we'd need to download. For now, pass
                     # as text fallback since Gemini doesn't accept arbitrary URLs.
                     parts.append({"text": f"[Image: {url}]"})
-        return parts or [{"text": ""}]
+        return parts or [{"text": " "}]
     return [{"text": str(content)}]
 
 
@@ -548,6 +741,17 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
       exclusive bound to inclusive, keep the tighter value when both exist).
     - Recursively clean nested 'properties', 'items', and composition arrays.
     """
+    # [2026-10-10] Flatten union types like ["string","null"] to a single
+    # value: Gemini's proto type field is a non-repeating enum and rejects
+    # lists outright (400: Proto field is not repeating, cannot start list).
+    # TS/Zod-based MCP servers emit nullable optional params this way;
+    # OpenAI/Anthropic accept them so the issue only surfaces on Gemini.
+    raw_type = schema.get("type")
+    if isinstance(raw_type, list):
+        non_null = [x for x in raw_type if x != "null"]
+        schema = dict(schema)
+        schema["type"] = non_null[0] if non_null else "string"
+
     # Keywords Gemini's OpenAPI-3.0 subset does not accept at all
     DROP = {"additionalProperties", "default", "$schema", "$id", "$ref",
             "$defs", "definitions", "multipleOf", "uniqueItems",
@@ -564,6 +768,12 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
             cleaned[k] = {pk: _clean_schema(pv) if isinstance(pv, dict) else pv for pk, pv in v.items()}
         elif k == "items" and isinstance(v, dict):
             cleaned[k] = _clean_schema(v)
+        elif k == "items" and isinstance(v, list):
+            # [2026-10-10] JSON Schema tuple-style items (list) → Gemini proto
+            # expects a singular Schema message; keep the first dict element,
+            # fall back to a permissive string schema when none.
+            dict_items = [x for x in v if isinstance(x, dict)]
+            cleaned[k] = _clean_schema(dict_items[0]) if dict_items else {"type": "string"}
         elif k in ("anyOf",) and isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
         elif k == "enum" and isinstance(v, list):
@@ -602,20 +812,40 @@ def _parse_usage(um: dict[str, Any]) -> dict[str, int]:
 
     [AutoC 2026-08-24] 缓存命中统一为 Clonoth 内部字段 cached_prompt_tokens。
     Gemini 的 cachedContentTokenCount 归一化到该字段。
+    [2026-10-23] 计入 toolUsePromptTokenCount 与 thoughtsTokenCount，保证与 cachedContentTokenCount
+    及真实上下文窗口大小口径一致。
     """
-    thoughts = um.get("thoughtsTokenCount")
-    reasoning = thoughts if isinstance(thoughts, int) and thoughts > 0 else 0
-    result = {
-        "prompt_tokens": um.get("promptTokenCount", 0),
-        "completion_tokens": um.get("candidatesTokenCount", 0) + reasoning,
-        "total_tokens": um.get("totalTokenCount", 0),
-    }
-    if reasoning:
-        result["reasoning_tokens"] = reasoning
+    prompt_tokens = int(um.get("promptTokenCount", 0) or 0)
     cached = um.get("cachedContentTokenCount")
-    if isinstance(cached, int) and cached > 0:
-        result["cached_prompt_tokens"] = cached
+    cached_tok = int(cached) if isinstance(cached, int) and cached > 0 else 0
+    thoughts = int(um.get("thoughtsTokenCount", 0) or 0)
+    completion_tokens = (um.get("candidatesTokenCount", 0) or 0) + thoughts
+    total_tokens = um.get("totalTokenCount", 0) or (prompt_tokens + completion_tokens)
+    result = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+    if cached_tok > 0:
+        result["cached_prompt_tokens"] = cached_tok
+    if isinstance(um.get("thoughtsTokenCount"), int) and thoughts > 0:
+        result["reasoning_tokens"] = thoughts
     return result
+
+
+class GeminiVertexProvider(GeminiProvider):
+    """Explicit Vertex AI Gemini provider (appends trailing role='system', 10 safety categories)."""
+
+    provider_name = "gemini-vertex"
+    default_is_vertex = True
+
+
+class GeminiAIStudioProvider(GeminiProvider):
+    """Explicit Google AI Studio Gemini provider (no role='system', 6 safety categories)."""
+
+    provider_name = "gemini-aistudio"
+    default_is_vertex = False
+
 
 
 def _parse_response(data: dict[str, Any]) -> ProviderResponse:
@@ -666,20 +896,21 @@ def _parse_response(data: dict[str, Any]) -> ProviderResponse:
 
     usage = _parse_usage(data.get("usageMetadata") or {})
     full_text = "".join(text_parts) or None
-    reasoning = "".join(thinking_parts) or None
+    thought_summary = "".join(thinking_parts) or None
 
-    # [2026-05-01] 存储整个 response 的原始 parts 到 provider_meta，
-    # Gemini 3 要求 "Return the entire response with all parts back"，
-    # 任何 part 都可能带 thoughtSignature，不能只存 thought parts
+    # [2026-10-25] 剔除 thought=True 思维链摘要分片，仅保留非 thought 分片与 thoughtSignature
     provider_meta: dict[str, Any] = {}
     if parts:
-        provider_meta["raw_parts"] = parts
+        _stripped_parts = _strip_thought_summary_parts(parts)
+        if _stripped_parts:
+            provider_meta["raw_parts"] = _stripped_parts
 
     return ProviderResponse(
         ok=True,
         text=full_text,
         tool_calls=tool_calls,
-        reasoning=reasoning,
+        reasoning=None,
+        thought_summary=thought_summary,
         usage=usage or None,
         inline_data=inline_data_list,
         raw=data,
@@ -691,8 +922,201 @@ def _error_from_response(resp: httpx.Response) -> ProviderResponse:
     """Build an error ProviderResponse from a failed httpx.Response."""
     try:
         data = resp.json()
-        err = data.get("error", {})
-        msg = err.get("message", resp.text[:500])
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        msg = err.get("message", resp.text[:500]) if isinstance(err, dict) else resp.text[:500]
     except Exception:
         msg = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
     return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
+
+
+async def _read_stream_error(resp: httpx.Response) -> str:
+    """Read and parse error message from a failed streaming response, then close it."""
+    try:
+        raw_body = await resp.aread()
+        error_text = raw_body.decode("utf-8", errors="replace")
+        try:
+            err_data = json.loads(error_text)
+            if isinstance(err_data, list) and err_data and isinstance(err_data[0], dict):
+                err_data = err_data[0]
+            err_info = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+            if isinstance(err_info, dict):
+                return err_info.get("message", error_text[:500])
+            return error_text[:500]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            return error_text[:500]
+    except Exception:
+        return f"HTTP {resp.status_code}"
+    finally:
+        await resp.aclose()
+
+
+def _is_thought_signature_error(err_msg: str | None) -> bool:
+    """Return True if the error indicates a corrupted or invalid thought signature."""
+    if not err_msg:
+        return False
+    low = err_msg.lower()
+    return "thought signature" in low or "thoughtsignature" in low or "thought_signature" in low
+
+
+def _is_system_role_error(err_msg: str | None) -> bool:
+    """Return True if an AIS channel rejected role='system' in contents."""
+    if not err_msg:
+        return False
+    low = err_msg.lower()
+    return "role 'system' is not supported" in low or 'role "system" is not supported' in low
+
+
+def _coalesce_raw_parts(raw_parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coalesce consecutive streamed thought or text parts into complete parts.
+
+    Why: Gemini's streamGenerateContent emits dozens of incremental thought/text
+    parts and attaches `thoughtSignature` only to the final chunk of a block.
+    Sending the unmerged fragments back on the next turn causes Gemini to validate
+    the signature against only the last fragment, failing with 400 Corrupted
+    thought signature.
+    """
+    merged: list[dict[str, Any]] = []
+    _NON_TEXT_KEYS = {"functionCall", "inlineData", "fileData", "executableCode", "codeExecutionResult"}
+
+    for p in raw_parts:
+        if not isinstance(p, dict):
+            continue
+        has_special = any(k in p for k in _NON_TEXT_KEYS)
+        is_thought = bool(p.get("thought"))
+
+        if not has_special and is_thought:
+            if (
+                merged
+                and bool(merged[-1].get("thought"))
+                and not any(k in merged[-1] for k in _NON_TEXT_KEYS)
+                and "thoughtSignature" not in merged[-1]
+            ):
+                merged[-1]["text"] = merged[-1].get("text", "") + p.get("text", "")
+                if "thoughtSignature" in p:
+                    merged[-1]["thoughtSignature"] = p["thoughtSignature"]
+            else:
+                new_p = dict(p)
+                if "text" not in new_p:
+                    new_p["text"] = ""
+                merged.append(new_p)
+        elif not has_special and "text" in p:
+            if (
+                merged
+                and not merged[-1].get("thought")
+                and "text" in merged[-1]
+                and not any(k in merged[-1] for k in _NON_TEXT_KEYS)
+                and "thoughtSignature" not in merged[-1]
+            ):
+                merged[-1]["text"] = merged[-1].get("text", "") + p.get("text", "")
+                if "thoughtSignature" in p:
+                    merged[-1]["thoughtSignature"] = p["thoughtSignature"]
+            else:
+                merged.append(dict(p))
+        else:
+            merged.append(dict(p))
+
+    return merged
+
+
+_SKIP_THOUGHT_SIG = "skip_thought_signature_validator"
+
+
+def _filter_unpaired_fc_parts(
+    parts: list[dict[str, Any]],
+    next_tool_msgs: list[dict[str, Any]],
+    *,
+    fallback_text: str | None = None,
+) -> list[dict[str, Any]]:
+    """Filter out excess functionCall parts in raw_parts when fewer role=tool responses follow."""
+    target_count = len(next_tool_msgs)
+    matched_call_ids = {
+        str(tm.get("tool_call_id") or "")
+        for tm in next_tool_msgs
+        if isinstance(tm, dict) and tm.get("tool_call_id")
+    }
+    fc_ordinals: list[int] = []
+    fc_seq = 0
+    for p in parts:
+        if isinstance(p, dict) and "functionCall" in p:
+            fc_seq += 1
+            fc_ordinals.append(fc_seq)
+
+    keep_ordinals: set[int] = {
+        ord_idx for ord_idx in fc_ordinals if f"call_{ord_idx}" in matched_call_ids
+    }
+    if len(keep_ordinals) > target_count:
+        keep_ordinals = set(sorted(keep_ordinals)[:target_count])
+    elif len(keep_ordinals) < target_count:
+        for ord_idx in fc_ordinals:
+            if len(keep_ordinals) >= target_count:
+                break
+            keep_ordinals.add(ord_idx)
+
+    preserved_sig: str | None = None
+    filtered: list[dict[str, Any]] = []
+    cur_fc_ord = 0
+    for p in parts:
+        if isinstance(p, dict) and "functionCall" in p:
+            cur_fc_ord += 1
+            if cur_fc_ord in keep_ordinals:
+                filtered.append(dict(p))
+            elif p.get("thoughtSignature") and not preserved_sig:
+                preserved_sig = p["thoughtSignature"]
+        else:
+            filtered.append(dict(p))
+
+    if preserved_sig and filtered and not any(
+        isinstance(p, dict) and "thoughtSignature" in p for p in filtered
+    ):
+        for p in filtered:
+            if isinstance(p, dict) and "functionCall" in p:
+                p["thoughtSignature"] = preserved_sig
+                break
+
+    if not filtered and fallback_text:
+        filtered.append({"text": fallback_text})
+    return filtered
+
+
+def _ensure_fc_thought_signature(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure a model turn with functionCall parts carries a thoughtSignature on its first functionCall."""
+    fc_parts = [p for p in parts if isinstance(p, dict) and "functionCall" in p]
+    if fc_parts and not any(isinstance(p, dict) and "thoughtSignature" in p for p in parts):
+        fc_parts[0]["thoughtSignature"] = _SKIP_THOUGHT_SIG
+    return parts
+
+
+def _strip_thought_summary_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove thought=True summary parts from raw_parts while preserving any thoughtSignature."""
+    kept: list[dict[str, Any]] = []
+    orphan_sig: str | None = None
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        if p.get("thought"):
+            if p.get("thoughtSignature") and not orphan_sig:
+                orphan_sig = p["thoughtSignature"]
+            continue
+        kept.append(dict(p))
+    if orphan_sig and kept and not any(isinstance(p, dict) and "thoughtSignature" in p for p in kept):
+        for p in kept:
+            if "functionCall" in p:
+                p["thoughtSignature"] = orphan_sig
+                break
+        else:
+            kept[0]["thoughtSignature"] = orphan_sig
+    return kept
+
+
+def _strip_thought_signatures(raw_parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove thought parts and replace thoughtSignature with bypass validator for cross-account fallback."""
+    cleaned: list[dict[str, Any]] = []
+    for p in raw_parts:
+        if not isinstance(p, dict) or p.get("thought"):
+            continue
+        cp = {k: v for k, v in p.items() if k != "thoughtSignature"}
+        if cp:
+            cleaned.append(cp)
+    return _ensure_fc_thought_signature(cleaned)

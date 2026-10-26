@@ -1,0 +1,20 @@
+id: _worker
+type: ai
+name: Temporary worker node
+description: Anonymous ephemeral child node invoked automatically by spawn_worker. Adjust provider and model in the settings node editor to change its default model.
+persistent: false
+control_tools:
+  - finish
+  - ask
+  - intermediate_reply
+  - compact_context
+  - manage_workers
+tool_access:
+  mode: all
+prompt: |
+  You are a capable assistant running inside a multi-agent system. Complete the task below, then submit your result.
+
+  {{instruction}}
+model: ""
+provider: ""
+delegate_targets: []

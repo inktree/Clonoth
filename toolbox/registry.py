@@ -181,36 +181,23 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
 
         input_json = json.dumps(args or {}, ensure_ascii=False)
 
-        # [2026-10-19] Why: on Windows the child interpreter inherits the console
-        # code page (GBK) for stdout, so `json.dumps(..., ensure_ascii=False)`
-        # emitted non-UTF-8 bytes. The reader below decodes with utf-8, turning
-        # Chinese error text into mojibake (`\xa1\xaa` instead of an em dash).
-        # How: force the child to use UTF-8 for stdio. Purpose: external tools
-        # have a documented UTF-8 JSON stdout contract; make it actually hold.
-        tool_env = _safe_subprocess_env()
-        tool_env["PYTHONIOENCODING"] = "utf-8"
-        tool_env["PYTHONUTF8"] = "1"
-        # [2026-10-19] Why: a script tool that mutates supervisor state (e.g.
-        # clear_context) has no way to tell the supervisor which task is calling
-        # it, so the reset logic cancelled the very task that requested the
-        # reset and the status message ended up as "task cancelled".
-        # How: expose the execution identity to the child process via env vars.
-        # Purpose: the tool can pass its own task/session back for exclusion.
-        tool_env["CLONOTH_TASK_ID"] = ctx.task_id
-        tool_env["CLONOTH_SESSION_ID"] = ctx.session_id
-        tool_env["CLONOTH_PARENT_SESSION_ID"] = ctx.parent_session_id
-        tool_env["CLONOTH_CONVERSATION_KEY"] = ctx.conversation_key
-        tool_env["CLONOTH_SUPERVISOR_URL"] = ctx.supervisor_url
-        tool_env["CLONOTH_WORKSPACE"] = str(ctx.workspace_root)
-
         try:
+            sub_env = _safe_subprocess_env()
+            if isinstance(root, Path):
+                sub_env["CLONOTH_WORKSPACE"] = str(root)
+            _ctx_sid = str(getattr(ctx, "session_id", "") or "").strip()
+            _ctx_tid = str(getattr(ctx, "task_id", "") or "").strip()
+            if _ctx_sid:
+                sub_env["CLONOTH_SESSION_ID"] = _ctx_sid
+            if _ctx_tid:
+                sub_env["CLONOTH_TASK_ID"] = _ctx_tid
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=tool_env,
+                env=sub_env,
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.
@@ -362,7 +349,7 @@ class ToolRegistry:
         # bridging of tool disposers.
         ledger = getattr(self, "_disposal_ledger", None)
         if ledger is not None:
-            ledger.record(_dispose)
+            ledger.record(_dispose, key=("tool", self, clean_name))
         return _dispose
 
     def set_disposal_ledger(self, ledger: Any) -> None:
@@ -472,7 +459,7 @@ class ToolRegistry:
                                     },
                                     "start_line": {
                                         "type": "integer",
-                                        "description": "(Recommended) 1-based line number to start searching from. Required when search matches multiple locations. Note: line numbers refer to content AFTER previous diffs in the array have been applied.",
+                                        "description": "(Recommended) 1-based line number from the original file to start searching from. Required when search matches multiple locations. Line shifts from earlier diffs in the array are compensated automatically.",
                                     },
                                 },
                                 "required": ["search", "replace"],
@@ -617,7 +604,7 @@ class ToolRegistry:
                 {"type": "object", "properties": {
                     "node_id": {
                         "type": "string",
-                        "description": "可选。只取消指定节点的活跃任务（如 scout、smith），不填则取消 session 内全部下游任务。",
+                        "description": "Optional. Cancel only the specified node's active tasks (e.g. scout, smith); omit to cancel all downstream tasks in the session.",
                     },
                 }, "required": []},
                 _builtins.cancel_active_tasks,

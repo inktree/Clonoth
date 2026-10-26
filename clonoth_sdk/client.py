@@ -76,9 +76,24 @@ class ClonothClient:
                 if p.exists():
                     token = p.read_text().strip()
                     if token:
+                        if token != self._admin_token and self._admin_token:
+                            import logging
+                            logging.getLogger("clonoth_sdk.client").info(
+                                "admin token rotated (file: %s)", self._admin_token_path,
+                            )
                         return token
-            except Exception:
-                pass
+                else:
+                    import logging
+                    logging.getLogger("clonoth_sdk.client").warning(
+                        "admin_token_path not found: %s, using cached token",
+                        self._admin_token_path,
+                    )
+            except Exception as exc:
+                import logging
+                logging.getLogger("clonoth_sdk.client").warning(
+                    "failed to read admin_token from %s: %s, using cached token",
+                    self._admin_token_path, exc,
+                )
         return self._admin_token
 
     def _http(self) -> httpx.AsyncClient:

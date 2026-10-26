@@ -6,8 +6,11 @@ from typing import Any
 
 from engine.compact import (
     count_real_task_segments,
+    invalidate_stale_usage,
     is_compact_circuit_open,
+    is_snipped_message,
     microcompact_messages,
+    microcompact_store,
     record_compact_failure,
     should_compact,
 )
@@ -50,7 +53,7 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         usage = (msg.get("_meta") or {}).get("usage")
-        if not isinstance(usage, dict):
+        if not isinstance(usage, dict) or usage.get("_compacted_stale"):
             continue
         pt = usage.get("prompt_tokens")
         if isinstance(pt, bool) or not isinstance(pt, (int, float)) or pt <= 0:
@@ -72,7 +75,17 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         tail_chars += len(part["text"])
-        return int(pt) + int(ct) + tail_chars // 3
+        # Subtract tokens of images stripped from the task that recorded this prompt_tokens
+        asst_tid = str((msg.get("_meta") or {}).get("source_task_id") or "")
+        stripped_imgs = 0
+        if asst_tid:
+            for prev in messages[:i + 1]:
+                if isinstance(prev, dict):
+                    pmeta = prev.get("_meta") or {}
+                    if isinstance(pmeta, dict) and str(pmeta.get("source_task_id") or "") == asst_tid:
+                        stripped_imgs += int(pmeta.get("_stripped_images_count") or 0)
+        seeded = int(pt) + int(ct) + tail_chars // 3 - stripped_imgs * 1600
+        return max(seeded, tail_chars // 3)
     return None
 
 
@@ -152,8 +165,25 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
     modified = False
     _messages, cleared = microcompact_messages(ls.messages)
     if cleared:
+        invalidate_stale_usage(ls.messages)
+        ls.last_prompt_tokens = None
         logger.info("microcompact: cleared %d tool_results", cleared)
         modified = True
+        store = getattr(ls.rctx, "conversation_store", None)
+        if store:
+            try:
+                snip_sid = _compact_target_session_id(ls)
+                if snip_sid:
+                    persisted, st_cleared = microcompact_store(store.load(snip_sid))
+                    if st_cleared > 0:
+                        store.replace_all(snip_sid, persisted)
+                branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
+                if branch_sid and branch_sid != snip_sid:
+                    b_persisted, b_cleared = microcompact_store(store.load(branch_sid))
+                    if b_cleared > 0:
+                        store.replace_all(branch_sid, b_persisted)
+            except Exception as mc_err:
+                logger.warning("microcompact persist failed: %s", mc_err)
 
     try:
         from engine.task_record import load_task_records, snip_history, snip_store
@@ -190,13 +220,21 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
                         max_snip=proactive_max,
                     )
                     if snip_count > 0:
+                        invalidate_stale_usage(snipped)
                         ls.messages = snipped
+                        ls.last_prompt_tokens = None
                         ctx.messages = ls.messages
                         store = getattr(ls.rctx, "conversation_store", None)
                         if store:
                             try:
                                 persisted = snip_store(store.load(snip_sid), snip_records, snipped_ids)
+                                invalidate_stale_usage(persisted)
                                 store.replace_all(snip_sid, persisted)
+                                branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
+                                if branch_sid and branch_sid != snip_sid:
+                                    branch_persisted = snip_store(store.load(branch_sid), snip_records, snipped_ids)
+                                    invalidate_stale_usage(branch_persisted)
+                                    store.replace_all(branch_sid, branch_persisted)
                             except Exception as persist_error:
                                 logger.warning("proactive snip persist failed: %s", persist_error)
                         logger.info(
@@ -241,17 +279,12 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         _conv_store = getattr(ls.rctx, 'conversation_store', None)
         if _conv_store:
             _stored_msgs = _conv_store.load(compact_sid)
-            # [2026-05-17] Why: compact_summary is already compressed history,
-            # not a real task segment, so counting it can trigger an endless
-            # LLM compactor loop. How: use the shared counter that skips old
-            # compact summaries and only counts consecutive real task ids.
-            # Purpose: builtin compact and legacy ai_step compact make the same
-            # dispatch decision before asking the compactor LLM to summarize.
             _seg_count = count_real_task_segments(_stored_msgs)
-            if _seg_count <= ls.compact_keep_recent:
+            _snipped_stubs = sum(1 for m in _stored_msgs if is_snipped_message(m))
+            if _seg_count <= 1 and _snipped_stubs == 0:
                 logger.info(
-                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
-                    _seg_count, ls.compact_keep_recent,
+                    "skip compact: only %d real task segments (snipped=%d), not enough to compress",
+                    _seg_count, _snipped_stubs,
                 )
                 ls.compacted = True
                 return None
@@ -274,14 +307,22 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         if snip_records:
             snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
             if snip_count > 0:
+                invalidate_stale_usage(snipped)
                 ls.messages = snipped
+                ls.last_prompt_tokens = None
                 ctx.messages = ls.messages
                 store = getattr(ls.rctx, "conversation_store", None)
                 if store:
                     try:
                         stored = store.load(snip_sid)
                         persisted = snip_store(stored, snip_records, snipped_ids)
+                        invalidate_stale_usage(persisted)
                         store.replace_all(snip_sid, persisted)
+                        branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
+                        if branch_sid and branch_sid != snip_sid:
+                            branch_persisted = snip_store(store.load(branch_sid), snip_records, snipped_ids)
+                            invalidate_stale_usage(branch_persisted)
+                            store.replace_all(branch_sid, branch_persisted)
                     except Exception as persist_error:
                         logger.warning("failed to persist snipped history: %s", persist_error)
                 await ls.rctx.emit_event("snip_compact", {

@@ -306,6 +306,10 @@ class DreamHandler:
             text = str(snapshot.get("result_text") or "").strip()
             if not text:
                 continue
+            if text.startswith("```"):
+                _lines = text.splitlines()
+                if len(_lines) >= 2 and _lines[-1].strip() == "```":
+                    text = "\n".join(_lines[1:-1]).strip()
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError as exc:
@@ -684,11 +688,10 @@ class DreamHandler:
 </book_list>
 保存时优先使用已有 book，也可以创建新 book。
 
-禁止调用 save_memory、delete_memory、list_memories。
-只分析下方 transcript。
-最终必须调用 finish，finish 的 text 必须是纯 JSON 数组：
+禁止调用 save_memory、delete_memory、list_memories 或 finish 等任何工具。
+只分析下方 transcript，直接输出纯 JSON 数组文本（不要加 ```json 代码块围栏，也不要输出任何解释文字）：
 [{{"id": "...", "book": "...", "content": "...", "keywords": ["..."]}}]
-无可保存信息时返回 []。
+无可保存信息时直接输出 []。
 
 --- 以下是对话记录 ---
 {transcript}"""
@@ -1012,9 +1015,10 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 delete_memory 清理。
 7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 create_or_update_skill 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
 8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
-9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
-10. 完成后用 finish 报告操作摘要。
+9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删、不改。
+10. 所有工具调用执行完毕并收到结果后，在最后一轮直接输出纯文本操作摘要（严禁调用 finish 等控制工具）。
 11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。
-12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。
+12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。严禁将 AI 拒绝或未能满足用户请求的实例抽象、归纳为任何行为限制规则。
 13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 save_memory 给它们互相补充 keywords，使它们更容易一起被激活。
-14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。"""
+14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。
+15. 严禁保存、保留或从实例中归纳任何“AI 拒绝用户请求”相关的记忆或限制规则；若在 source=auto 的非 constant 候选中发现拒绝类污染条目，用 delete_memory 清理。"""
