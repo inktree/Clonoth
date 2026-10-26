@@ -248,3 +248,151 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
     with TestClient(app) as client:
         assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
     assert app.state.panel_auth is not None
+
+
+def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path: Path):
+    from types import SimpleNamespace
+    from engine.builtin.knowledge_inject import (
+        build_knowledge_messages,
+        build_scan_text,
+        is_valid_keyword,
+        list_memories,
+        normalize_memory_entries,
+        normalize_skill_entries,
+        save_memory,
+    )
+
+    assert not is_valid_keyword("20")
+    assert not is_valid_keyword("#9")
+    assert not is_valid_keyword("ip")
+    assert not is_valid_keyword("日志")
+    assert is_valid_keyword("fb")
+    assert is_valid_keyword("4a")
+    assert is_valid_keyword(r"/\bh3\b/i")
+    assert is_valid_keyword("墨树")
+    assert is_valid_keyword("dol-tilemap")
+
+    history = [
+        {"role": "user", "content": "上一轮用户提问"},
+        {"role": "assistant", "content": "上一轮助手回复包含 trigger_from_bot"},
+        {"role": "user", "content": "动态块", "_dynamic": True},
+    ]
+    scan = build_scan_text("当前用户指令", history, scan_depth=1)
+    assert "上一轮用户提问" in scan
+    assert "trigger_from_bot" not in scan
+    assert "动态块" not in scan
+
+    skills = normalize_skill_entries([
+        {
+            "name": "card-workflow",
+            "description": "v3.4.0｜角色卡完整制作工作流与分阶段检查清单",
+            "enabled": True,
+            "strategy": "normal",
+            "keywords": ["制卡工作流", "20", "前端"],
+            "body": "# 第一章 调研\n导言段落\n## 1.1 角色设定\n" + ("详细步骤内容\n" * 200),
+        },
+        {
+            "name": "pure-index-skill",
+            "description": "无关键词技能说明",
+            "enabled": True,
+            "strategy": "normal",
+            "keywords": [],
+            "body": "短正文",
+        },
+    ])
+    memories = normalize_memory_entries([
+        {
+            "id": "workflow_packaged",
+            "book": "rules",
+            "content": "# 打包工作流\n这是无关键词的非constant成熟方案正文",
+            "keywords": [],
+            "has_raw_keywords": False,
+            "constant": False,
+            "enabled": True,
+        },
+        {
+            "id": "garbage_kw_only",
+            "book": "default",
+            "content": "只有无效泛词的脏记忆",
+            "keywords": ["20", "日志"],
+            "has_raw_keywords": True,
+            "constant": False,
+            "enabled": True,
+        },
+        {
+            "id": "long_active_mem",
+            "book": "tech",
+            "content": "# 架构方案\n" + ("核心细节说明\n" * 100),
+            "keywords": ["架构方案触发词"],
+            "has_raw_keywords": True,
+            "constant": False,
+            "enabled": True,
+        },
+    ])
+
+    skill_static, skill_dynamic, mem_static, mem_dynamic = build_knowledge_messages(
+        tmp_path,
+        skills + memories,
+        instruction_text="请按 制卡工作流 和 架构方案触发词 执行",
+        skill_inline_max_chars=500,
+        memory_inline_max_chars=200,
+    )
+    skill_static_text = "\n".join(m["content"] for m in skill_static)
+    skill_dynamic_text = "\n".join(m["content"] for m in skill_dynamic)
+    mem_static_text = "\n".join(m["content"] for m in mem_static)
+    mem_dynamic_text = "\n".join(m["content"] for m in mem_dynamic)
+
+    # Full compact skill index lives in static messages and includes activated skills too
+    assert "[SKILLS:INDEX]" in skill_static_text
+    assert "- card-workflow: 角色卡完整制作工作流与分阶段检查清单" in skill_static_text
+    assert "- pure-index-skill: 无关键词技能说明" in skill_static_text
+    assert "[SKILLS:INDEX]" not in skill_dynamic_text
+
+    # Intentionally keywordless memory is in static [MEMORY:INDEX]; garbage-only kw entry is dropped
+    assert "[MEMORY:INDEX]" in mem_static_text
+    assert "rules/workflow_packaged" in mem_static_text
+    assert "garbage_kw_only" not in mem_static_text
+    assert "garbage_kw_only" not in mem_dynamic_text
+
+    # Long activated skill and memory are rendered as progressive outlines
+    assert "[Large skill" in skill_dynamic_text
+    assert "- L1: # 第一章 调研" in skill_dynamic_text
+    assert "[Long memory" in mem_dynamic_text
+    assert 'list_memories(book="tech", id="long_active_mem")' in mem_dynamic_text
+
+    # Verify list_memories(id=...) returns full untruncated content
+    ctx = SimpleNamespace(
+        workspace_root=tmp_path,
+        node_id="main",
+        _caller_node_id="system.memory_extractor",
+        _node_extra={},
+        workspace_name="",
+    )
+    long_text = "A" * 600
+    res_save = asyncio.run(save_memory(
+        {"id": "full_read_test", "book": "tech", "content": long_text, "keywords": ["专有触发词", "20"], "scan_depth": 3},
+        ctx,
+    ))
+    assert res_save["ok"]
+    res_list_preview = asyncio.run(list_memories({"book": "tech"}, ctx))
+    assert len(res_list_preview["data"]["entries"][0]["content"]) == 200
+    assert res_list_preview["data"]["entries"][0]["keywords"] == ["专有触发词"]
+    assert res_list_preview["data"]["entries"][0]["scan_depth"] == 0
+    res_full = asyncio.run(list_memories({"book": "tech", "id": "full_read_test"}, ctx))
+    assert res_full["data"]["entries"][0]["content"] == long_text
+
+
+def test_discord_context_identity_and_key_roles():
+    from types import SimpleNamespace
+    from adapters.discord.context import _format_identity, _format_member_entry
+
+    role_noise = SimpleNamespace(name="月粉")
+    role_key = SimpleNamespace(name="核心维护者")
+    member_same = SimpleNamespace(display_name="InkTree", name="inktree", roles=[role_noise, role_key])
+    member_diff = SimpleNamespace(display_name="墨树", name="inktree", roles=[role_noise, role_key])
+
+    assert _format_identity(member_same, key_roles=set()) == "InkTree"
+    assert _format_identity(member_diff, key_roles=set(), is_admin=True) == "墨树[inktree] ✓ADMIN"
+    assert _format_identity(member_diff, key_roles={"核心维护者"}) == "墨树[inktree](核心维护者)"
+    assert _format_member_entry(member_same, "你好", reply_author="Sera", key_roles=set()) == "InkTree ↩ Sera: 你好"
+

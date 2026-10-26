@@ -101,19 +101,129 @@ PLUGIN_META = {
 #  Keyword matching
 # ---------------------------------------------------------------------------
 
-def compile_keyword(kw: str) -> re.Pattern[str] | str:
-    """Compile a skill or memory keyword entry."""
-    # Why: skill and memory keyword matching now lives inside the knowledge
-    # plugin instead of the old standalone matcher file. How: keep the exact legacy
-    # /pattern/flags parsing and lower-case substring fallback. Purpose: preserve
-    # activation behavior while removing the standalone matcher module.
-    kw = (kw or "").strip()
+_GENERIC_STOP_KEYWORDS = {
+    "入口", "换行", "事件", "预设", "安装", "继续", "部署", "日志", "路由", "分离",
+    "测试", "接口", "配置", "问题", "报错", "设置", "消息", "代码", "文件", "目录",
+    "系统", "服务", "功能", "模块", "参数", "返回", "请求", "响应", "状态", "结果",
+    "数据", "格式", "内容", "列表", "默认", "当前", "历史", "上下文", "指令", "回复", "时间",
+}
+
+_ASCII_STOP_KEYWORDS = {
+    "in", "on", "at", "to", "by", "or", "is", "it", "be", "as", "do", "go",
+    "no", "so", "up", "if", "my", "me", "we", "he", "us", "an", "of", "id",
+    "ok", "ip", "os", "ui", "io", "db", "js", "py", "ts", "sh", "fs",
+}
+
+_ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
+    "firebase": ("fb", "firebase", "firebasevertex", "firebasevertexai", "fb家园", "firebase家园", "firebase ai"),
+    "argon": ("4a", "4ag", "gemini-4-argon", "gemini 4 argon", "gemini4a", "vertex 4a", "[v]gemini-4-argon", "argon", "破4a"),
+    "zoaholic": ("zoa", "zoaholic", "家园反代"),
+    "aistudio": ("ais", "aistudio", "ai studio", "aistudio-科研区"),
+    "sillytavern": ("st", "sillytavern", "酒馆"),
+    "claude_code": ("cc", "claude code", "claude-code", "claude官cc", "claude官 cc"),
+    "novelai": ("nai", "novelai", "novel ai"),
+    "uau": ("uau", "uuau", "uau_outputtool"),
+    "toolcall": ("toolcall", "tool_call", "纯toolcall", "toolcall破限", "toolcall引导"),
+}
+
+_CORROBORATE_TERMS = (
+    "反代", "预设", "网关", "渠道", "代理", "破甲", "流式", "工具调用", "toolcall", "appcheck", "app check",
+)
+
+
+def _ascii_boundary_pattern(term: str) -> str:
+    esc = re.escape(term.lower())
+    if term.isascii() and len(term) <= 3:
+        return rf"(?<![a-z0-9]){esc}(?![a-z0-9])"
+    return esc
+
+
+_ALIAS_GROUP_PATTERNS: dict[str, re.Pattern[str]] = {
+    group: re.compile(
+        "|".join(_ascii_boundary_pattern(t) for t in sorted(terms, key=len, reverse=True)),
+        re.IGNORECASE,
+    )
+    for group, terms in _ALIAS_GROUPS.items()
+}
+
+_TERM_TO_ALIAS_GROUP: dict[str, str] = {
+    t.lower(): group
+    for group, terms in _ALIAS_GROUPS.items()
+    for t in terms
+}
+
+
+def _resolve_alias_group(raw_kw: str) -> str | None:
+    return _TERM_TO_ALIAS_GROUP.get(raw_kw.lower().strip())
+
+
+_ID_BOILERPLATE_TOKENS = {
+    "and", "the", "for", "with", "from", "into", "over", "under", "via",
+    "fix", "fixes", "setup", "spec", "rule", "rules", "note", "notes", "user",
+    "default", "project", "projects", "channel", "channels", "model", "models",
+    "system", "prompt", "prompts", "guide", "workflow", "config", "update",
+    "status", "check", "test", "plan", "mode", "only", "full", "pure", "new",
+    "old", "raw", "api", "bot", "web", "app", "cli", "sdk", "doc", "docs",
+}
+
+
+def _extract_compound_subtokens(entry_id: str, keywords: list[str]) -> list[tuple[str, re.Pattern[str]]]:
+    """Extract atomic ASCII/alphanumeric technical sub-tokens from snake_case id and compound keywords."""
+    seen: set[str] = {k.lower().strip() for k in keywords}
+    tokens: list[tuple[str, re.Pattern[str]]] = []
+    sources = [entry_id, *[k for k in keywords if not k.startswith("/")]]
+    for src in sources:
+        for raw_tok in re.findall(r"[A-Za-z][A-Za-z0-9]*|\d+[A-Za-z]+", src):
+            tok = raw_tok.lower()
+            if len(tok) < 2 or tok in seen or tok in _ASCII_STOP_KEYWORDS or tok in _ID_BOILERPLATE_TOKENS:
+                continue
+            if len(tok) == 2 and tok not in _TERM_TO_ALIAS_GROUP:
+                continue
+            if re.fullmatch(r"v\d+", tok):
+                continue
+            seen.add(tok)
+            group = _resolve_alias_group(tok)
+            pat = (
+                _ALIAS_GROUP_PATTERNS[group]
+                if group
+                else re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE)
+            )
+            tag = f"group:{group}" if group else f"sub:{tok}"
+            tokens.append((tag, pat))
+    return tokens
+
+
+def is_valid_keyword(kw: str) -> bool:
+    """Reject broad literal triggers while preserving explicit regex and domain slang."""
+    kw = kw.strip()
     if not kw:
+        return False
+    if kw.startswith("/") and kw.rfind("/") > 0:
+        return bool(kw[1:kw.rfind("/")])
+    if re.fullmatch(r"[\d\W_]+", kw):
+        return False
+    kw_low = kw.lower()
+    if kw_low in _TERM_TO_ALIAS_GROUP:
+        return True
+    if kw.isascii():
+        if len(kw) <= 1 or kw_low in _ASCII_STOP_KEYWORDS:
+            return False
+        return True
+    return kw not in _GENERIC_STOP_KEYWORDS
+
+
+def compile_keyword(kw: str) -> re.Pattern[str] | str:
+    """Compile a skill or memory keyword entry with alias expansion and short-ASCII boundaries."""
+    kw = (kw or "").strip()
+    if not is_valid_keyword(kw):
         return ""
     if kw.startswith("/"):
         last_slash = kw.rfind("/")
         if last_slash > 0:
             pattern = kw[1:last_slash]
+            alias_group = _resolve_alias_group(pattern)
+            if alias_group and not re.search(r"[\\.*+?^$|{}\[\]()]", pattern):
+                return _ALIAS_GROUP_PATTERNS[alias_group]
             flags_str = kw[last_slash + 1:]
             flags = 0
             if "i" in flags_str:
@@ -126,6 +236,11 @@ def compile_keyword(kw: str) -> re.Pattern[str] | str:
                 return re.compile(pattern, flags)
             except re.error:
                 pass
+    alias_group = _resolve_alias_group(kw)
+    if alias_group:
+        return _ALIAS_GROUP_PATTERNS[alias_group]
+    if kw.isascii() and len(kw) <= 3:
+        return re.compile(_ascii_boundary_pattern(kw), re.IGNORECASE)
     return kw.lower()
 
 
@@ -166,10 +281,15 @@ def build_scan_text(
         # starts are found. Purpose: preserve keyword activation scope exactly.
         round_starts: list[int] = []
         for i in range(len(history) - 1, -1, -1):
-            role = history[i].get("role", "")
-            if role != "user":
+            msg_i = history[i]
+            if msg_i.get("role", "") != "user" or msg_i.get("_dynamic"):
                 continue
-            if i == 0 or history[i - 1].get("role", "") != "user":
+            prev_is_real_user = (
+                i > 0
+                and history[i - 1].get("role", "") == "user"
+                and not history[i - 1].get("_dynamic")
+            )
+            if not prev_is_real_user:
                 round_starts.append(i)
                 if len(round_starts) >= scan_depth:
                     break
@@ -178,7 +298,7 @@ def build_scan_text(
             start_idx = round_starts[-1]
             for msg in history[start_idx:]:
                 role = msg.get("role", "")
-                if role not in ("user", "assistant"):
+                if role != "user" or msg.get("_dynamic"):
                     continue
                 content = msg.get("content")
                 if isinstance(content, str):
@@ -286,11 +406,12 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 strategy = "normal"
 
             raw_kw = meta.get("keywords")
-            keywords: list[str] = []
+            raw_keywords: list[str] = []
             if isinstance(raw_kw, list):
-                keywords = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
+                raw_keywords = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
             elif isinstance(raw_kw, str) and raw_kw.strip():
-                keywords = [raw_kw.strip()]
+                raw_keywords = [raw_kw.strip()]
+            keywords = [k for k in raw_keywords if is_valid_keyword(k)]
 
             order = 0
             if isinstance(meta.get("order"), (int, float)):
@@ -606,15 +727,16 @@ def load_memory_catalog(
                     continue
 
                 raw_kw = entry.get("keywords")
-                keywords: list[str] = []
+                raw_keywords: list[str] = []
                 if isinstance(raw_kw, list):
-                    keywords = [
+                    raw_keywords = [
                         str(k).strip()
                         for k in raw_kw
                         if isinstance(k, str) and str(k).strip()
                     ]
                 elif isinstance(raw_kw, str) and raw_kw.strip():
-                    keywords = [raw_kw.strip()]
+                    raw_keywords = [raw_kw.strip()]
+                keywords = [k for k in raw_keywords if is_valid_keyword(k)]
 
                 constant = bool(entry.get("constant", False))
                 priority = 0
@@ -642,6 +764,7 @@ def load_memory_catalog(
                     "book": book,
                     "id": eid,
                     "keywords": keywords,
+                    "has_raw_keywords": bool(raw_keywords),
                     "compiled_keywords": [compile_keyword(k) for k in keywords],
                     "content": content,
                     "constant": constant,
@@ -750,7 +873,8 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
         if not raw.get("enabled", True):
             continue
 
-        keywords = _as_string_list(raw.get("keywords"))
+        raw_keywords = _as_string_list(raw.get("keywords"))
+        keywords = [kw for kw in raw_keywords if is_valid_keyword(kw)]
         raw_strategy = str(raw.get("strategy") or "normal").strip().lower()
         if raw_strategy == "constant":
             strategy = "constant"
@@ -763,13 +887,17 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
         if not name:
             continue
 
+        compiled_kw = raw.get("compiled_keywords")
+        if not isinstance(compiled_kw, list) or len(compiled_kw) != len(keywords):
+            compiled_kw = [compile_keyword(kw) for kw in keywords]
+
         entries.append({
             "id": name,
             "kind": "skill",
             "content": str(raw.get("body") or raw.get("content") or ""),
             "strategy": strategy,
             "keywords": keywords,
-            "compiled_keywords": list(raw.get("compiled_keywords") or []),
+            "compiled_keywords": list(compiled_kw),
             "priority": _as_int(raw.get("priority"), 0),
             "order": _as_int(raw.get("order"), 0),
             "scan_depth": max(0, _as_int(raw.get("scan_depth"), 0)),
@@ -787,10 +915,7 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
 
 def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Map memory catalog entries to the unified knowledge-entry dictionary."""
-    # Why: memory injection should use the same pipeline as skills, but memory
-    # has no discovery INDEX. How: map constant memories to constant entries,
-    # keyword memories to keyword entries, and skip keywordless non-constant
-    # memories. Purpose: preserve existing memory visibility exactly.
+    # Keywordless non-constant memories remain discoverable through a static index.
     entries: list[dict[str, Any]] = []
     for raw in catalog or []:
         if not isinstance(raw, dict):
@@ -803,13 +928,20 @@ def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, An
         if not memory_id or not content:
             continue
 
-        keywords = _as_string_list(raw.get("keywords"))
+        raw_keywords = _as_string_list(raw.get("keywords"))
+        keywords = [kw for kw in raw_keywords if is_valid_keyword(kw)]
         if bool(raw.get("constant", False)):
             strategy = "constant"
         elif keywords:
             strategy = "keyword"
+        elif not raw_keywords and not raw.get("has_raw_keywords"):
+            strategy = "index"
         else:
             continue
+
+        compiled_kw = raw.get("compiled_keywords")
+        if not isinstance(compiled_kw, list) or len(compiled_kw) != len(keywords):
+            compiled_kw = [compile_keyword(kw) for kw in keywords]
 
         entries.append({
             "id": memory_id,
@@ -817,7 +949,7 @@ def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, An
             "content": content,
             "strategy": strategy,
             "keywords": keywords,
-            "compiled_keywords": list(raw.get("compiled_keywords") or []),
+            "compiled_keywords": list(compiled_kw),
             "priority": _as_int(raw.get("priority"), 0),
             "order": 0,
             "scan_depth": max(0, _as_int(raw.get("scan_depth"), 0)),
@@ -890,7 +1022,57 @@ def _new_buckets() -> dict[str, list[dict[str, Any]]]:
         "skill_index": [],
         "memory_constant": [],
         "memory_active": [],
+        "memory_index": [],
     }
+
+
+def _matched_entry_concepts(
+    entry: dict[str, Any],
+    scan_text: str,
+    active_groups: set[str],
+    active_corroborate: set[str],
+) -> set[str]:
+    """Return matched concept tags for a keyword-activated entry."""
+    text_lower = scan_text.lower()
+    concepts: set[str] = set()
+    keywords = list(entry.get("keywords") or [])
+    compiled_list = list(entry.get("compiled_keywords") or [])
+    for idx, comp in enumerate(compiled_list):
+        if not comp:
+            continue
+        hit = bool(comp.search(scan_text)) if isinstance(comp, re.Pattern) else (comp in text_lower)
+        if not hit:
+            continue
+        raw_kw = keywords[idx] if idx < len(keywords) else str(comp)
+        core = raw_kw[1:raw_kw.rfind("/")] if (raw_kw.startswith("/") and raw_kw.rfind("/") > 0) else raw_kw
+        group = _resolve_alias_group(core)
+        concepts.add(f"group:{group}" if group else f"kw:{core.lower().strip()}")
+
+    has_primary_hit = bool(concepts)
+    if str(entry.get("book") or "") != "people":
+        for sub_tag, sub_pat in _extract_compound_subtokens(str(entry.get("id") or ""), keywords):
+            if sub_pat.search(scan_text):
+                concepts.add(sub_tag)
+        # Entries matched only via derived compound subtokens require at least 2 distinct subtoken/group hits
+        if not has_primary_hit and len(concepts) < 2:
+            return set()
+
+    if not concepts:
+        return concepts
+
+    # Corroborate with entry id, keywords, and opening title lines against other active query concepts
+    first_lines = " ".join(str(entry.get("content") or "").splitlines()[:2])
+    head_text = f"{entry.get('id') or ''} {' '.join(keywords)} {first_lines}".lower()
+    for group in active_groups:
+        tag = f"group:{group}"
+        if tag not in concepts and _ALIAS_GROUP_PATTERNS[group].search(head_text):
+            concepts.add(tag)
+    for term in active_corroborate:
+        if term in head_text:
+            concepts.add(f"term:{term}")
+    if not has_primary_hit and len(concepts) < 2:
+        return set()
+    return concepts
 
 
 def _classify_and_match_entries(
@@ -900,13 +1082,19 @@ def _classify_and_match_entries(
     instruction_text: str = "",
     history: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Classify entries and run keyword activation for keyword entries."""
-    # Why: the old builders both used constant/keyword/index phases. How: run
-    # the same phases over unified entries and route results back to render
-    # buckets by kind. Purpose: make later budgeting global while preserving
-    # memory's lack of an INDEX block.
+    """Classify entries and run keyword activation with multi-concept co-occurrence filtering."""
     buckets = _new_buckets()
-    matched_memories: list[dict[str, Any]] = []
+    pending_memory_hits: list[tuple[dict[str, Any], set[str]]] = []
+    scan_cache: dict[int, tuple[str, set[str], set[str]]] = {}
+
+    def _get_scan_bundle(depth: int) -> tuple[str, set[str], set[str]]:
+        if depth not in scan_cache:
+            st = build_scan_text(instruction_text, history, depth)
+            st_low = st.lower()
+            act_groups = {g for g, rx in _ALIAS_GROUP_PATTERNS.items() if rx.search(st)}
+            act_corr = {t for t in _CORROBORATE_TERMS if t in st_low}
+            scan_cache[depth] = (st, act_groups, act_corr)
+        return scan_cache[depth]
 
     for entry in entries:
         kind = entry.get("kind")
@@ -918,24 +1106,53 @@ def _classify_and_match_entries(
                 buckets["memory_constant"].append(entry)
             continue
 
-        if strategy == "keyword":
-            scan_text = build_scan_text(instruction_text, history, int(entry.get("scan_depth") or 0))
-            if match_keywords(list(entry.get("compiled_keywords") or []), scan_text):
-                if kind == "skill":
-                    buckets["skill_active"].append(entry)
-                elif kind == "memory":
-                    buckets["memory_active"].append(entry)
-                    matched_memories.append(entry)
-            elif kind == "skill":
-                buckets["skill_index"].append(entry)
-            continue
-
-        if strategy == "index" and kind == "skill":
+        if kind == "skill":
             buckets["skill_index"].append(entry)
+        elif kind == "memory" and strategy == "index":
+            buckets["memory_index"].append(entry)
+
+        if strategy == "keyword":
+            scan_text, active_groups, active_corr = _get_scan_bundle(int(entry.get("scan_depth") or 0))
+            if kind == "skill":
+                if match_keywords(list(entry.get("compiled_keywords") or []), scan_text):
+                    buckets["skill_active"].append(entry)
+            elif kind == "memory":
+                concepts = _matched_entry_concepts(entry, scan_text, active_groups, active_corr)
+                if concepts:
+                    pending_memory_hits.append((entry, concepts))
+
+    # Multi-concept co-occurrence pruning for non-people memories:
+    # When multi-concept matches (score >= 2) exist, drop score==1 entries whose single concept
+    # is shared by multiple entries (e.g. generic 'zoa' or '4a' fan-out) unless priority > 0.
+    non_people_scores = [
+        len(c) for e, c in pending_memory_hits if str(e.get("book") or "") != "people"
+    ]
+    max_non_people_score = max(non_people_scores, default=0)
+    concept_freq: dict[str, int] = {}
+    for e, concepts in pending_memory_hits:
+        if str(e.get("book") or "") != "people":
+            for tag in concepts:
+                concept_freq[tag] = concept_freq.get(tag, 0) + 1
+
+    matched_memories: list[dict[str, Any]] = []
+    for entry, concepts in pending_memory_hits:
+        is_people = str(entry.get("book") or "") == "people"
+        has_person_kw = any(c.startswith("kw:") for c in concepts)
+        if is_people and not has_person_kw:
+            continue
+        if (
+            not is_people
+            and max_non_people_score >= 2
+            and len(concepts) == 1
+            and int(entry.get("priority") or 0) <= 0
+        ):
+            sole_tag = next(iter(concepts))
+            if sole_tag.startswith("group:") or concept_freq.get(sole_tag, 0) >= 2:
+                continue
+        buckets["memory_active"].append(entry)
+        matched_memories.append(entry)
 
     if matched_memories:
-        # [2026-05-24] Record hits in memory dict (zero IO).
-        # Old _update_last_hit_bg was yaml.safe_load-ing 660KB per call.
         _record_hits(workspace_root, matched_memories)
 
     return buckets
@@ -948,128 +1165,86 @@ def _sort_render_buckets(buckets: dict[str, list[dict[str, Any]]]) -> None:
     # Purpose: keep render order stable after moving logic into one module.
     for key in ("skill_constant", "skill_active", "skill_index"):
         buckets[key].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    for key in ("memory_constant", "memory_active"):
+    for key in ("memory_constant", "memory_active", "memory_index"):
         buckets[key].sort(key=lambda entry: str(entry.get("id") or ""))
 
 
-def _apply_skill_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply the legacy skill-only budget to skill injectable buckets."""
-    # Why: knowledge.max_budget_chars=0 must use the old independent skill
-    # budget. How: select constant and active skills by priority and append
-    # rejected skills to INDEX. Purpose: preserve both injected content and
-    # discovery behavior for existing configs.
+def _apply_active_budget(
+    buckets: dict[str, list[dict[str, Any]]], bucket_names: tuple[str, ...], max_budget_chars: int,
+) -> None:
+    """Budget active bodies only; retain overflow as progressive outlines."""
     if max_budget_chars <= 0:
         return
-
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    for entry in buckets["skill_constant"]:
-        all_injectable.append(("skill_constant", entry))
-    for entry in buckets["skill_active"]:
-        all_injectable.append(("skill_active", entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
-
-    kept_constant: list[dict[str, Any]] = []
-    kept_active: list[dict[str, Any]] = []
+    ranked = [(name, i, entry) for name in bucket_names for i, entry in enumerate(buckets[name])]
+    ranked.sort(key=lambda item: int(item[2].get("priority") or 0), reverse=True)
     used = 0
-    for origin, entry in all_injectable:
+    for name, i, entry in ranked:
         body_len = len(str(entry.get("content") or ""))
         if used + body_len <= max_budget_chars:
             used += body_len
-            if origin == "skill_constant":
-                kept_constant.append(entry)
-            else:
-                kept_active.append(entry)
         else:
-            buckets["skill_index"].append(entry)
+            buckets[name][i] = {**entry, "_outline_only": True}
 
-    buckets["skill_constant"] = kept_constant
-    buckets["skill_active"] = kept_active
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
+
+def _apply_skill_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
+    _apply_active_budget(buckets, ("skill_active",), max_budget_chars)
 
 
 def _apply_memory_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply the legacy memory-only budget to memory injectable buckets."""
-    # Why: the default path must keep memory's old independent budget. How:
-    # select constant and active memories by priority and drop rejected memories
-    # because memories never had an INDEX. Purpose: preserve existing memory
-    # prompt output when no global knowledge budget is configured.
-    if max_budget_chars <= 0:
-        return
-
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    for entry in buckets["memory_constant"]:
-        all_injectable.append(("memory_constant", entry))
-    for entry in buckets["memory_active"]:
-        all_injectable.append(("memory_active", entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
-
-    kept_constant: list[dict[str, Any]] = []
-    kept_active: list[dict[str, Any]] = []
-    used = 0
-    for origin, entry in all_injectable:
-        body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
-            used += body_len
-            if origin == "memory_constant":
-                kept_constant.append(entry)
-            else:
-                kept_active.append(entry)
-
-    buckets["memory_constant"] = kept_constant
-    buckets["memory_active"] = kept_active
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+    _apply_active_budget(buckets, ("memory_active",), max_budget_chars)
 
 
 def _apply_global_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    """Apply one priority-sorted budget pool across skills and memories."""
-    # Why: Phase 3 requires high-priority memories and skills to compete in one
-    # pool. How: rank all injectable entries by priority while remembering their
-    # render bucket, then restore kept entries to their original labels. Purpose:
-    # change budget selection without changing final tag names or prompt layout.
-    if max_budget_chars <= 0:
-        return
+    _apply_active_budget(buckets, ("skill_active", "memory_active"), max_budget_chars)
 
-    all_injectable: list[tuple[str, dict[str, Any]]] = []
-    # Why: equal-priority ties need deterministic behavior. How: start from the
-    # prompt render order before the stable priority sort. Purpose: avoid random
-    # output while still making priority the only cross-kind ranking key.
-    for bucket_name in ("skill_constant", "memory_constant", "skill_active", "memory_active"):
-        for entry in buckets[bucket_name]:
-            all_injectable.append((bucket_name, entry))
-    all_injectable.sort(key=lambda item: int(item[1].get("priority") or 0), reverse=True)
 
-    kept: dict[str, list[dict[str, Any]]] = {
-        "skill_constant": [],
-        "skill_active": [],
-        "memory_constant": [],
-        "memory_active": [],
-    }
-    used = 0
-    for origin, entry in all_injectable:
-        body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
-            used += body_len
-            kept[origin].append(entry)
-        elif origin.startswith("skill_"):
-            # Why: over-budget skill bodies used to remain discoverable through
-            # SKILLS:INDEX. How: append rejected injectable skills to the index
-            # bucket. Purpose: global budgeting does not hide skill metadata.
-            buckets["skill_index"].append(entry)
+def _compact_index_desc(s: str, max_chars: int = 60) -> str:
+    s = re.sub(r"^v\d+(?:\.\d+)*\s*[｜|]\s*", "", s.strip())
+    s = " ".join(s.split())
+    return s[:max_chars] + ("…" if len(s) > max_chars else "")
 
-    for bucket_name, entries in kept.items():
-        buckets[bucket_name] = entries
-    buckets["skill_constant"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["skill_active"].sort(key=lambda entry: (int(entry.get("order") or 0), str(entry.get("id") or "")))
-    buckets["memory_constant"].sort(key=lambda entry: str(entry.get("id") or ""))
-    buckets["memory_active"].sort(key=lambda entry: str(entry.get("id") or ""))
+
+def _build_skill_outline(entry: dict[str, Any], max_preview_chars: int = 800) -> str:
+    content = str(entry.get("content") or "")
+    headings: list[str] = []
+    intro: list[str] = []
+    intro_chars = 0
+    preview_limit = min(300, max_preview_chars)
+    for line_no, line in enumerate(content.splitlines(), 1):
+        if re.match(r"^#{1,3}\s+.+", line):
+            if len(headings) < 25:
+                headings.append(f"- L{line_no}: {line}")
+        elif intro_chars < preview_limit and not re.match(r"^#+\s+", line):
+            stripped = line.strip()
+            if stripped:
+                intro.append(stripped)
+                intro_chars += len(stripped) + 1
+    preview = "\n".join(intro)[:preview_limit]
+    return (
+        f'[Large skill (共 {len(content)} 字符) — 已展示结构大纲与导言。需要具体章节时请调用 '
+        f'read_file("skills/{entry["id"]}/SKILL.md", start_line=..., limit=...)]\n'
+        f'Description: {entry.get("description") or ""}\nOutline:\n'
+        + "\n".join(headings) + f"\nPreview:\n{preview}"
+    )
+
+
+def _build_memory_outline(entry: dict[str, Any], max_preview_chars: int = 500) -> str:
+    content = str(entry.get("content") or "")
+    headings = [f"- L{i}: {line}" for i, line in enumerate(content.splitlines(), 1)
+                if re.match(r"^#{1,3}\s+.+", line)][:25]
+    outline = "\nOutline:\n" + "\n".join(headings) if headings else ""
+    return (
+        content[:max_preview_chars] + outline
+        + f'\n[Long memory (共 {len(content)} 字符) — 如需完整内容请调用 '
+        f'list_memories(book="{entry.get("book") or "default"}", id="{entry["id"]}")]'
+    )
 
 
 def _render_skill_messages(
     constant_skills: list[dict[str, Any]],
     dynamic_skills: list[dict[str, Any]],
     index_only_skills: list[dict[str, Any]],
+    skill_inline_max_chars: int = 6000,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Render skill buckets using the legacy SKILLS tags."""
     # Why: callers and tests depend on exact SKILLS tag names and section
@@ -1091,21 +1266,18 @@ def _render_skill_messages(
         dynamic_parts.append("[SKILLS:ACTIVE]")
         for entry in dynamic_skills:
             dynamic_parts.append(f"\n## Skill: {entry['id']}\n")
-            dynamic_parts.append(str(entry.get("content") or ""))
+            content = str(entry.get("content") or "")
+            dynamic_parts.append(_build_skill_outline(entry) if entry.get("_outline_only") or len(content) > skill_inline_max_chars else content)
         dynamic_parts.append("\n[/SKILLS:ACTIVE]")
 
     if index_only_skills:
-        if dynamic_parts:
-            dynamic_parts.append("")
-        dynamic_parts.append("[SKILLS:INDEX]")
-        dynamic_parts.append(
-            "The following skills are not activated. If the current task needs one, read its full text at the listed path via read_file."
-        )
+        parts = ["[SKILLS:INDEX]",
+                 'If a task needs an unactivated skill, read "skills/<name>/SKILL.md" via read_file.']
         for entry in index_only_skills:
-            dynamic_parts.append(f"- name: {entry['id']}")
-            dynamic_parts.append(f"  description: {_short_text(str(entry.get('description') or ''))}")
-            dynamic_parts.append(f"  path: {entry.get('path') or ''}")
-        dynamic_parts.append("[/SKILLS:INDEX]")
+            desc = _compact_index_desc(str(entry.get("description") or ""))
+            parts.append(f"- {entry['id']}" + (f": {desc}" if desc else ""))
+        parts.append("[/SKILLS:INDEX]")
+        static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     if dynamic_parts:
         dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
@@ -1116,11 +1288,12 @@ def _render_skill_messages(
 def _render_memory_messages(
     constant_entries: list[dict[str, Any]],
     dynamic_entries: list[dict[str, Any]],
+    index_entries: list[dict[str, Any]] | None = None,
+    memory_inline_max_chars: int = 2000,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Render memory buckets using the legacy MEMORY tags."""
-    # Why: memories did not have an INDEX block and used different section
-    # headers from skills. How: keep the old MEMORY renderer's exact tag names
-    # and joins. Purpose: preserve prompt text for existing memory users.
+    # Keep constant bodies and discovery metadata static; active bodies can
+    # degrade to outlines without losing a path to their full content.
     static_msgs: list[dict[str, str]] = []
     dynamic_msgs: list[dict[str, str]] = []
 
@@ -1132,12 +1305,22 @@ def _render_memory_messages(
         parts.append("\n[/MEMORY:CONSTANT]")
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
+    if index_entries:
+        parts = ["[MEMORY:INDEX]",
+                 'Unindexed memories (use list_memories(book="<book>", id="<id>") to read full content when relevant):']
+        for entry in index_entries:
+            desc = _compact_index_desc(str(entry.get("content") or ""))
+            parts.append(f"- {entry.get('book') or 'default'}/{entry['id']}: {desc}")
+        parts.append("[/MEMORY:INDEX]")
+        static_msgs.append({"role": "system", "content": "\n".join(parts)})
+
     dynamic_parts: list[str] = []
     if dynamic_entries:
         dynamic_parts.append("[MEMORY:ACTIVE]")
         for entry in dynamic_entries:
             dynamic_parts.append(f"\n## {entry['id']}\n")
-            dynamic_parts.append(str(entry.get("content") or ""))
+            content = str(entry.get("content") or "")
+            dynamic_parts.append(_build_memory_outline(entry) if entry.get("_outline_only") or len(content) > memory_inline_max_chars else content)
         dynamic_parts.append("\n[/MEMORY:ACTIVE]")
 
     if dynamic_parts:
@@ -1160,6 +1343,8 @@ def build_knowledge_messages(
     skill_max_budget_chars: int = 0,
     memory_max_budget_chars: int = 0,
     knowledge_max_budget_chars: int = 0,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
     """Build skill and memory messages from already-normalized entries."""
     # Why: build_knowledge_context and legacy wrappers need the same pipeline.
@@ -1194,10 +1379,13 @@ def build_knowledge_messages(
         buckets["skill_constant"],
         buckets["skill_active"],
         buckets["skill_index"],
+        skill_inline_max_chars=skill_inline_max_chars,
     )
     memory_static, memory_dynamic = _render_memory_messages(
         buckets["memory_constant"],
         buckets["memory_active"],
+        buckets["memory_index"],
+        memory_inline_max_chars=memory_inline_max_chars,
     )
     return skill_static, skill_dynamic, memory_static, memory_dynamic
 
@@ -1209,6 +1397,9 @@ def build_knowledge_context(
     history: list[dict],
     runtime_cfg: dict,
     task_context: dict | None = None,
+    *,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Return ``(skill_static, skill_dynamic, memory_static, memory_dynamic)``.
 
@@ -1292,6 +1483,8 @@ def build_knowledge_context(
         skill_max_budget_chars=get_int(safe_runtime_cfg, "skills.max_budget_chars", 0, min_value=0),
         memory_max_budget_chars=get_int(safe_runtime_cfg, "memory.max_budget_chars", 0, min_value=0),
         knowledge_max_budget_chars=get_int(safe_runtime_cfg, "knowledge.max_budget_chars", 0, min_value=0),
+        skill_inline_max_chars=get_int(safe_runtime_cfg, "skills.inline_max_chars", skill_inline_max_chars, min_value=0),
+        memory_inline_max_chars=get_int(safe_runtime_cfg, "memory.inline_max_chars", memory_inline_max_chars, min_value=0),
     )
 
 
@@ -1356,6 +1549,13 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         except (TypeError, ValueError):
             pass
 
+    if keywords is not None:
+        keywords = [kw for kw in keywords if is_valid_keyword(kw)]
+    _caller_nid = str(getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or "").strip()
+    _is_sys_mem_node = _caller_nid in ("system.memory_extractor", "system.dream")
+    if _is_sys_mem_node:
+        scan_depth = 0
+
     visibility = str(args.get("visibility", "") or "").strip().lower() or None
     if visibility is not None and visibility not in ("public", "private"):
         return _tool_err("invalid visibility: 'public' or 'private'")
@@ -1390,6 +1590,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
         meta, body = parse_skill_frontmatter(content)
         if not isinstance(meta, dict):
             meta = {}
+        meta["keywords"] = [kw for kw in _as_string_list(meta.get("keywords")) if is_valid_keyword(kw)]
         meta["name"] = name
         if description:
             meta["description"] = description
@@ -1615,6 +1816,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     elif isinstance(raw_keywords, str) and raw_keywords.strip():
         keywords = [raw_keywords.strip()]
 
+    keywords = [kw for kw in keywords if is_valid_keyword(kw)]
     constant = bool(args.get("constant", False))
     enabled = bool(args.get("enabled", True))
     _caller_nid = str(getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or "").strip()
@@ -1646,6 +1848,9 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             scan_depth = max(0, int(args["scan_depth"]))
         except (TypeError, ValueError):
             pass
+
+    if _is_sys_mem_node:
+        scan_depth = 0
 
     # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
     # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
@@ -1731,6 +1936,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # 看不到自己刚保存的 workspace 记忆。How: 扫描节点级目录与全部 @ 子目录，
     # 每条目标记 scope/workspace 来源；ns 目录不存在时保留 root 兜底。
     book_filter = str(args.get("book") or "").strip() or None
+    id_filter = str(args.get("id") or "").strip() or None
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
     _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
     _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
@@ -1761,10 +1967,12 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
                 for e in data.get("entries", []):
                     if not isinstance(e, dict):
                         continue
+                    if id_filter and str(e.get("id") or "").strip() != id_filter:
+                        continue
                     result.append({
                         "book": bname,
                         "id": str(e.get("id") or ""),
-                        "content": str(e.get("content") or "")[:200],
+                        "content": str(e.get("content") or "") if id_filter else str(e.get("content") or "")[:200],
                         "keywords": e.get("keywords", []),
                         "constant": bool(e.get("constant", False)),
                         "enabled": bool(e.get("enabled", True)),
@@ -1788,8 +1996,8 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         scope_label = f"{mscope}(@{mws})" if mws else mscope
         trig_label = "constant" if m.get("constant") else f"kw={len(m.get('keywords') or [])}"
         en_label = "enabled" if m.get("enabled", True) else "disabled"
-        preview = " ".join(str(m.get("content") or "").split())
-        if len(preview) > 100:
+        preview = str(m.get("content") or "") if id_filter else " ".join(str(m.get("content") or "").split())
+        if not id_filter and len(preview) > 100:
             preview = preview[:100] + "…"
         lines.append(f"- {mbook}/{mid_str} | {scope_label} | {trig_label} | {en_label} | {preview}")
     return _tool_ok("\n".join(lines), entries=result)
@@ -1956,6 +2164,7 @@ PLUGIN_META["tools"] = [
             "type": "object",
             "properties": {
                 "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
+                "id": {"type": "string", "description": "Optional memory entry id. When specified, returns the full untruncated content of matching entry/entries."},
             },
             "required": [],
         },

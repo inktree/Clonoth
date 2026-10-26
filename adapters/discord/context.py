@@ -50,10 +50,32 @@ def _get_display_name(member: discord.Member | discord.User) -> str:
     return _sanitize_name(getattr(member, "display_name", str(member)))
 
 
-def _get_role_names(member: discord.Member | discord.User) -> list[str]:
-    if not hasattr(member, "roles"):
+def _get_role_names(
+    member: discord.Member | discord.User, key_roles: set[str] | None = None,
+) -> list[str]:
+    if not key_roles:
         return []
-    return [_sanitize_name(r.name, 24) for r in member.roles if r.name != "@everyone"]
+    return [
+        _sanitize_name(r.name, 24) for r in getattr(member, "roles", [])
+        if r.name != "@everyone" and r.name in key_roles
+    ]
+
+
+def _format_identity(
+    member: discord.Member | discord.User,
+    key_roles: set[str] | None = None,
+    is_admin: bool = False,
+) -> str:
+    """统一历史、引用与指令身份，仅保留不同的用户名及特定身份组。"""
+    display_name = _get_display_name(member)
+    username = getattr(member, "name", "") or ""
+    identity = display_name if not username or display_name.lower() == username.lower() else f"{display_name}[{_sanitize_name(username)}]"
+    roles = _get_role_names(member, key_roles)
+    if roles:
+        identity += f"({','.join(roles)})"
+    if is_admin:
+        identity += " ✓ADMIN"
+    return identity
 
 
 async def _resolve_mention(match: re.Match[str], guild: discord.Guild | None) -> str:
@@ -146,14 +168,13 @@ def _format_member_entry(
     text: str,
     msg_time: datetime.datetime | None = None,
     reply_author: str = "",
+    key_roles: set[str] | None = None,
 ) -> str:
-    """构造带身份组标注的历史条目。"""
+    """构造带精简身份、时间与回复关系的历史条目。"""
     time_prefix = _format_time_prefix(msg_time)
-    display_name = _get_display_name(member)
-    roles = _get_role_names(member)
-    role_tag = f"({','.join(roles)})" if roles else ""
+    identity = _format_identity(member, key_roles)
     reply_tag = f" ↩ {reply_author}" if reply_author else ""
-    return f"{time_prefix}{display_name}[{member.name}]{role_tag}{reply_tag}: {text}"
+    return f"{time_prefix}{identity}{reply_tag}: {text}"
 
 
 def _build_context_text(
@@ -199,10 +220,8 @@ def _build_context_text(
     else:
         history_block = ""
 
-    display_name = _get_display_name(member)
-    roles = _get_role_names(member)
-    role_str = f"（身份组: {', '.join(roles)}）" if roles else ""
-    now_str = datetime.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
+    identity = _format_identity(member, rt.key_roles, is_admin=member.id in rt.superusers)
+    now_str = datetime.datetime.now(_CST).strftime("%m-%d %H:%M CST")
 
     history_title = "【私聊上下文记录】" if is_dm else "【群聊上下文记录】"
     parts = []
@@ -213,9 +232,8 @@ def _build_context_text(
     parts.append(f"当前时间: {now_str}")
     # [2026-05-14 refactor note] The administrator marker now reads the
     # superuser set from DiscordRuntime rather than a module-level global.
-    admin_tag = " ✓ADMIN" if member.id in rt.superusers else ""
     parts.append(
-        f"【当前用户指令】\n{display_name}[{member.name}]{role_str}{admin_tag}: {user_input}\n\n"
+        f"【当前用户指令】\n{identity}: {user_input}\n\n"
         f"请根据以上上下文，执行当前用户的指令并给出回复。"
     )
     return "\n".join(parts)
@@ -243,9 +261,7 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
         return ""
 
     author = ref.author
-    display_name = _get_display_name(author)
-    roles = _get_role_names(author) if hasattr(author, "roles") else []
-    role_tag = f"({','.join(roles)})" if roles else ""
+    identity = _format_identity(author, rt.key_roles)
     time_prefix = _format_time_prefix(ref.created_at)
     text = ""
     guild = message.guild
@@ -312,7 +328,7 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
         text = "[media]"
     if len(text) > 500:
         text = text[:497] + "..."
-    return f"{time_prefix}{display_name}[{author.name}]{role_tag}: {text}"
+    return f"{time_prefix}{identity}: {text}"
 
 
 def record_reaction_add(rt: Any, payload: discord.RawReactionActionEvent) -> None:

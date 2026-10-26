@@ -135,6 +135,8 @@ supervisor:
     discord_history_len: 15
     discord_log_channel: ""
     discord_superusers: ""
+    # 仅保留在上下文中的特定身份组名称列表，逗号分隔；留空时不展示普通装饰性身份组。
+    discord_key_roles: ""
     # Discord gateway/API 通过本机 Clash HTTP 代理转发。
     discord_proxy: ""
     # Gateway 连接偶发失败时，在 Bot 进程内等待后重试。

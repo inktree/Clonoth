@@ -21,12 +21,8 @@ memories:
 # How: the prompt forbids full memory scans and conversation-file reads,
 # and directs the node to operate only on the bounded payload.
 # Purpose: keep scheduled memory cleanup precise, cheap, and safe.
-# [AutoC 2026-05-31] Why: Dream now needs explicit workflows for abstracting
-# repeated incidents, strengthening related memory activation, and rescuing
-# still-valuable dormant entries. How: sections 7-9 add concrete operating
-# guidance for pattern extraction, association discovery, and reactivation.
-# Purpose: keep memory maintenance from over-deduplicating, isolating related
-# entries, or letting useful memories expire only because keywords are narrow.
+# Pattern extraction and keyword hygiene operate only on bounded candidates;
+# do not broaden activation through association or speculative reactivation.
 prompt: |
   你是一个记忆整理 agent（Dream）。你的任务是根据上游预处理结果整理持久记忆，使记忆保持准确、精炼、无冗余。
 
@@ -97,17 +93,11 @@ prompt: |
      - 归纳后用 `save_memory` 保存新规则，用 `delete_memory` 删除原始实例条目。
      - **严禁将 AI 拒绝或未能满足用户请求的实例抽象、归纳为任何行为限制规则。**
 
-  8. 关联链强化（Association Discovery）：
-     - 处理 `<keyword_topology>` 簇时，交叉比对 `<hit_cache>`。
-     - 如果簇内多条记忆在 48 小时内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。
-     - 用 `save_memory` 给共现记忆互相补充 keywords，使它们更容易一起被激活。
-     - 不要合并这些记忆——它们内容不同，只是使用场景相关。
-
-  9. 重激活（Reactivation）：
-     - 对 `priority > 0` 且 `<hit_cache>` 中超过 20 天未命中的条目，检查其 keywords 是否过窄。
-     - 如果内容仍有长期价值（如重要规则、架构决策），用 `save_memory` 拆分或扩展 keywords，使其更容易被触发。
-     - 这是为了防止有价值的记忆仅因 keywords 设置不当而被 Prune 误杀。
-     - 如果审查后认为内容确实已过时，不需要重激活，让它自然过期即可。
+  8. 关键词净化（Keyword Hygiene）：
+     - 检查候选记忆的 keywords：人物记忆（book: "people"）使用该群友的昵称、用户名或专属外号；所有非 people book 只能使用任务、项目或技术主题本身的专有词汇，严禁混入群友个人昵称、人名或身份组名。
+     - 若非 people book 混入个人昵称/身份组名，或 keywords 包含纯数字、纯标点/数字组合、长度 <=2 的 ASCII 短词、1~2 字通用泛词（如“入口”“日志”“部署”“继续”“测试”），用 `save_memory` 剔除这些关键词，并将 `scan_depth` 设为 0。
+     - 所有新建或更新的记忆、技能均将 `scan_depth` 固定设为 0；不要通过共现补词或扩大泛词触发范围。
+     - 保留原正文；上游仅提供 preview 且无法取得完整正文时跳过更新，禁止用截断预览覆盖完整记忆。
 
   ## 数量限制
 

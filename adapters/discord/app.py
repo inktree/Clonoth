@@ -92,6 +92,11 @@ def _parse_superusers(raw: str) -> set[int]:
 SUPERUSERS: set[int] = _parse_superusers(os.environ.get("DISCORD_SUPERUSERS", ""))
 
 
+def _parse_key_roles(raw: str) -> set[str]:
+    """Parse the comma-separated context role allowlist."""
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "")
     if not raw:
@@ -112,6 +117,7 @@ class DiscordRuntime:
     child_node_display_names: dict[str, str]
     base_url: str
     history_max_len: int
+    key_roles: set[str] = field(default_factory=set)
     discord_voice_input: bool = True
     discord_voice_reply: bool = True
     discord_voice_reply_on_voice_input: bool = True
@@ -159,9 +165,15 @@ def create_runtime() -> DiscordRuntime:
     # loads .env and adds any DISCORD_SUPERUSERS values on top of that set.
     runtime_superusers = set(SUPERUSERS)
     runtime_superusers.update(_parse_superusers(os.environ.get("DISCORD_SUPERUSERS", "")))
+    workspace = Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE)
+    raw_key_roles = os.environ.get("DISCORD_KEY_ROLES")
+    if raw_key_roles is None:
+        from clonoth_runtime import get_str, load_runtime_config
+        raw_key_roles = get_str(load_runtime_config(workspace), "supervisor.process_manager.discord_key_roles", "")
     rt = DiscordRuntime(
         dc_client=_create_discord_client(),
-        workspace=Path(os.environ.get("CLONOTH_WORKSPACE", "") or CLONOTH_WORKSPACE),
+        workspace=workspace,
+        key_roles=_parse_key_roles(raw_key_roles),
         superusers=runtime_superusers,
         agent_log_channel_id=int(os.environ.get("DISCORD_LOG_CHANNEL", str(AGENT_LOG_CHANNEL_ID))),
         bridge_port=int(os.environ.get("DISCORD_BRIDGE_PORT", str(BRIDGE_PORT))),
@@ -352,6 +364,7 @@ def register_events(rt: DiscordRuntime) -> None:
         if clean_text:
             entry = _format_member_entry(
                 message.author, clean_text, msg_time=message.created_at, reply_author=reply_author_name,
+                key_roles=rt.key_roles,
             )
             _push_history(rt, channel_id, entry, message=message, msg_id=message.id)
 
@@ -378,6 +391,7 @@ def register_events(rt: DiscordRuntime) -> None:
                     if entry.get("msg_id") == message.id:
                         entry["text"] = _format_member_entry(
                             message.author, history_text, msg_time=message.created_at, reply_author=reply_author_name,
+                            key_roles=rt.key_roles,
                         )
                         break
         else:

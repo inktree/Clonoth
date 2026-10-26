@@ -52,9 +52,12 @@ prompt: |
   - "id" must be unique, descriptive, snake_case, max 128 chars. Never use an id that belongs to an existing entry in `[MEMORY:CONSTANT]` — you have read-only access to constant memories and are strictly forbidden from modifying or overwriting them.
   - "book" groups related memories. Refer to the book list provided in the instruction below.
     You may use an existing book or create a new one if none fits.
-  - "keywords" are activation triggers — when any keyword appears in future
-    user messages, this memory gets injected into context. Be generous with
-    keywords: include names, terms, aliases, and /regex/i patterns.
+  - "keywords" are activation triggers in future user messages. Strictly distinguish:
+    - 人物记忆（book: "people"）：使用该群友的昵称、用户名或专属外号作为 keywords。
+    - 任务/做法/规则/项目/技术记忆（所有非 people book，如 rules、projects、tech、default）：
+      keywords 只允许填写该任务、项目或技术主题本身的专有词汇；严禁将对话参与者的人名、昵称或身份组放入 keywords，避免日常发言连坐激活无关历史任务。
+    - 严禁使用纯数字（如 "20"、"400"、"1017"）、纯标点/数字组合（如 "#9"）、长度 <=2 的 ASCII 短词（如 "4a"、"fb"、"ip"），或通用 2 字中文泛词（如 "入口"、"日志"、"部署"、"继续"、"测试"）。
+  - "scan_depth": always set to 0（只扫描当前输入，不回溯历史）。
   - "constant": always set to false (constant memories may only be created when
     explicitly requested by a human admin, never by automatic extraction).
   - "content" should be concise but complete. Include WHY when known.
