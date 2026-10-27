@@ -254,11 +254,9 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
         converted.append({"role": "user", "content": blocks})
         i += 1
 
-    # Merge consecutive same-role messages (Anthropic requires strict user/assistant alternation)
-    # IMPORTANT: tool_result blocks and text blocks MUST NOT be mixed in the
-    # same user message — Anthropic rejects any user message containing both.
-    # When a user-role tool_result group is followed by a user-role text message
-    # (or vice versa), we insert a synthetic assistant separator instead of merging.
+    # Merge consecutive same-role messages. Client tool results may share a user
+    # message with ordinary text, provided all tool_result blocks come first.
+    # Only text followed by tool_result needs a synthetic assistant separator.
     merged: list[dict] = []
     for msg in converted:
         if merged and merged[-1]["role"] == msg["role"]:
@@ -268,8 +266,8 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
             curr_blocks = curr_content if isinstance(curr_content, list) else _content_to_blocks(curr_content)
             prev_has_tr = any(b.get("type") == "tool_result" for b in prev_blocks)
             curr_has_tr = any(b.get("type") == "tool_result" for b in curr_blocks)
-            # Both have tool_result, or neither has — safe to merge
-            if prev_has_tr == curr_has_tr:
+            # Appending text after tool results preserves Anthropic's block order.
+            if prev_has_tr == curr_has_tr or (prev_has_tr and not curr_has_tr):
                 if isinstance(prev_content, list) and isinstance(curr_content, list):
                     prev_content.extend(curr_content)
                 elif isinstance(prev_content, list):
@@ -277,7 +275,7 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
                 else:
                     merged[-1]["content"] = _content_to_blocks(prev_content) + _content_to_blocks(curr_content)
             else:
-                # Mixing tool_result with text — insert assistant separator
+                # Text before tool_result would violate the required block order.
                 merged.append({"role": "assistant", "content": [{"type": "text", "text": "(continued)"}]})
                 merged.append(msg)
         else:

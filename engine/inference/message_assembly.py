@@ -185,7 +185,7 @@ def assemble_messages_with_injections(
 
     else:
         # === String mode (existing behavior) ===
-        # Stable prefix → history → dynamic suffix → instruction
+        # Stable prefix → history → instruction → dynamic suffix
         #
         # Dynamic content uses role=user instead of role=system so that
         # Anthropic/Gemini (which merge all system messages into a single
@@ -201,7 +201,7 @@ def assemble_messages_with_injections(
         # --- history ---
         messages.extend(history)
 
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
+        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之前）
         _last = history[-1] if history else None
         _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
         _already_in_history = (
@@ -391,7 +391,7 @@ def assemble_initial_messages(
 
     else:
         # === String mode (existing behavior) ===
-        # Stable prefix → history → dynamic suffix → instruction
+        # Stable prefix → history → instruction → dynamic suffix
         #
         # Dynamic content uses role=user instead of role=system so that
         # Anthropic/Gemini (which merge all system messages into a single
@@ -407,7 +407,7 @@ def assemble_initial_messages(
         # --- history ---
         messages.extend(history)
 
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
+        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之前）
         _last = history[-1] if history else None
         _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
         _already_in_history = (

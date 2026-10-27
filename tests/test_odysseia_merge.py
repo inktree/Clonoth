@@ -399,7 +399,8 @@ def test_discord_context_identity_and_key_roles():
     assert _format_member_entry(member_same, "你好", reply_author="Sera", key_roles=set()) == "InkTree ↩ Sera: 你好"
 
 
-def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolation(tmp_path: Path):
+@pytest.mark.parametrize("provider_name", ["openai", "anthropic", "gemini-vertex"])
+def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolation(tmp_path, provider_name):
     from types import SimpleNamespace
     from engine.inference.llm_call import _build_messages_for_provider
     from engine.inference.message_assembly import assemble_messages_with_injections
@@ -424,7 +425,7 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     assert "2026-10-27 12:00 UTC" in prompt_msgs[1]["content"]
     assert "hello # %%DYNAMIC%% world" in prompt_msgs[1]["content"]
 
-    # String mode: instruction comes before _dynamic, and multi-step tool calls stay before _dynamic in provider view
+    # Scheme C: history -> instruction -> dynamic; tool steps only append afterward.
     str_msgs, is_block = assemble_messages_with_injections(
         system_prompt=prompt_msgs,
         skill_static=[],
@@ -440,17 +441,27 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     assert str_msgs[3]["content"] == "turn1_q"
     assert str_msgs[4].get("_dynamic") is True
 
-    # Simulate step 1 tool call appended after initial assembly
-    str_msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
-    str_msgs.append({"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "file_body"})
     formatter = create_tool_formatter("native")
-    provider = SimpleNamespace(name="gemini-vertex")
+    provider = SimpleNamespace(name=provider_name)
+    initial_view = _build_messages_for_provider(str_msgs, formatter, provider)
+
+    # Simulate step 1 using the native formatter's L1 storage shape.
+    str_msgs.append({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}],
+        "_meta": {"tool_mode": "native"},
+    })
+    str_msgs.append({
+        "role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "file_body",
+        "_meta": {"tool_mode": "native"},
+    })
     view = _build_messages_for_provider(str_msgs, formatter, provider)
-    # _dynamic is relocated to the very end so [system, prev_q, prev_a, turn1_q, assistant(c1), tool(c1)] indices never shift on Turn 2
-    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "assistant", "tool", "user"]
+    assert view[:len(initial_view)] == initial_view
+    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "user", "assistant", "tool"]
     assert view[3]["content"] == "turn1_q"
-    assert view[5]["content"] == "file_body"
-    assert view[6].get("_dynamic") is True
+    assert view[4]["content"] == str_msgs[4]["content"]
+    assert view[6]["content"] == "file_body"
+    assert str_msgs[4].get("_dynamic") is True
 
     # Block mode with trailing assistant prefill (UAU / UAS): _dynamic must NOT be moved after assistant prefill
     block_msgs = [
@@ -462,5 +473,112 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     block_view = _build_messages_for_provider(block_msgs, formatter, provider)
     assert block_view[-1]["role"] == "assistant"
     assert block_view[-1]["content"] == "<!-- Start the ECoT -->"
+
+
+@pytest.mark.parametrize("result_fields", [
+    {"tool_call_id": "", "name": "read_file"},
+    {"name": "read_file"},
+    {"tool_call_id": "", "name": ""},
+    {"tool_call_id": " ", "name": " "},
+    {},
+])
+def test_legacy_tool_results_recover_ids_and_preserve_actual_output(result_fields):
+    from engine.inference.tool_format import build_llm_messages, repair_tool_result_pairing_with_stats
+
+    messages = [
+        {"role": "assistant", "content": "", "_meta": {"tool_mode": "native"},
+         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
+        {"role": "tool", "content": "ACTUAL_RESULT", "_meta": {"tool_mode": "native"}, **result_fields},
+    ]
+    repaired, stats = repair_tool_result_pairing_with_stats(messages)
+    assert stats["removed_orphan_tool_results"] == 0
+    assert stats["fixed_orphan_tool_calls"] == 0
+    assert repaired[1]["tool_call_id"] == "c1"
+    assert repaired[1]["name"] == "read_file"
+    assert repaired[1]["content"] == "ACTUAL_RESULT"
+    view = build_llm_messages(messages, NativeToolFormatter())
+    assert view[0]["tool_calls"][0]["id"] == "c1"
+    assert view[1]["tool_call_id"] == "c1"
+    assert view[1]["name"] == "read_file"
+    assert view[1]["content"] == "ACTUAL_RESULT"
+
+
+@pytest.mark.parametrize("bad_fields", [
+    {"tool_call_id": "wrong_id", "name": "read_file"},
+    {"tool_call_id": "", "name": "unknown_tool"},
+])
+def test_unmatched_tool_results_cannot_consume_a_different_call(bad_fields):
+    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
+
+    messages = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
+        {"role": "tool", "content": "WRONG_RESULT", **bad_fields},
+        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "ACTUAL_RESULT"},
+    ]
+    repaired, stats = repair_tool_result_pairing_with_stats(messages)
+    assert stats["removed_orphan_tool_results"] == 1
+    assert stats["fixed_orphan_tool_calls"] == 0
+    assert [m["content"] for m in repaired[1:]] == ["ACTUAL_RESULT"]
+    assert repaired[1]["tool_call_id"] == "c1"
+
+
+def test_legacy_tool_results_match_names_before_position():
+    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
+
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "read_file", "arguments": {}},
+            {"id": "c2", "name": "search", "arguments": {}},
+        ]},
+        {"role": "tool", "tool_call_id": "", "name": "search", "content": "SEARCH_RESULT"},
+        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "READ_RESULT"},
+    ]
+    repaired, _ = repair_tool_result_pairing_with_stats(messages)
+    assert [(m["tool_call_id"], m["content"]) for m in repaired[1:]] == [
+        ("c1", "READ_RESULT"), ("c2", "SEARCH_RESULT"),
+    ]
+
+
+def test_positional_tool_results_remove_consumed_ids_from_pending():
+    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
+
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "name": "read_file", "arguments": {}},
+            {"id": "c2", "name": "search", "arguments": {}},
+        ]},
+        {"role": "tool", "tool_call_id": "", "name": "", "content": "FIRST"},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "DUPLICATE"},
+        {"role": "tool", "content": "SECOND"},
+    ]
+    repaired, stats = repair_tool_result_pairing_with_stats(messages)
+    assert stats["removed_orphan_tool_results"] == 1
+    assert [(m["tool_call_id"], m["name"], m["content"]) for m in repaired[1:]] == [
+        ("c1", "read_file", "FIRST"), ("c2", "search", "SECOND"),
+    ]
+
+
+def test_anthropic_finish_result_merges_next_turn_text_without_continued():
+    from providers.anthropic import _convert_messages
+
+    messages = [
+        {"role": "user", "content": "I1"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "f1", "type": "function",
+             "function": {"name": "finish", "arguments": '{"text":"DONE"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "f1", "name": "finish", "content": "ok"},
+        {"role": "user", "content": "D2", "_dynamic": True},
+        {"role": "user", "content": "I2"},
+    ]
+    _, converted = _convert_messages(messages)
+    assert [m["role"] for m in converted] == ["user", "assistant", "user"]
+    assert converted[-1]["content"] == [
+        {"type": "tool_result", "tool_use_id": "f1", "content": "ok"},
+        {"type": "text", "text": "D2"},
+        {"type": "text", "text": "I2"},
+    ]
+    assert not any(block.get("text") == "(continued)" for m in converted for block in m["content"])
 
 

@@ -1058,19 +1058,22 @@ def repair_tool_result_pairing_with_stats(
         for idx, call in enumerate(list(pending_order)):
             call_name = str(call.get("name") or "")
             call_has_id = bool(str(call.get("id") or ""))
-            if message.get("role") == "tool":
-                # [2026-05-07] role=tool 结果不能只按 name 配对到有 id 的调用。
-                # 原因：原生 provider 校验 tool_call_id；缺 id 的结果即使同名也会成为坏历史。
-                # 做法：只有 assistant 调用本身也没有 id 时才允许 name fallback。
-                # 目的：避免普通业务工具结果被误判为已配对。
-                if call_has_id:
-                    continue
+            # An explicit wrong ID must not match a different identified call by name.
+            # Legacy results without an ID can still recover their call by name.
+            if message.get("role") == "tool" and call_id and call_has_id:
+                continue
             if name and call_name == name:
                 pending_order.pop(idx)
                 cid = str(call.get("id") or "")
                 if cid:
                     pending_by_id.pop(cid, None)
                 return call
+        if message.get("role") == "tool" and not call_id and not name and pending_order:
+            call = pending_order.pop(0)
+            cid = str(call.get("id") or "")
+            if cid:
+                pending_by_id.pop(cid, None)
+            return call
         return None
 
     def _repair_paired_result_message(message: dict[str, Any], call: dict[str, Any]) -> dict[str, Any]:
@@ -1082,10 +1085,10 @@ def repair_tool_result_pairing_with_stats(
             # 原因：旧 JSONL 可能保存了 name 或 tool_call_id 不完整的 role=tool 行。
             # 做法：从刚匹配到的 assistant.tool_call 回填缺失值。
             # 目的：后续 provider 转换拿到完整的工具结果结构。
-            if call_id:
-                repaired.setdefault("tool_call_id", call_id)
-            if call_name:
-                repaired.setdefault("name", call_name)
+            if call_id and not str(repaired.get("tool_call_id") or "").strip():
+                repaired["tool_call_id"] = call_id
+            if call_name and not str(repaired.get("name") or "").strip():
+                repaired["name"] = call_name
             return repaired
 
         parsed = _parse_text_tool_result(message.get("content"))
