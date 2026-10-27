@@ -301,7 +301,7 @@ class ToolRegistry:
 
         self.reload()
 
-    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> Callable[[], None]:
+    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc, *, pure: bool = False) -> Callable[[], None]:
         """Register one builtin tool declared by a built-in plugin.
 
         Why: some built-in tools now live with their owning plugin instead of
@@ -327,6 +327,7 @@ class ToolRegistry:
             "name": clean_name,
             "description": str(description or ""),
             "input_schema": input_schema,
+            "pure": bool(pure),
         }
         self._tool_specs[clean_name] = spec
         self._tool_funcs[clean_name] = func
@@ -393,26 +394,26 @@ class ToolRegistry:
             ),
             (
                 "read_file",
-                "Read one or more files under workspace root. Supports text files (with optional line range), images (returned as multimodal), and binary files. Policy+approval guarded.",
+                "Read one or more files under workspace root. Supports text files (with optional line range; up to 500 lines / 64 KB per read, or 50-line head preview on >10 MB files when startLine is omitted), images (returned as multimodal), and binary files. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
                         "files": {
                             "type": "array",
-                            "description": "Array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive). MUST be an array even for single file.",
+                            "description": "Preferred: array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive).",
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "path": {"type": "string", "description": "File path relative to workspace root."},
-                                    "startLine": {"type": "integer", "description": "Start line (1-based, inclusive). Only for text files."},
+                                    "startLine": {"type": "integer", "description": "Start line (1-based, inclusive). Only for text files; also works on >10 MB files via bounded streaming."},
                                     "endLine": {"type": "integer", "description": "End line (1-based, inclusive). Only for text files."},
                                 },
                                 "required": ["path"],
                             },
                         },
-                        "path": {"type": "string", "description": "(Legacy single-file mode) File path relative to workspace root."},
-                        "start_line": {"type": "integer", "description": "(Legacy) Start line number."},
-                        "end_line": {"type": "integer", "description": "(Legacy) End line number."},
+                        "path": {"type": "string", "description": "(Deprecated alias, prefer files array) Single file path relative to workspace root."},
+                        "start_line": {"type": "integer", "description": "(Deprecated alias) Start line number."},
+                        "end_line": {"type": "integer", "description": "(Deprecated alias) End line number."},
                     },
                     "required": [],
                 },
@@ -472,12 +473,12 @@ class ToolRegistry:
             ),
             (
                 "execute_command",
-                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env).",
+                "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env; default timeout 90s; commands running >60s automatically upgrade to background async execution and deliver results via preempt).",
                 {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string"},
-                        "timeout_sec": {"type": "number"},
+                        "timeout_sec": {"type": "number", "description": "Timeout in seconds (default 90s)."},
                     },
                     "required": ["command"],
                 },
@@ -498,17 +499,17 @@ class ToolRegistry:
             ),
             (
                 "grep",
-                "Search file contents using pattern matching (like grep). Supports regex, glob filter, replace mode, and output_mode (content/files_only/count).",
+                "Search file contents using pattern matching (like grep). Supports regex, glob filter, replace mode, and output_mode (content/files_only/count). Search mode is case-insensitive; replace mode is case-sensitive.",
                 {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
                         "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
-                        "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
+                        "mode": {"type": "string", "description": "search (default, case-insensitive) or replace (case-sensitive)", "enum": ["search", "replace"]},
                         "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
                         "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},
                         "maxResults": {"type": "integer", "description": "max matches for search mode. Default 100"},
-                        "replace": {"type": "string", "description": "replacement string for replace mode. Supports $1 $2 capture groups"},
+                        "replace": {"type": "string", "description": "replacement string for replace mode. Supports $1/$2 or \\1/\\2 capture groups when isRegex=true"},
                         "maxFiles": {"type": "integer", "description": "max files to modify in replace mode. Default 50"},
                         "output_mode": {"type": "string", "description": "Output format: content (default, full match text), files_only (file paths only), count (match count per file)", "enum": ["content", "files_only", "count"]},
                     },
@@ -529,6 +530,8 @@ class ToolRegistry:
                         "input_schema": {"type": "object"},
                         "script": {"type": "string", "description": "Python script body. Has access to: args (dict from stdin), output(result), fail(error)."},
                         "timeout_sec": {"type": "number"},
+                        "pure": {"type": "boolean", "description": "Whether the tool is pure/side-effect-free (safe for parallel execution in the same turn). Default false."},
+                        "async_mode": {"type": "boolean", "description": "Whether the tool runs asynchronously in background and delivers results via preempt. Default false."},
                     },
                     "required": ["name", "script"],
                 },
@@ -542,7 +545,7 @@ class ToolRegistry:
             ),
             (
                 "request_restart",
-                "Request supervisor to restart engine/all (policy+approval guarded; includes git diff summary).",
+                "Request supervisor to restart engine/all (policy+approval guarded; creates a git checkpoint of tracked files and includes git diff summary).",
                 {
                     "type": "object",
                     "properties": {
@@ -569,13 +572,12 @@ class ToolRegistry:
                         "command": {"type": "string", "description": "shell command to run (required for script type). stdout must be a single-line JSON object with a 'text' field: {\"text\": \"message to inject\"}. Optional 'attachments' field for file paths. Empty stdout = silent skip (if silent=true) or prefix-only injection."},
                         "timeout": {"type": "integer", "description": "script timeout in seconds (default 30, script type only)"},
                         "silent": {"type": "boolean", "description": "if true, skip inbound when script stdout is empty (default true, script type only)"},
-                        "conversation_key": {"type": "string", "description": "conversation key (default: scheduler:{id})"},
+                        "conversation_key": {"type": "string", "description": "conversation key (defaults to current session's conversation_key; falls back to scheduler:{id} if none)"},
                         "entry_node_id": {"type": "string", "description": "optional entry node override for the injected inbound"},
-                        "workflow_id": {"type": "string", "description": "optional workflow override"},
                         "enabled": {"type": "boolean"},
                         "once": {"type": "boolean", "description": "if true, auto-delete after first trigger"},
                     },
-                    "required": ["id", "cron"],
+                    "required": ["id"],
                 },
                 _builtins.create_schedule,
             ),
@@ -598,18 +600,6 @@ class ToolRegistry:
                 _builtins.delete_schedule,
             ),
             (
-                "cancel_active_tasks",
-                "Cancel all active downstream tasks in the current session. "
-                "Use when the user's new message makes the previous task unnecessary.",
-                {"type": "object", "properties": {
-                    "node_id": {
-                        "type": "string",
-                        "description": "Optional. Cancel only the specified node's active tasks (e.g. scout, smith); omit to cancel all downstream tasks in the session.",
-                    },
-                }, "required": []},
-                _builtins.cancel_active_tasks,
-            ),
-            (
                 "get_context_window",
                 "Get current context window token usage for this session. "
                 "Returns actual LLM-reported tokens (if available), character-based estimates, "
@@ -620,12 +610,13 @@ class ToolRegistry:
             ),
         ]
 
+        _pure_builtins = {"list_dir", "read_file", "list_schedules", "get_context_window"}
         for name, desc, schema, func in builtins:
             # Why: built-in tools now have a public registration path shared by
             # registry-owned and plugin-owned tools. How: seed the central table
             # through register_builtin_tool(). Purpose: keep one code path for
             # validating and storing builtin specs.
-            self.register_builtin_tool(name, desc, schema, func)
+            self.register_builtin_tool(name, desc, schema, func, pure=(name in _pure_builtins))
 
         # [2026-09-06] Why: execute_command runs a second, internal guard
         # (op="execute_command", command-level approval) inside its body. The
@@ -659,7 +650,7 @@ class ToolRegistry:
 
         builtin_names = set(self._tool_specs.keys())
 
-        for py in self.tools_dir.glob("*.py"):
+        for py in sorted(self.tools_dir.glob("*.py")):
             if py.name == "__init__.py":
                 continue
 
@@ -690,6 +681,7 @@ class ToolRegistry:
                 "description": description,
                 "input_schema": input_schema,
                 "async_mode": bool(spec.get("async_mode", False)),
+                "pure": bool(spec.get("pure", False)),
             }
             result_format = spec.get("result_format")
             if isinstance(result_format, str) and result_format.strip():

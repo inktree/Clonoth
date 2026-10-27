@@ -279,7 +279,6 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
     # file-sourced nodes wholesale (override semantics); targets are recomputed
     # from the final set because an override may change delegate_targets.
     entries: dict[str, dict[str, Any]] = {}
-    _NON_SWITCHABLE_IDS = {"bootstrap.cmd_reviewer", "ereuna_slave1", "ereuna_summarizer", "ereuna_qa", "mini"}
     for nodes_dir in nodes_dirs:
         if not nodes_dir.is_dir():
             continue
@@ -290,7 +289,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             n = load_node(workspace_root, nid)
             if n is None or n.type != "ai" or n.id in entries:
                 continue
-            # Exclude system.* internal nodes, one-way nodes without switch_node capability, and non-dialogue worker nodes
+            # Exclude system nodes, one-way nodes and explicit switchable: false nodes.
             _ctl = getattr(n, "control_tools", "all")
             _can_switch_back = _ctl in (None, "all") or (isinstance(_ctl, (list, set, tuple)) and "switch_node" in _ctl)
             entries[n.id] = {
@@ -298,7 +297,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
                 "name": n.name,
                 "description": n.description or n.name,
                 "targets": set(n.delegate_targets),
-                "switchable": (not n.id.startswith("system.")) and (n.id not in _NON_SWITCHABLE_IDS) and _can_switch_back,
+                "switchable": (not n.id.startswith("system.")) and (n.extra.get("switchable", True) is not False) and _can_switch_back,
             }
     # 插件声明节点并入：同 id 覆盖文件来源（Paradox 语义）。
     for decl_entry in _plugin_nodes.iter_declared_nodes():
@@ -324,7 +323,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             "name": name,
             "description": str(data.get("description") or "").strip() or name,
             "targets": targets,
-            "switchable": (not nid.startswith("system.")) and (nid not in _NON_SWITCHABLE_IDS) and _decl_can_switch,
+            "switchable": (not nid.startswith("system.")) and (data.get("switchable", True) is not False) and _decl_can_switch,
         }
     all_nodes: list[dict[str, Any]] = [
         {"id": e["id"], "name": e["name"], "description": e["description"]}
@@ -397,14 +396,10 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # old all-strip behavior for callers that do not pass current_task_id. Purpose:
     # task-local history keeps locked user input while cross-task history stays
     # compact and safe against stale file:// attachment references.
-    msg_task_id = str(msg.source_task_id or "")
-    _stripped_imgs = 0
-    if isinstance(d["content"], list) and (not current_task_id or msg_task_id != current_task_id):
-        _stripped_imgs = sum(1 for p in d["content"] if isinstance(p, dict) and p.get("type") == "image_url")
-        d["content"] = _strip_images_from_content(d["content"])
+    # [2026-10-26] Disabled cross-task historical image stripping (_strip_images_from_content):
+    # stripping image_url parts from previous turns mutates the historical message prefix on the next turn
+    # and invalidates the entire Prefix KV Cache from that message onward.
     _meta = dict(msg.meta) if msg.meta else {}
-    if _stripped_imgs > 0:
-        _meta["_stripped_images_count"] = _stripped_imgs
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
@@ -538,10 +533,7 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
                         continue
                     content = m.get("content", "")
                     if isinstance(content, list):
-                        # Strip image_url parts from historical messages to avoid
-                        # re-encoding large base64 images on every turn.
-                        # Current turn's images are passed separately via attachments.
-                        entry: dict[str, Any] = {"role": str(m.get("role")), "content": _strip_images_from_content(content)}
+                        entry: dict[str, Any] = {"role": str(m.get("role")), "content": content}
                     else:
                         entry = {"role": str(m.get("role")), "content": str(content)}
                     # Preserve message_type for downstream keyword scan filtering
@@ -947,6 +939,9 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     _mrws = input_data.get("_memory_route_ws")
     if isinstance(_mrws, str) and _mrws:
         ctx["_memory_route_ws"] = _mrws
+    _do = input_data.get("_dispatch_origin")
+    if isinstance(_do, dict) and _do:
+        ctx["dispatch_origin"] = _do
     return ctx
 
 
@@ -1139,6 +1134,11 @@ async def _run_node_task(
         # when present — child sessions carry no provider_override.
         _override_sid = child_session_id or session_id
         session_provider_override = await _fetch_session_provider_override(http, sup_url, _override_sid)
+        _disp_orig = input_data.get("_dispatch_origin") or {}
+        if not session_provider_override and _disp_orig.get("context_mode") == "fork" and _disp_orig.get("parent_session_id"):
+            session_provider_override = await _fetch_session_provider_override(
+                http, sup_url, str(_disp_orig["parent_session_id"]).strip()
+            )
         # [2026-06-07] Why: resolve_provider needs all provider sections from config.yaml
         # to look up the default model for a non-global provider (e.g. openai-responses).
         # How: load config.yaml and extract provider blocks (dicts with base_url/model/api_key).
@@ -1171,20 +1171,28 @@ async def _run_node_task(
         _po = _merge_provider_options(global_provider_options, node_provider_options)
         if isinstance(getattr(rp, "provider_options", None), dict) and rp.provider_options:
             _po = _merge_provider_options(_po, rp.provider_options)
-        # Compute durable sticky session ID (avoiding transient branch_xxxx IDs)
+        # Compute durable sticky session ID (avoiding transient branch_xxxx and fresh child UUIDs)
         _ctx_mode_for_sticky = str(input_data.get("context_mode") or "").strip()
-        if child_session_id and (getattr(node, "persistent", False) or _ctx_mode_for_sticky == "accumulate"):
-            _base_parent_sid = parent_session_id or session_id
-            _ckey_sticky = str(input_data.get("_context_key") or "").strip()
-            _sticky_sid = (
-                f"{_base_parent_sid}:{node.id}:{_ckey_sticky}"
-                if not _base_parent_sid.startswith("branch_")
-                else child_session_id
-            )
+        if input_data.get("_system_task") or str(node.id).startswith("system."):
+            _sticky_sid = f"node:{node.id}"
+        elif child_session_id:
+            if getattr(node, "persistent", False) or _ctx_mode_for_sticky == "accumulate":
+                _base_parent_sid = parent_session_id or session_id
+                _ckey_sticky = str(input_data.get("_context_key") or "").strip()
+                _sticky_sid = (
+                    f"{_base_parent_sid}:{node.id}:{_ckey_sticky}"
+                    if not _base_parent_sid.startswith("branch_")
+                    else child_session_id
+                )
+            else:
+                _sticky_sid = f"node:{node.id}"
         else:
-            _sticky_sid = parent_session_id or child_session_id or session_id
+            _sticky_sid = parent_session_id or session_id
+        if _disp_orig.get("context_mode") == "fork" and (_disp_orig.get("parent_sticky_session_id") or _disp_orig.get("parent_session_id")):
+            _sticky_sid = str(_disp_orig.get("parent_sticky_session_id") or _disp_orig.get("parent_session_id") or _sticky_sid).strip()
         rctx.sticky_session_id = _sticky_sid
         _po["_sticky_session_id"] = _sticky_sid
+        _current_sticky_sid_var.set(_sticky_sid)
         # [AutoC 2026-06-01] Why: runtime.yaml now supports provider-wide options, but
         # node YAML must remain the most specific layer. How: read
         # providers.<provider_type>.options and merge it with node.provider_options.

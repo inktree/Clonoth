@@ -1159,6 +1159,24 @@ def repair_tool_result_pairing_with_stats(
         # which handles trailing orphans automatically.
         _reset_pending()
 
+    # One shared repair boundary for all providers: retain 1:1 pairing and
+    # present each contiguous result block in its assistant's declared ID order.
+    index = 0
+    while index < len(result):
+        assistant = result[index]
+        if assistant.get("role") != "assistant" or not assistant.get("tool_calls"):
+            index += 1
+            continue
+        order = {str(call.get("id") or ""): pos for pos, call in enumerate(assistant["tool_calls"])}
+        end = index + 1
+        while end < len(result) and result[end].get("role") == "tool":
+            end += 1
+        result[index + 1:end] = sorted(
+            result[index + 1:end],
+            key=lambda message: order.get(str(message.get("tool_call_id") or ""), len(order)),
+        )
+        index = end
+
     return result, stats
 
 

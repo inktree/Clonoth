@@ -58,6 +58,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},
                 {"pattern": "data/schedules.yaml", "decision": "approval_required", "reason": "schedule changes require approval"},
+                {"pattern": "data/mcp_clients.yaml", "decision": "approval_required", "reason": "MCP client changes require approval"},
                 {"pattern": "engine/**", "decision": "approval_required", "reason": "engine source changes require approval"},
                 {"pattern": "supervisor/**", "decision": "approval_required", "reason": "supervisor source changes require approval"},
                 {"pattern": "toolbox/**", "decision": "approval_required", "reason": "toolbox source changes require approval"},
@@ -113,6 +114,10 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"name": "list_memories", "decision": "auto", "reason": "只读记忆列表"},
                 {"name": "list_skills", "decision": "auto", "reason": "只读技能列表"},
                 {"name": "create_or_update_skill", "decision": "auto", "reason": "内部 write_file 审批 skills/**"},
+                {"name": "list_mcp_clients", "decision": "auto", "reason": "只读 MCP 客户端列表"},
+                {"name": "create_or_update_mcp_client", "decision": "auto", "reason": "内部 write_file 审批 data/mcp_clients.yaml"},
+                {"name": "delete_mcp_client", "decision": "auto", "reason": "内部 write_file 审批 data/mcp_clients.yaml"},
+                {"name": "create_agent", "decision": "auto", "reason": "内部 write_file 审批 config/nodes/**"},
             ],
         },
     }

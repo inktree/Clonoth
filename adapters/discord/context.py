@@ -199,8 +199,8 @@ def _build_context_text(
         history_entries = q[:-1]
     else:
         history_entries = list(q)
-    # [2026-05-14 refactor note] The high watermark still lives in
-    # SessionState; runtime ownership only changes where the object is stored.
+    # Discord commits this snapshot after reply delivery, not inbound acceptance:
+    # parallel branches must still see messages whose replies are in flight.
     wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
     history_entries = [e for e in history_entries if e.get("seq", -1) > wm]
     # 排除 Bot 自己的消息，避免群聊上下文中出现 Bot 回复

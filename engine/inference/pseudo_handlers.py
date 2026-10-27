@@ -1,11 +1,14 @@
 """伪工具运行时处理。
 
-从 ai_step.py 抽出。处理静态伪工具和 dispatch:{target_id} 动态伪工具的执行逻辑。
+从 ai_step.py 抽出。处理静态伪工具、dispatch_to 与向后兼容别名伪工具的执行逻辑。
 """
 from __future__ import annotations
 
+import copy
 import json
 import mimetypes as _mimetypes
+import re as _re
+import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,30 +16,20 @@ from typing import Any
 from .resume_builder import _select_attachments
 from ..compact_flow import prepare_compaction
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
-from .loop_state import _LoopState, _persist_ctx, _short
-# 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
-# MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
+from .loop_state import _LoopState, _short
 from .tool_format import ParsedToolCall
 from .pseudo_tools import _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
 
 
-# ---------------------------------------------------------------------------
-#  [2026-04-22] 辅助函数：将 workspace-relative 路径列表转换为 attachment dict 列表。
-#  [2026-05-04] 现在只服务 dispatch:{target_id} 动态伪工具。
-#  为什么：旧聚合委派工具已删除，但动态委派仍需把父节点文件传给子节点。
-#  怎么做：保留路径到 attachment dict 的转换函数，删除旧分支调用。
-#  目的：让动态 dispatch 的附件行为保持不变。
-# ---------------------------------------------------------------------------
+def _persist_ctx(ls: _LoopState, step: int) -> str:
+    from .ai_step import _persist_ctx as persist
+    return persist(ls, step)
+
 
 def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
-    """Convert file paths to attachment dicts for dispatch.
-
-    Accepts workspace-relative and absolute paths.  Stores the path as-is;
-    the serving endpoint (/v1/sessions/{id}/file) enforces access control
-    based on the session's workspace directory.
-    """
+    """Convert file paths to attachment dicts for dispatch."""
     result = []
     for p in paths:
         p_str = str(p).strip()
@@ -67,13 +60,7 @@ def _emit_pseudo_tool_result(
     control_tool_status: str = "",
     meta_patch: dict[str, Any] | None = None,
 ) -> None:
-    """统一写入伪工具的 tool_result，确保 native 模式下 tool_use/tool_result 配对完整。
-
-    [2026-05-07] 正常 finish 也通过本函数写普通工具结果。
-    原因：finish 现在是完整落盘的真实 API 工具，不能再被改写为普通 assistant 文本。
-    做法：默认 persist=True 且不设置 control 标记；只有未交付的拦截类结果才使用 control 参数。
-    目的：保留 provider 配对，同时让长期历史保存 assistant.tool_call + tool_result。
-    """
+    """统一写入伪工具的 tool_result，确保 native 模式下 tool_use/tool_result 配对完整。"""
     from .ai_step import _shadow_write
     _parsed = ParsedToolCall(
         id=getattr(pseudo_call, "id", "") or "",
@@ -82,10 +69,6 @@ def _emit_pseudo_tool_result(
     )
     tool_msg = ls.formatter.format_tool_result(_parsed, content)
     if control_tool_name:
-        # [2026-05-07] 控制流工具结果必须保留运行期配对字段，但不能成为长期历史。
-        # 原因：finish 是真实 provider tool_use，需要 ACK；同时 fake-native/json 结果默认没有 call_id，旧清洗只能按全局兜底处理。
-        # 做法：给控制 ACK 标记 _ephemeral，并补齐 tool_call_id/name，供当轮内存配对和清洗函数精确识别。
-        # 目的：满足 provider 配对要求，同时避免 finish 结果进入 ConversationStore、快照、压缩和摘要。
         tool_msg["_ephemeral"] = True
         if _parsed.id:
             tool_msg.setdefault("tool_call_id", _parsed.id)
@@ -97,12 +80,6 @@ def _emit_pseudo_tool_result(
         control_tool_status=control_tool_status,
     ))
     if meta_patch:
-        # [AutoC 2026-06-17] Why: terminal pseudo tools can carry final delivery
-        # metadata such as selected attachments and request ids, but the stored
-        # assistant tool_call row is written before the pseudo handler knows the
-        # final attachment list. How: attach durable presentation metadata to the
-        # paired tool_result row. Purpose: refreshed web history can restore the
-        # same final attachments and request ownership as realtime outbound events.
         tool_msg.setdefault("_meta", {}).update(meta_patch)
     ls.messages.append(tool_msg)
     if persist:
@@ -120,9 +97,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # intermediate_reply: 非终止，发送中间消息
     if pseudo_call.name == "intermediate_reply":
         reply_text = str(args.get("text") or "").strip()
-        # 解析附件
-        # [AutoC 2026-09-13] 兼容 attachments 别名：模型有时会漏写 schema 里的
-        # attachment_paths 而写成 attachments，旧逻辑会把附件静默丢弃（工具仍返回 ok）。
         _reply_att_paths = args.get("attachment_paths") or args.get("attachments") or []
         _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root) if _reply_att_paths else []
         if reply_text or _reply_atts:
@@ -134,8 +108,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             if _reply_atts:
                 _reply_payload["attachments"] = _reply_atts
             await ls.rctx.emit_event("intermediate_reply", _reply_payload)
-        # [fix 2026-10-21] 即使 reply_text 为空也必须写入 tool_result，
-        # 否则 native 模式下 assistant.functionCall 数量大于 functionResponse 数量会导致 400 锁死。
         _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         return None
 
@@ -143,39 +115,30 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if pseudo_call.name == "compact_context":
         return await _handle_pseudo_compact(ls, pseudo_call, step)
 
-    # preempt_task: 非终止，软打断子任务
+    # manage_workers (with legacy aliases preempt_task and cancel_active_tasks)
+    if pseudo_call.name == "manage_workers":
+        return await _handle_manage_workers(ls, args, pseudo_call)
     if pseudo_call.name == "preempt_task":
         return await _handle_pseudo_preempt_task(ls, pseudo_call, args)
+    if pseudo_call.name == "cancel_active_tasks":
+        _cat_args = dict(args)
+        _cat_args["action"] = "cancel"
+        return await _handle_manage_workers(ls, _cat_args, pseudo_call)
 
-    # [AutoC 2026-09-12] spawn_worker: non-terminal anonymous delegation.
-    # Why: this tool has no target encoded in its name and must resolve the built-in
-    # template before dynamic dispatch-name parsing. How: normalize its arguments in
-    # a dedicated handler, then reuse the existing dispatch sender. Purpose: worker
-    # calls retain dispatch event, attachment, fork, and callback behavior.
+    # spawn_worker: non-terminal anonymous delegation
     if pseudo_call.name == "spawn_worker":
         return await _handle_spawn_worker(ls, args, pseudo_call)
 
-    # [AutoC 2026-09-12] manage_workers: non-terminal child-agent control.
-    # Why: it is injected only after active-child discovery and must remain in the
-    # pseudo layer rather than ToolRegistry. How: route all action variants through
-    # one handler. Purpose: list, message, and cancel share session-scoped validation.
-    if pseudo_call.name == "manage_workers":
-        return await _handle_manage_workers(ls, args, pseudo_call)
+    # dispatch_to: unified dynamic delegation tool
+    if pseudo_call.name == "dispatch_to":
+        return await _handle_pseudo_dispatch(ls, args, pseudo_call)
 
-    # [2026-05-04] dispatch:{target_id}: 非终止，固定目标异步委派。
-    # Why: dynamic per-target tools remove the target parameter from the schema.
-    # How: extract target_id from the tool name and pass it to the shared dispatch
-    # sender. Purpose: keep supervisor API behavior identical while making target
-    # selection happen at tool registration time.
+    # Legacy dispatch_to_{target_id} compatibility
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
         return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target}, pseudo_call)
 
     # ---- 终止型伪工具：finish / ask / switch_node ----
-
-    # [AutoC 2026-08-06] hybrid 模式下 finish 仍然正常执行（不拒绝）。
-    # 虽然 hybrid 模式不注入 finish 工具定义，但过渡期模型可能从历史中
-    # 学到 finish 模式。直接让它走正常 finish 路径，避免拒绝循环。
     if pseudo_call.name in ("finish", "ask"):
         terminal_name = str(pseudo_call.name or "").strip()
         result_text = str(args.get("text") or "").strip()
@@ -189,10 +152,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 f'in text and call {terminal_name} again.'
             )
             _emit_pseudo_tool_result(ls, pseudo_call, _reject_text)
-            # [AutoC 2026-07-27] Why: _emit_pseudo_tool_result only writes to ls.messages
-            # and JSONL; the live frontend never sees the rejection, leaving the tool card
-            # spinning forever. How: emit tool_call_end so the reducer can close the card.
-            # Purpose: live rendering matches history reconstruction for rejected finish.
             await ls.rctx.emit_event("tool_call_end", {
                 "tool_call_id": _call_id,
                 "tool_name": terminal_name,
@@ -206,11 +165,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             })
             return None
 
-        # [AutoC 2026-06-10] Why: output_rejected needs to resume the entry node
-        # with a formatter-paired result for the exact finish call. How: persist
-        # terminal pseudo-tool call_id in the task runtime tool_call_log only after
-        # the terminal call is valid. Purpose: supervisor can carry the latest real
-        # _finish_tool_call_id back in resume_data.
         ls.rctx.tool_call_log.append({
             "name": terminal_name,
             "call_id": _call_id,
@@ -220,7 +174,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         final_atts = []
         if terminal_name == "finish":
-            # [AutoC 2026-09-13] 同 intermediate_reply，兼容 attachments 别名写法。
             _selected_paths = args.get("attachment_paths") or args.get("attachments")
             if isinstance(_selected_paths, list) and _selected_paths:
                 final_atts = _select_attachments(
@@ -229,11 +182,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                     session_id=ls.rctx.session_id,
                 )
 
-        # [2026-06-10] Emit tool_call_start so the frontend can split a new card
-        # (allToolsTerminal triggers card break). Do NOT emit tool_call_end here:
-        # finish is async — the task may be handed to a caller chain that asks
-        # back. outbound_message (emitted by runner after TaskAction) is the real
-        # completion signal; the frontend closes the message there.
         _tool_start_payload: dict[str, Any] = {
             "tool_call_id": _call_id,
             "tool_name": terminal_name,
@@ -242,11 +190,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             "task_id": ls.rctx.task_id,
         }
         if final_atts:
-            # [AutoC 2026-06-17] Why: live web rendering may receive the terminal
-            # tool start before the later outbound_message, and older supervisors may
-            # not mirror finish attachments on outbound. How: include the resolved
-            # attachment metadata on the control tool event as well. Purpose: the
-            # reducer can recover final finish attachments from the owning tool card.
             _tool_start_payload["attachments"] = list(final_atts)
         await ls.rctx.emit_event("tool_call_start", _tool_start_payload)
         _tool_meta_patch: dict[str, Any] = {
@@ -285,11 +228,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
-        # [Fork/Merge 2026-05-17] Why: switch_node changes the entry node for
-        # future inbound messages, which are keyed by the parent conversation
-        # session, not the temporary branch runtime session. How: prefer
-        # rctx.parent_session_id for the supervisor endpoint. Purpose: node
-        # switching remains effective after the current branch is merged/cleaned.
         route_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
         try:
             await ls.rctx.http.post(
@@ -325,10 +263,6 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
     except (AttributeError, TypeError, ValueError):
         pass
 
-    # [2026-06-06] Why: compact_context should no longer own prompt filtering or
-    # dispatch payload construction. How: compute only the durable target session
-    # from runtime metadata and delegate planning to engine.compact_flow. Purpose:
-    # the pseudo tool stays a thin wrapper around the shared compact planner.
     target_session_id = str(
         getattr(ls.rctx, "child_session_id", "")
         or getattr(ls.rctx, "parent_session_id", "")
@@ -355,7 +289,6 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
                 "original_chars": original_chars,
             })
         if plan.status == "dispatch":
-            # Dispatch 路径：写 tool_result 后退出循环
             _emit_pseudo_tool_result(ls, pseudo_call, "compacting...")
             ctx_ref = _persist_ctx(ls, step)
             return TaskAction(
@@ -380,33 +313,24 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
     return None
 
 
-# [2026-05-28] 判断字符串是否像 UUID 或 hex 前缀（task_id 支持前缀匹配）。
-# 为什么：preempt_task 新增 node_id 支持，需要区分传入值是 task_id 还是 node_id。
-# 怎么判断：全 hex+连字符且长度≥8 视为 task_id/前缀，否则视为 node_id。
-import re as _re
 _UUID_FULL_PATTERN = _re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$', _re.I)
+
 
 def _looks_like_task_id(s: str) -> bool:
     """Return True if s looks like a UUID or hex prefix (for task_id prefix match)."""
     if _UUID_FULL_PATTERN.fullmatch(s):
         return True
-    # hex prefix: all hex chars (plus optional dashes), length >= 8
     return len(s) >= 8 and all(c in '0123456789abcdef-' for c in s.lower())
 
 
 async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -> None:
-    """处理 preempt_task 伪工具。始终返回 None（非终止）。"""
-    _pt_tid = str(args.get("task_id") or "").strip()
+    """处理旧 preempt_task 别名调用。始终返回 None（非终止）。"""
+    _pt_tid = str(args.get("task_id") or args.get("target") or args.get("node_id") or "").strip()
     _pt_msg = str(args.get("message") or "").strip()
     if _pt_tid:
         try:
-            # [2026-05-28] 支持按 node_id 查找活跃任务再 preempt。
-            # 为什么：调用方通常只知道子节点名（如 "bob"），不知道动态 task_id。
-            # 怎么改：如果传入值不像 UUID/hex 前缀，视为 node_id，先查出真实 task_id。
-            # 目的：简化 preempt 调用，无需事先查询 task_id。
             real_task_id = _pt_tid
             if not _looks_like_task_id(_pt_tid):
-                # 当作 node_id 处理，查询当前 session 中该节点的活跃任务
                 _route_sid = ls.rctx.parent_session_id or ls.rctx.session_id
                 _node_resp = await ls.rctx.http.get(
                     f"{ls.rctx.supervisor_url}/v1/sessions/{_route_sid}/tasks/by-node/{_pt_tid}",
@@ -415,11 +339,6 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
                     _node_data = _node_resp.json()
                     real_task_id = _node_data.get("task_id", "")
                 elif _node_resp.status_code == 404:
-                    # [2026-05-28] fallback 到全局 by-node 查找。
-                    # 为什么：持久节点的任务运行在独立 session 上，
-                    #   session 内查找找不到。
-                    # 怎么改：404 时 fallback 到 /v1/tasks/active-by-node/{node_id}。
-                    # 目的：跨 session 支持 preempt 持久节点任务。
                     _global_resp = await ls.rctx.http.get(
                         f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{_pt_tid}",
                     )
@@ -435,8 +354,6 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
                     _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
                     return None
 
-            # [2026-05-23] Pass message to supervisor so preempt can inject
-            # additional instructions instead of just stopping the child.
             _pt_body: dict[str, Any] = {}
             if _pt_msg:
                 _pt_body["message"] = _pt_msg
@@ -463,18 +380,9 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
 
 
 async def _handle_spawn_worker(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """Create an anonymous ephemeral sub-agent through shared dispatch handling.
-
-    The built-in ``_worker`` node is used unless the caller selects another node as
-    the model/tool template. Both accepted modes create isolated child conversation
-    keys; fork additionally asks Supervisor to inherit the parent session context.
-    """
+    """Create an anonymous ephemeral sub-agent through shared dispatch handling."""
     instr = str(args.get("instruction") or "").strip()
     if not instr:
-        # [AutoC 2026-09-12] Reject empty work before dispatch. Why: an empty child
-        # task wastes an engine slot and cannot produce a useful callback. How: emit
-        # a normal paired pseudo-tool result. Purpose: the parent model can correct
-        # the call without creating a child session.
         _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
             "success": False,
             "error": "instruction is required",
@@ -489,11 +397,6 @@ async def _handle_spawn_worker(ls: _LoopState, args: dict, pseudo_call) -> None:
     raw_attachment_paths = args.get("attachment_paths") or []
     attachment_paths = raw_attachment_paths if isinstance(raw_attachment_paths, list) else []
 
-    # [AutoC 2026-09-12] Reuse dispatch instead of creating a second child-session
-    # transport. Why: dispatch already handles attachments, fork metadata, events,
-    # callback origin, and unique fresh/fork conversation keys. How: resolve target
-    # and normalized context fields, then delegate to the shared handler. Purpose:
-    # spawn_worker stays non-terminal and receives normal child-result callbacks.
     dispatch_args = {
         "target": template,
         "instruction": instr,
@@ -504,7 +407,7 @@ async def _handle_spawn_worker(ls: _LoopState, args: dict, pseudo_call) -> None:
 
 
 def _resolve_active_child_task_id(tasks: list[dict[str, Any]], requested: str) -> tuple[str, str]:
-    """Resolve a full or unique-prefix task id within the active child set."""
+    """Resolve a full/unique-prefix task id OR node_id within the active child set."""
     needle = str(requested or "").strip()
     if not needle:
         return "", "task_id is required"
@@ -516,9 +419,51 @@ def _resolve_active_child_task_id(tasks: list[dict[str, Any]], requested: str) -
     matches = list(dict.fromkeys(task_id for task_id in matches if task_id))
     if len(matches) == 1:
         return matches[0], ""
-    if not matches:
-        return "", f"active child task not found: {needle}"
-    return "", f"ambiguous task_id prefix: {needle}"
+    if len(matches) > 1:
+        return "", f"ambiguous task_id prefix: {needle}"
+    # Try matching by node_id inside the active child task set
+    node_matches = [
+        str(task.get("task_id") or "").strip()
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("node_id") or "").strip() == needle
+    ]
+    node_matches = list(dict.fromkeys(task_id for task_id in node_matches if task_id))
+    if len(node_matches) == 1:
+        return node_matches[0], ""
+    if len(node_matches) > 1:
+        return node_matches[-1], ""
+    return "", f"active child task not found: {needle}"
+
+
+async def _resolve_child_target_with_fallback(
+    ls: _LoopState,
+    tasks: list[dict[str, Any]],
+    requested: str,
+) -> tuple[str, str]:
+    """Resolve target via active child list first, then fallback to supervisor by-node lookup."""
+    needle = str(requested or "").strip()
+    if not needle:
+        return "", "target is required"
+    task_id, err = _resolve_active_child_task_id(tasks, needle)
+    if task_id or err.startswith("ambiguous"):
+        return task_id, err
+    # Fallback to supervisor by-node endpoints when needle looks like a node_id
+    if not _looks_like_task_id(needle) and hasattr(ls, "rctx") and hasattr(ls.rctx, "http"):
+        get_fn = getattr(ls.rctx.http, "get", None)
+        if callable(get_fn):
+            route_sid = getattr(ls.rctx, "parent_session_id", "") or getattr(ls.rctx, "session_id", "")
+            node_resp = await get_fn(f"{ls.rctx.supervisor_url}/v1/sessions/{route_sid}/tasks/by-node/{needle}")
+            if node_resp.status_code == 200:
+                tid = str((node_resp.json() or {}).get("task_id") or "").strip()
+                if tid:
+                    return tid, ""
+            elif node_resp.status_code == 404:
+                glob_resp = await get_fn(f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{needle}")
+                if glob_resp.status_code == 200:
+                    tid = str((glob_resp.json() or {}).get("task_id") or "").strip()
+                    if tid:
+                        return tid, ""
+    return "", err
 
 
 def _task_elapsed_seconds(created_at: Any) -> int | None:
@@ -536,7 +481,7 @@ def _task_elapsed_seconds(created_at: Any) -> int | None:
 
 
 async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """List, message, or cancel active child agents in the routed session."""
+    """List, message, gracefully preempt, or cancel active child agents in the routed session."""
     action = str(args.get("action") or "").strip()
     route_session_id = str(
         getattr(ls.rctx, "parent_session_id", "")
@@ -545,10 +490,6 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
     ).strip()
 
     async def _active_tasks() -> list[dict[str, Any]]:
-        # [AutoC 2026-09-12] Reuse the exact discovery view used for dynamic tool
-        # injection. Why: management must not message or cancel unrelated user-entry
-        # tasks. How: delegate to RunContext's normalized child query. Purpose: tool
-        # visibility, list results, and mutation authorization use one task set.
         discover = getattr(ls.rctx, "list_active_child_tasks", None)
         if not callable(discover):
             return []
@@ -577,29 +518,38 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
         _emit_pseudo_tool_result(ls, pseudo_call, result)
         return None
 
-    if action == "message":
-        requested_task_id = str(args.get("task_id") or "").strip()
+    if action in ("message", "preempt"):
+        requested_target = str(args.get("target") or args.get("task_id") or args.get("node_id") or "").strip()
         message = str(args.get("message") or "").strip()
-        if not requested_task_id or not message:
+        if action == "message" and (not requested_target or not message):
             _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
                 "success": False,
                 "error": "task_id and message are required for 'message' action",
             }, ensure_ascii=False))
             return None
+        if action == "preempt" and not requested_target:
+            _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+                "success": False,
+                "error": "target (or task_id/node_id) is required for 'preempt' action",
+            }, ensure_ascii=False))
+            return None
         try:
-            task_id, resolution_error = _resolve_active_child_task_id(await _active_tasks(), requested_task_id)
+            task_id, resolution_error = await _resolve_child_target_with_fallback(ls, await _active_tasks(), requested_target)
             if resolution_error:
                 result = json.dumps({"success": False, "error": resolution_error}, ensure_ascii=False)
             else:
+                body = {"message": message} if message else None
+                post_kwargs: dict[str, Any] = {"timeout": 10.0}
+                if body is not None:
+                    post_kwargs["json"] = body
                 response = await ls.rctx.http.post(
                     f"{ls.rctx.supervisor_url}/v1/tasks/{task_id}/preempt",
-                    json={"message": message},
-                    timeout=10.0,
+                    **post_kwargs,
                 )
                 if response.status_code == 200:
                     result = json.dumps({
                         "success": True,
-                        "message": f"Instruction injected to {task_id[:12]}",
+                        "message": f"Instruction injected to {task_id[:12]}" if message else f"Graceful preempt requested for {task_id[:12]}",
                     }, ensure_ascii=False)
                 else:
                     result = json.dumps({
@@ -612,27 +562,49 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
         return None
 
     if action == "cancel":
-        requested_task_id = str(args.get("task_id") or "").strip()
+        requested_target = str(args.get("target") or args.get("task_id") or "").strip()
+        explicit_node_id = str(args.get("node_id") or "").strip()
         try:
-            if requested_task_id:
-                task_id, resolution_error = _resolve_active_child_task_id(await _active_tasks(), requested_task_id)
-                if resolution_error:
-                    _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
-                        "success": False,
-                        "error": resolution_error,
-                    }, ensure_ascii=False))
-                    return None
+            if explicit_node_id and not requested_target:
+                params = {
+                    "exclude_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+                    "node_id": explicit_node_id,
+                }
                 response = await ls.rctx.http.post(
-                    f"{ls.rctx.supervisor_url}/v1/tasks/{task_id}/cancel",
+                    f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
+                    params=params,
                     timeout=10.0,
                 )
-                cancelled = task_id[:12]
+                cancelled = f"node:{explicit_node_id}"
+            elif requested_target:
+                tasks = await _active_tasks()
+                task_id, resolution_error = await _resolve_child_target_with_fallback(ls, tasks, requested_target)
+                if resolution_error:
+                    # If target is a node_id and no active tasks matched locally, allow session-level cancel by node_id
+                    if not _looks_like_task_id(requested_target) and not tasks:
+                        params = {
+                            "exclude_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+                            "node_id": requested_target,
+                        }
+                        response = await ls.rctx.http.post(
+                            f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
+                            params=params,
+                            timeout=10.0,
+                        )
+                        cancelled = f"node:{requested_target}"
+                    else:
+                        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+                            "success": False,
+                            "error": resolution_error,
+                        }, ensure_ascii=False))
+                        return None
+                else:
+                    response = await ls.rctx.http.post(
+                        f"{ls.rctx.supervisor_url}/v1/tasks/{task_id}/cancel",
+                        timeout=10.0,
+                    )
+                    cancelled = task_id[:12]
             else:
-                # [AutoC 2026-09-12] Preserve the caller during cancel-all.
-                # Why: the session endpoint can see the current entry task alongside
-                # its children. How: pass exclude_task_id, matching the existing
-                # cancel_active_tasks builtin. Purpose: manage_workers cancels child
-                # agents without terminating itself before reporting the result.
                 response = await ls.rctx.http.post(
                     f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
                     params={"exclude_task_id": str(getattr(ls.rctx, "task_id", "") or "")},
@@ -653,31 +625,52 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
 
     _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
         "success": False,
-        "error": f"Unknown action: {action}. Use 'list', 'message', or 'cancel'.",
+        "error": f"Unknown action: {action}. Use 'list', 'message', 'preempt', or 'cancel'.",
     }, ensure_ascii=False))
     return None
 
 
-async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
+def _extract_cache_warm_fork_prefix(ls: _LoopState) -> list[dict[str, Any]]:
+    """Extract the exact prefix of ls.messages that was sent to the LLM in the current step.
 
-    [2026-05-28] 所有异步 dispatch 统一走 inbound 路径。
-    为什么：让异步子节点复用现有的 session / entry-branch / conversation 机制，
-    而不是用单独的 dispatch-async 端点。
-    怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
-    目的：统一生命周期管理，为 persistent node 支持铺路。
+    Strips any trailing tool results emitted earlier in the current step and the
+    current step's assistant tool_call message, plus any _ephemeral messages.
     """
+    raw_msgs = ls.messages
+    if not raw_msgs:
+        return []
+    end = len(raw_msgs)
+    while end > 0 and raw_msgs[end - 1].get("role") == "tool":
+        end -= 1
+    if end > 0 and raw_msgs[end - 1].get("role") == "assistant" and raw_msgs[end - 1].get("tool_calls"):
+        end -= 1
+    prefix = [copy.deepcopy(m) for m in raw_msgs[:end] if not m.get("_ephemeral")]
+    from .llm_call import _build_messages_for_provider
+    return _build_messages_for_provider(prefix, None, None)
+
+
+async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
+    """处理 dispatch_to / spawn_worker / dispatch_to_{target_id} 动态伪工具。始终返回 None（非终止）。"""
     target = str(args.get("target") or "").strip()
-    # [2026-09-13] _worker 从插件声明迁移为 config/nodes 物理文件：首次使用前
-    # 确保默认文件已落盘，之后设置页可直接编辑 provider/model。spawn_worker
-    # 也走本函数（它委托到此处），同一挂点覆盖两条路径。
+    if not target:
+        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+            "success": False,
+            "error": "target is required",
+        }, ensure_ascii=False))
+        return None
+
     if target == "_worker":
-        try:
-            from engine.builtin.agent_manage import ensure_worker_node_yaml
-            ensure_worker_node_yaml(ls.rctx.workspace_root)
-        except Exception:
-            pass
+        from engine.builtin.agent_manage import ensure_worker_node_yaml
+        ensure_worker_node_yaml(ls.rctx.workspace_root)
+
     instr = str(args.get("instruction") or "").strip()
+    if not instr:
+        _emit_pseudo_tool_result(ls, pseudo_call, json.dumps({
+            "success": False,
+            "error": "instruction is required",
+        }, ensure_ascii=False))
+        return None
+
     _raw_ctx_mode = args.get("context_mode")
     if _raw_ctx_mode is not None:
         ctx_mode = str(_raw_ctx_mode).strip()
@@ -687,49 +680,72 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     attachment_paths = args.get("attachment_paths") or []
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
 
-    # [AutoC 2026-06-06] Why: persistent nodes (like Smith, Scout) are designed
-    # to accumulate context across tasks, but callers can accidentally pass
-    # context_mode="fresh" which creates a new session every time, causing
-    # session proliferation. How: load the target node config and force
-    # accumulate mode when the node declares persistent=true. Purpose: enforce
-    # the node author's persistence intention regardless of caller behavior.
-    if ctx_mode != "accumulate":
+    is_ephemeral_worker = (pseudo_call.name == "spawn_worker" or target == "_worker")
+
+    # Only default persistent nodes to accumulate when NOT an ephemeral worker (spawn_worker)
+    # and when the caller did not explicitly request fresh/fork (or when persistent node defaults apply).
+    if not is_ephemeral_worker and ctx_mode != "accumulate" and _raw_ctx_mode is None:
         from ..node import load_node as _load_node
         _target_node = _load_node(Path(ls.rctx.workspace_root), target)
         if _target_node is not None and getattr(_target_node, "persistent", False):
-            import logging as _lg
-            _lg.getLogger(__name__).info(
-                "dispatch to persistent node %r: overriding context_mode %r -> accumulate",
-                target, ctx_mode,
-            )
             ctx_mode = "accumulate"
 
-    # 获取父 session 信息
     parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
-    # [2026-05-29 方案C第一步] 为什么：conversation_key 同时承担存储身份和
-    # 路由可见性时，嵌套 dispatch 会生成多层 agent: 前缀，EventRouter 只能反解析
-    # 字符串来找父频道。怎么改：优先读取 task_context.route_conversation_key，
-    # 没有时才使用当前 task 的原 conversation_key。目的：所有嵌套子任务都保留
-    # 根父频道的原始 conversation_key，后续 SDK 可直接按结构化字段路由。
+    task_ctx = getattr(ls.rctx, "task_context", None) or {}
     parent_conv_key = str(
-        ls.rctx.task_context.get("route_conversation_key")
-        or ls.rctx.task_context.get("conversation_key")
+        task_ctx.get("route_conversation_key")
+        or task_ctx.get("conversation_key")
         or ""
     ).strip()
-    parent_channel = ls.rctx.task_context.get("channel", "internal")
+    parent_channel = task_ctx.get("channel", "internal")
     target_node_id = target
 
-    # 生成 conversation_key
-    if ctx_mode in ("fresh", "fork"):
-        import uuid as _uuid
+    if ctx_mode in ("fresh", "fork") or is_ephemeral_worker:
         conv_key = f"agent:{target_node_id}:{parent_conv_key}:{_uuid.uuid4()}"
     else:  # accumulate
         if ctx_key:
             conv_key = f"agent:{target_node_id}:{ctx_key}:{parent_conv_key}"
         else:
             conv_key = f"agent:{target_node_id}:{parent_conv_key}"
+        _seen_conv = getattr(ls, "_step_dispatch_conv_keys", None)
+        if _seen_conv is None:
+            _seen_conv = {}
+            setattr(ls, "_step_dispatch_conv_keys", _seen_conv)
+        _step_tag = f"{getattr(ls.rctx, 'current_llm_request_id', '')}:{conv_key}"
+        _cnt = _seen_conv.get(_step_tag, 0) + 1
+        _seen_conv[_step_tag] = _cnt
+        if _cnt > 1:
+            conv_key = f"{conv_key}:par{_cnt}"
 
-    # 构造 inbound payload
+    dispatch_origin: dict[str, Any] = {
+        "parent_session_id": parent_session_id,
+        "caller_node_id": ls.node.id,
+        "origin_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+        "parent_conversation_key": parent_conv_key,
+        "context_mode": ctx_mode,
+    }
+
+    # Cache-Warm Fork: when spawning a fork worker (or fork dispatch), persist the parent's
+    # exact cache-warmed prefix (system prompt + static blocks + history + tools + sticky_session_id)
+    # so the child worker hits 100% of the parent session's upstream KV cache!
+    if ctx_mode == "fork" and is_ephemeral_worker and target == "_worker":
+        parent_sticky_sid = str(getattr(ls.rctx, "sticky_session_id", "") or parent_session_id or "").strip()
+        if parent_sticky_sid:
+            dispatch_origin["parent_sticky_session_id"] = parent_sticky_sid
+        prefix_msgs = _extract_cache_warm_fork_prefix(ls)
+        if prefix_msgs:
+            snap_dir = Path(ls.rctx.workspace_root) / "data" / "temp" / "fork_snapshots"
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            snap_name = f"fork_{_uuid.uuid4().hex}.json"
+            snap_path = snap_dir / snap_name
+            snap_payload = {
+                "messages": prefix_msgs,
+                "openai_tools": copy.deepcopy(getattr(ls, "openai_tools", None) or []),
+                "sticky_session_id": parent_sticky_sid,
+            }
+            snap_path.write_text(json.dumps(snap_payload, ensure_ascii=False), encoding="utf-8")
+            dispatch_origin["fork_snapshot_path"] = f"data/temp/fork_snapshots/{snap_name}"
+
     inbound_payload: dict[str, Any] = {
         "channel": parent_channel,
         "conversation_key": conv_key,
@@ -737,29 +753,12 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "entry_node_id": target_node_id,
         "use_context": True,
         "attachments": attachments or [],
-        "dispatch_origin": {
-            "parent_session_id": parent_session_id,
-            "caller_node_id": ls.node.id,
-            # [2026-09-13] origin_task_id：派发发生时的父 task id。supervisor 回调
-            # 路由据此做三级承接查找（preempt 活跃父 task / 标记承接 fork），
-            # 详见 task_router._find_dispatch_callback_carrier_locked。
-            "origin_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
-            # [2026-05-29 方案C第一步] 为什么：审批和子进度事件只带子 session，
-            # 旧 SDK 只能从 agent: conversation_key 反解析父频道，容易误判或丢事件。
-            # 怎么改：把父频道的原始 conversation_key 与上下文模式随 dispatch_origin
-            # 一起下发。目的：task_created 事件可直接携带路由元数据，无需字符串猜测。
-            "parent_conversation_key": parent_conv_key,
-            "context_mode": ctx_mode,
-        },
+        "dispatch_origin": dispatch_origin,
         "dispatch_context_mode": ctx_mode,
     }
     if ctx_mode == "fork":
-        inbound_payload["dispatch_fork_from_session"] = parent_session_id
+        inbound_payload["dispatch_fork_from_session"] = getattr(ls.rctx, "session_id", "") or parent_session_id
 
-    # [2026-06-06] Why: dispatch pseudo-tools did not emit tool_call_start/end
-    # WebSocket events, so the frontend could not render ToolCallCards during
-    # streaming. How: emit the same event pair as real tools. Purpose: dispatch
-    # tool calls appear in the chat stream with name, args, and result.
     _call_id = getattr(pseudo_call, "id", "") or ""
     _call_args = dict(pseudo_call.arguments or {})
     await ls.rctx.emit_event("tool_call_start", {
@@ -777,11 +776,6 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         if _dispatch_resp.status_code == 200:
             _d_data = _dispatch_resp.json()
             _sid_short = str(_d_data.get("session_id", ""))[:8]
-            # [fix 2026-09-14] Why: 异步占位提示词在三条路径上不一致——异步工具
-            # 与自动转异步都会告知投递方式与行为指引，旧 dispatch 版只说
-            # “已委派”，模型不知道结果何时、以什么形态回来。How: 对齐另两条
-            # 路径的句式，写明 <dispatch_result> 投递渠道与“可继续其他工作”。
-            # Purpose: 三类异步占位语义一致，降低模型轮询/空等行为。
             _dispatch_result = json.dumps({
                 "success": True,
                 "session_id": _d_data.get("session_id", ""),

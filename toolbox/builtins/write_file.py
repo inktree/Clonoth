@@ -25,13 +25,16 @@ async def write_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         # expose data.result for readable history. How: wrap the policy error in
         # the unified ok/data/error shape while preserving cancellation metadata.
         # Purpose: keep failed writes understandable in model traces.
-        error_text = str(err.get("error", "denied")) if isinstance(err, dict) else str(err)
-        return {"ok": False, "error": error_text, "data": {"result": f"ERROR: {error_text}"}, "cancelled": bool(isinstance(err, dict) and err.get("cancelled"))}
+        error_text = str(err.get("error", "denied"))
+        return {"ok": False, "error": error_text, "data": {"result": f"ERROR: {error_text}"}, "cancelled": bool(err.get("cancelled"))}
 
     if not path.strip():
         return {"ok": False, "error": "empty path", "data": {"result": "ERROR: empty path"}}
 
-    p = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    try:
+        p = resolve_under_allowed_roots(ctx.workspace_root, path, workspace=ctx.workspace)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "data": {"result": f"ERROR: {exc}"}}
     if p.is_dir():
         return {"ok": False, "error": f"path is a directory: {path}", "data": {"result": f"ERROR: path is a directory: {path}"}}
     p.parent.mkdir(parents=True, exist_ok=True)

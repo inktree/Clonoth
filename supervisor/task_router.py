@@ -1596,10 +1596,8 @@ class TaskRouterMixin:
     def inject_async_result(self, session_id: str, text: str, attachments: list | None = None, source_task_id: str = "") -> dict[str, Any]:
         """注入异步工具结果到 session。
 
-        [AutoC 2026-07-05] 优先按 source_task_id 精确定位发起异步工具的 task：
-        - task_id 匹配且 running → preempt 该 task（无论 branch 还是主 session）
-        - 无 branch 模式下按 session 查找 running entry task → preempt
-        - 否则 → 创建 inbound（走 branch fork）
+        优先复用 dispatch 的三级承接查找（原任务、同源承接分支、无分支入口），
+        找到后追加 preempt；否则创建带源任务归属的 inbound，供后续结果复用。
         """
         with self._lock:
             session_info = self.sessions.get(session_id)
@@ -1608,14 +1606,8 @@ class TaskRouterMixin:
 
             result_atts = list(attachments or [])
 
-            # ---- 策略 1：按 task_id 精确查找（覆盖 branch 模式） ----
-            target_task: Task | None = None
-            if source_task_id:
-                t = self.tasks.get(source_task_id)
-                if t is not None and t.status == TaskStatus.running:
-                    target_task = t
-
-            # ---- 策略 2：无 branch 模式下按 session 查找 ----
+            # ---- 策略 1 & 2：三级承接查找（优先原 task 本身 running/pending，其次同源已唤醒的承接 branch task，最后无 branch 模式入口 task） ----
+            target_task: Task | None = self._find_dispatch_callback_carrier_locked(source_task_id, session_id)
             if target_task is None:
                 target_task = self._is_branchless_running_task_locked(session_id)
 
@@ -1648,6 +1640,8 @@ class TaskRouterMixin:
                 # 标签，与用户发言区分（与 dispatch 路径同构）。
                 "message_type": "async_tool_result",
             }
+            if source_task_id:
+                payload["_dispatch_owner_root_task_id"] = source_task_id
             if result_atts:
                 payload["attachments"] = [{"path": p} for p in result_atts]
 

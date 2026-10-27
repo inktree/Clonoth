@@ -301,13 +301,22 @@ class DiscordCallbacks:
             # replies read as plain messages while guild replies keep threading.
             reply_target = None if trigger.is_dm else msg
             try:
-                await _send_split_text(self.rt, ch, text or "", reply_to=reply_target, files=files or None)
+                sent = await _send_split_text(self.rt, ch, text or "", reply_to=reply_target, files=files or None)
             except Exception:
-                pass
-            if text:
-                _record_bot_reply(self.rt, channel_id, text)
+                logger.exception("send_reply failed ch=%s seq=%s", channel_id, trigger.inbound_seq)
+            else:
+                if sent:
+                    _record_bot_reply(
+                        self.rt, channel_id, text,
+                        msg_id=sent[0].id,
+                        context_watermark=pd.get("_context_watermark"),
+                    )
         if voice_segments:
-            await _send_discord_tts_segments(self.rt, ch, trigger.conversation_key, voice_segments)
+            voice_sent = await _send_discord_tts_segments(self.rt, ch, trigger.conversation_key, voice_segments)
+            if voice_sent:
+                _record_bot_reply(
+                    self.rt, channel_id, "", context_watermark=pd.get("_context_watermark"),
+                )
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)

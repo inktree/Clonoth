@@ -95,6 +95,10 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
         input_schema = {"type": "object", "properties": {}, "required": []}
 
     spec = {"name": name, "description": description, "input_schema": input_schema}
+    if "pure" in args:
+        spec["pure"] = bool(args["pure"])
+    if "enabled" in args:
+        spec["enabled"] = bool(args["enabled"])
     code = _render_tool_py(
         spec=spec,
         script_body=script.strip(),

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 _REJECT_MESSAGE_TEMPLATE = (
     "\u274c REJECTED: {tool}() cannot be called alongside other tools "
-    "(except reply). Execute your other tools first, wait for their "
+    "(except intermediate_reply). Execute your other tools first, wait for their "
     "results, then call {tool}() alone in a separate turn."
 )
 
@@ -60,7 +60,8 @@ class FinishGuardHandler:
         if pseudo_calls is not None or real_tool_calls is not None:
             pseudo_list = list(pseudo_calls or [])
             real_list = list(real_tool_calls or [])
-            total_calls = len(pseudo_list) + len(real_list)
+            unauth_count = int(ctx.extra.get("unauthorized_count") or 0)
+            total_calls = len(pseudo_list) + len(real_list) + unauth_count
             exclusive_name = next(
                 (_tool_name(call) for call in pseudo_list if _tool_name(call) in exclusive_tools),
                 "",
@@ -83,7 +84,7 @@ class FinishGuardHandler:
                 "",
             )
             has_terminal = bool(terminal_name)
-            has_non_reply_others = bool(real_list) or any(
+            has_non_reply_others = bool(real_list) or (unauth_count > 0) or any(
                 _tool_name(call) not in (*terminal_tools, *reply_tools) for call in pseudo_list
             )
         else:

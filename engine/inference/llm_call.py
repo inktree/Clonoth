@@ -134,32 +134,15 @@ def _build_messages_for_provider(
     formatter: Any,
     provider: Any,
 ) -> list[dict[str, Any]]:
-    """Build the message view that should be handed to the provider.
-
-    [2026-05-01] OpenAI Responses native tools need the L1 storage view: the
-    assistant message still has Clonoth's structured ``tool_calls`` field and
-    provider metadata.  FakeNativeToolFormatter would collapse that data into
-    user text, and true NativeToolFormatter would strip provider metadata.
-    Therefore the Responses provider bypasses L2 for both native and fake-native
-    modes, then performs its own final API conversion.  Other providers keep
-    the existing L2 formatter path.
-    """
-    # Defensive boundary for callers passing storage-shaped rows. Presentation
-    # history must never reach a model, including Responses/Gemini bypass paths.
+    """Build the message view that should be handed to the provider."""
     messages = [{k: v for k, v in message.items() if k != "response_info"} for message in messages]
+    non_dynamic = [message for message in messages if not message.get("_dynamic")]
+    prefill = non_dynamic[-1] if non_dynamic else None
+    if not (prefill and prefill.get("role") == "assistant" and not prefill.get("tool_calls")):
+        messages = non_dynamic + [message for message in messages if message.get("_dynamic")]
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
-    # [2026-05-01] Responses conversion needs storage-level tool_calls and _meta.
-    # Bypass both true native and fake-native L2; fake-native would text-collapse,
-    # while true native would strip provider metadata needed for raw_output replay.
-    # Gemini also needs _meta for raw_parts (thoughtSignature + functionCall round-trip)
     if provider_name in {"openai-responses", "gemini", "gemini-vertex", "gemini-aistudio"} and formatter_mode in {"native", "fake-native"}:
-        # Keep storage-level tool_calls/_meta for the provider, but match
-        # build_llm_messages by dropping ephemeral retry/control messages.
-        # [2026-05-07] 旁路 provider 也必须执行控制流历史清洗。
-        # 原因：Gemini/Responses 为保留 provider meta 绕过 L2，若不在这里清理会继续回放 finish。
-        # 做法：先用 L1 形态清洗 finish tool_call/tool_result，再保留 _meta 交给 provider。
-        # 目的：不破坏普通工具配对，同时防止控制流伪工具进入原生 provider 历史。
         return [dict(msg) for msg in sanitize_control_tool_history(messages) if not msg.get("_ephemeral")]
     return build_llm_messages(messages, formatter) if formatter else messages
 
@@ -200,14 +183,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
-    # [2026-10-19] Why: per-tool truncation bounds one result, but history still
-    # accumulates dozens of large tool outputs and every request resends them all,
-    # eventually overflowing the upstream request body (surfaces as
-    # MALFORMED_RESPONSE, often mislabelled as a safety filter by proxies).
-    # How: apply a shared budget across historical tool results, keeping the most
-    # recent ones intact and compressing older ones to a short head fragment.
-    # Purpose: keep every request bounded without deleting messages, so
-    # assistant.tool_calls / role=tool pairing stays valid.
     _formatted, _budget_stats = bound_tool_history(
         _formatted, total_budget=get_history_tool_budget(ls.runtime_cfg)
     )

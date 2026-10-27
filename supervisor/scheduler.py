@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -20,6 +22,7 @@ from typing import Any, TYPE_CHECKING
 import yaml
 
 from engine.context_store import cleanup_old_contexts
+from toolbox._common import safe_subprocess_env
 
 
 if TYPE_CHECKING:
@@ -124,6 +127,7 @@ class SchedulerThread:
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
         self._thread: threading.Thread | None = None
         self._running_scripts: set[str] = set()  # 防重入
+        self._scripts_lock = threading.Lock()
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -173,7 +177,12 @@ class SchedulerThread:
             stype = str(s.get("type") or "message").strip()
 
             if stype == "script":
-                self._fire_script(s, sid)
+                threading.Thread(
+                    target=self._fire_script,
+                    args=(dict(s), sid),
+                    daemon=True,
+                    name=f"sched-script-{sid}",
+                ).start()
             else:
                 self._fire_message(s, sid)
 
@@ -246,26 +255,50 @@ class SchedulerThread:
         if not command:
             log.error(f"[scheduler] script {sid}: missing 'command' field")
             return
-        if sid in self._running_scripts:
-            log.warning(f"[scheduler] script {sid}: still running, skipping")
-            return
-        self._running_scripts.add(sid)
+        with self._scripts_lock:
+            if sid in self._running_scripts:
+                log.warning(f"[scheduler] script {sid}: still running, skipping")
+                return
+            self._running_scripts.add(sid)
+        proc: subprocess.Popen[str] | None = None
         try:
             timeout = int(s.get("timeout") or 30)
             silent = bool(s.get("silent", True))
             text_prefix = str(s.get("text") or "").strip()
             conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
             entry_node_id = str(s.get("entry_node_id") or "").strip()
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=timeout, cwd=str(self._workspace_root),
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(self._workspace_root),
+                env=safe_subprocess_env(),
+                start_new_session=True,
             )
-            if result.stderr and result.stderr.strip():
-                log.warning(f"[scheduler] script {sid} stderr: {result.stderr.strip()[:500]}")
-            if result.returncode != 0:
-                log.error(f"[scheduler] script {sid} exited with rc={result.returncode}")
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True, timeout=5,
+                    )
+                else:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        log.debug("[scheduler] script %s already exited", sid)
+                proc.communicate(timeout=3)
+                log.error(f"[scheduler] script {sid}: timed out after {timeout}s")
                 return
-            stdout = (result.stdout or "").strip()
+            if stderr_raw and stderr_raw.strip():
+                log.warning(f"[scheduler] script {sid} stderr: {stderr_raw.strip()[:500]}")
+            if proc.returncode != 0:
+                log.error(f"[scheduler] script {sid} exited with rc={proc.returncode}")
+                return
+            stdout = (stdout_raw or "").strip()
             if not stdout:
                 if silent:
                     log.debug(f"[scheduler] script {sid}: empty stdout, silent skip")
@@ -288,12 +321,11 @@ class SchedulerThread:
                 body_text = text_prefix + "\n" + body_text
             attachments = data.get("attachments") or None
             self._inject_inbound(sid, body_text, conv_key, entry_node_id, attachments)
-        except subprocess.TimeoutExpired:
-            log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")
         except Exception as e:
             log.error(f"[scheduler] script {sid}: unexpected error: {e}")
         finally:
-            self._running_scripts.discard(sid)
+            with self._scripts_lock:
+                self._running_scripts.discard(sid)
 
     def _remove_schedule(self, sid: str) -> None:
         try:

@@ -41,7 +41,6 @@ description: Anonymous ephemeral child node invoked automatically by spawn_worke
 persistent: false
 control_tools:
   - finish
-  - ask
   - intermediate_reply
   - compact_context
   - manage_workers
@@ -100,12 +99,49 @@ def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     return {"ok": True, "data": {"result": result_text, **fields}}
 
 
-def _err(message: Any) -> dict[str, Any]:
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
     # [AutoC 2026-05-31] Why: create_agent validation failures should be readable
     # through data.result. How: wrap the error once. Purpose: avoid legacy plugin
     # error payloads during migration.
     text = str(message)
-    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
+def _append_delegate_target_preserving_format(raw_yaml: str, target_name: str) -> str | None:
+    """Insert ``- {target_name}`` under ``delegate_targets:`` without re-dumping the whole YAML."""
+    lines = raw_yaml.splitlines()
+    for idx, line in enumerate(lines):
+        m = re.match(r"^(\s*)delegate_targets\s*:\s*(\[\s*\])?\s*(#.*)?$", line)
+        if not m:
+            continue
+        indent = m.group(1)
+        is_empty_inline = bool(m.group(2))
+        comment = f" {m.group(3)}" if m.group(3) else ""
+        item_indent = indent + "  "
+        if is_empty_inline:
+            lines[idx] = f"{indent}delegate_targets:{comment}"
+            lines.insert(idx + 1, f"{item_indent}- {target_name}")
+            return "\n".join(lines) + ("\n" if raw_yaml.endswith("\n") else "")
+        # Find existing list items under delegate_targets:
+        insert_at = idx + 1
+        while insert_at < len(lines):
+            cur = lines[insert_at]
+            stripped = cur.strip()
+            if not stripped or stripped.startswith("#"):
+                insert_at += 1
+                continue
+            item_m = re.match(r"^(\s*)-\s+(\S+)", cur)
+            if item_m and len(item_m.group(1)) >= len(indent):
+                item_indent = item_m.group(1)
+                insert_at += 1
+                continue
+            break
+        lines.insert(insert_at, f"{item_indent}- {target_name}")
+        return "\n".join(lines) + ("\n" if raw_yaml.endswith("\n") else "")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +209,17 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if provider:
         tmpl_data["provider"] = provider
 
-    # Step 5: 写入新节点 yaml
+    # Step 5: 审批守卫 + 写入新节点 yaml
+    from toolbox._common import request_guard
+
+    _op, err = await request_guard(
+        ctx,
+        "write_file",
+        {"path": f"config/nodes/{name}.yaml", "tool_name": "create_agent", "template": template},
+    )
+    if err is not None:
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(
         yaml.safe_dump(tmpl_data, default_flow_style=False, allow_unicode=True),
@@ -187,18 +233,23 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         caller_path = workspace_root / "config" / "nodes" / f"{caller_node_id}.yaml"
         if caller_path.exists():
             try:
-                caller_data = yaml.safe_load(caller_path.read_text(encoding="utf-8"))
+                raw_caller_text = caller_path.read_text(encoding="utf-8")
+                caller_data = yaml.safe_load(raw_caller_text)
                 if isinstance(caller_data, dict):
                     targets = caller_data.get("delegate_targets", [])
                     if not isinstance(targets, list):
                         targets = []
                     if name not in targets:
-                        targets.append(name)
-                        caller_data["delegate_targets"] = targets
-                        caller_path.write_text(
-                            yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True),
-                            encoding="utf-8",
-                        )
+                        patched_text = _append_delegate_target_preserving_format(raw_caller_text, name)
+                        if patched_text is not None:
+                            caller_path.write_text(patched_text, encoding="utf-8")
+                        else:
+                            targets.append(name)
+                            caller_data["delegate_targets"] = targets
+                            caller_path.write_text(
+                                yaml.safe_dump(caller_data, default_flow_style=False, allow_unicode=True),
+                                encoding="utf-8",
+                            )
                         caller_updated = True
             except Exception:
                 pass  # 非致命：节点已创建但调用者更新失败

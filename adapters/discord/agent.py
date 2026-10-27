@@ -446,6 +446,7 @@ async def _handle_agent_inner(
             old_trigger.platform_data["cancel_view"] = cancel_view
             old_trigger.platform_data["last_typing_time"] = time.time()
             old_trigger.platform_data["_discord_input_modality"] = input_modality
+            old_trigger.platform_data["_context_watermark"] = new_wm
         elif preempted_src_seq:
             new_trigger = TriggerInfo(
                 inbound_seq=preempted_src_seq,
@@ -457,6 +458,7 @@ async def _handle_agent_inner(
                     "status_msg": status_msg, "cancel_view": cancel_view,
                     "last_typing_time": time.time(),
                     "_discord_input_modality": input_modality,
+                    "_context_watermark": new_wm,
                 },
             )
             rt.session_state.register_trigger(new_trigger)
@@ -519,8 +521,8 @@ async def _handle_agent_inner(
                 )
         except Exception:
             pass
-    if my_inbound_seq:
-        rt.session_state.register_watermark(my_inbound_seq, channel_id, new_wm)
+    # Acceptance is not delivery: concurrent branches still need unanswered
+    # channel messages. Commit this snapshot only after a reply reaches Discord.
 
     cancel_view = CancelView(rt, session_id)
     if my_inbound_seq:
@@ -535,6 +537,7 @@ async def _handle_agent_inner(
                 "cancel_view": cancel_view,
                 "last_typing_time": time.time(),
                 "_discord_input_modality": input_modality,
+                "_context_watermark": new_wm,
             },
         )
         rt.session_state.register_trigger(trigger)

@@ -65,15 +65,15 @@ def _find_and_replace(
     replace: str,
     start_line: int | None,
     raw_start_line: int | None = None,
-) -> tuple[str, str | None, list[int] | None]:
+) -> tuple[str, str | None, list[int] | None, int | None]:
     """Apply a single search/replace on *content*.
 
-    Returns (new_content, error_message | None, candidate_lines | None).
+    Returns (new_content, error_message | None, candidate_lines | None, matched_line | None).
     error_message is None on success.
     candidate_lines is populated when multiple matches exist without a valid start_line.
     """
     if not search:
-        return content, "Empty search string is not allowed.", None
+        return content, "Empty search string is not allowed.", None, None
 
     # 改进1 & 2: 先做全局计数，用于唯一匹配优先判断和候选行号收集
     count = content.count(search)
@@ -82,14 +82,16 @@ def _find_and_replace(
         # 改进1: 唯一匹配时忽略 start_line —— 即使 AI 给了过期的行号，
         # 只要 search 内容在文件中唯一，就直接替换，不因行号偏移而失败。
         if count == 1:
+            idx = content.find(search)
+            m_line = content[:idx].count("\n") + 1
             new_content = content.replace(search, replace, 1)
-            return new_content, None, None
+            return new_content, None, None, m_line
 
         if count == 0:
             return content, (
                 "No exact match found. "
                 "Please verify the content matches exactly."
-            ), None
+            ), None, None
 
         # count > 1: 多匹配场景，使用 start_line 定位
         lines = content.split("\n")
@@ -98,43 +100,47 @@ def _find_and_replace(
             return content, (
                 f"start_line {check_line} is out of range "
                 f"(file has {len(lines)} lines)."
-            ), None
+            ), None, None
 
         positions = _find_match_positions(content, search)
         # If raw_start_line (post-diff line number) matches an occurrence exactly,
         # while adjusted start_line does not, honor the exact match.
         chosen_idx: int | None = None
+        chosen_line: int | None = None
         if raw_start_line is not None and raw_start_line != start_line:
             for char_idx, m_line in positions:
                 if m_line == raw_start_line:
                     chosen_idx = char_idx
+                    chosen_line = m_line
                     break
         if chosen_idx is None:
             for char_idx, m_line in positions:
                 if m_line >= start_line:
                     chosen_idx = char_idx
+                    chosen_line = m_line
                     break
         if chosen_idx is None and raw_start_line is not None:
             for char_idx, m_line in positions:
                 if m_line >= raw_start_line:
                     chosen_idx = char_idx
+                    chosen_line = m_line
                     break
 
         if chosen_idx is None:
             return content, (
                 "No exact match found starting from line "
                 f"{check_line}. Please verify the content matches exactly."
-            ), None
+            ), None, None
 
         new_content = content[:chosen_idx] + replace + content[chosen_idx + len(search):]
-        return new_content, None, None
+        return new_content, None, None, chosen_line
 
     # Global search: require unique match.
     if count == 0:
         return content, (
             "No exact match found. "
             "Please verify the content matches exactly."
-        ), None
+        ), None, None
     if count > 1:
         # 改进2: 多匹配时返回候选行号，帮助 AI 快速定位正确位置
         candidate_lines = _find_match_lines(content, search)
@@ -142,10 +148,12 @@ def _find_and_replace(
             f"Multiple matches found ({count}). "
             "Please provide 'start_line' parameter to specify which match to use. "
             f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
-        ), candidate_lines
+        ), candidate_lines, None
 
+    idx = content.find(search)
+    m_line = content[:idx].count("\n") + 1
     new_content = content.replace(search, replace, 1)
-    return new_content, None, None
+    return new_content, None, None, m_line
 
 
 # ---------------------------------------------------------------------------
@@ -294,13 +302,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             shift = sum(delta for edit_line, delta in applied_shifts if edit_line < start_line)
             adjusted_start_line = max(1, start_line + shift)
 
-        # Find match line before replacement for shift tracking
-        match_line_before = start_line or 1
-        if search and search in content:
-            _first_idx = content.find(search)
-            match_line_before = content[:_first_idx].count('\n') + 1
-
-        new_content, error, candidate_lines = _find_and_replace(
+        new_content, error, candidate_lines, matched_line = _find_and_replace(
             content, search, replace, adjusted_start_line, raw_start_line=start_line,
         )
         if error is not None:
@@ -313,10 +315,10 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             # Don't update content — skip this diff and continue with next.
             continue
 
-        # 改进3: 计算本次 diff 的行数变化并记录其原始行位置
+        # 改进3: 计算本次 diff 的行数变化并记录其实际替换起始行位置
         old_line_count = search.count('\n') + 1
         new_line_count = replace.count('\n') + 1
-        applied_shifts.append((match_line_before, new_line_count - old_line_count))
+        applied_shifts.append((matched_line or start_line or 1, new_line_count - old_line_count))
 
         content = new_content
         applied_count += 1

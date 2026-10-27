@@ -22,7 +22,8 @@ from .._common import request_guard, resolve_under_allowed_roots
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"})
 _MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024      # 25 MB max image file size
 _MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024       # 10 MB threshold for oversized text files (Strategy A)
-_OVERSIZED_PREVIEW_LINES = 50                 # Head lines returned when text file > 10 MB
+_MAX_OVERSIZED_SCAN_CHARS = 50 * 1024 * 1024  # 50M chars max streaming skip scan for startLine on oversized files
+_OVERSIZED_PREVIEW_LINES = 50                 # Head lines returned when text file > 10 MB without explicit startLine/endLine
 _OVERSIZED_PREVIEW_CHARS = 8 * 1024           # 8 KB max chars for oversized file head preview
 _MAX_LINES_PER_READ = 500                     # Max lines returned in a single read_file call
 _MAX_OUTPUT_CHARS = 64 * 1024                 # 64 KB max total output chars per file
@@ -134,25 +135,28 @@ def _is_binary_prefix(sample: bytes) -> bool:
         return True
 
 
-def _read_bounded_line(f: Any) -> tuple[str | None, bool]:
+def _read_bounded_line(f: Any) -> tuple[str | None, bool, int]:
     """Read one line with bounded memory.
 
-    Returns ``(line_without_newline | None_if_eof, was_line_truncated)``.
+    Returns ``(line_without_newline | None_if_eof, was_line_truncated, raw_chars_read)``.
     Never holds more than ``_MAX_LINE_READ_CHARS`` in memory even on a 100MB single-line file.
     """
     chunk = f.readline(_MAX_LINE_READ_CHARS)
     if not chunk:
-        return None, False
+        return None, False, 0
+    chars_read = len(chunk)
     if chunk.endswith("\n") or chunk.endswith("\r"):
-        return chunk.rstrip("\r\n"), False
+        return chunk.rstrip("\r\n"), False, chars_read
     # Check if we hit EOF or if the line exceeds _MAX_LINE_READ_CHARS
     nxt = f.readline(65536)
     if not nxt:
-        return chunk.rstrip("\r\n"), False
+        return chunk.rstrip("\r\n"), False, chars_read
+    chars_read += len(nxt)
     kept = chunk[:_MAX_LINE_KEEP_CHARS] + " ... [line truncated]"
     while nxt and not (nxt.endswith("\n") or nxt.endswith("\r")):
         nxt = f.readline(65536)
-    return kept, True
+        chars_read += len(nxt)
+    return kept, True, chars_read
 
 
 def _read_single_file_sync(
@@ -215,14 +219,18 @@ def _read_single_file_sync(
     except Exception as exc:
         return {"path": path_str, "success": False, "error": str(exc)}, None
 
-    # ---- Strategy A: oversized text file (> 10 MB) -> head preview + hint ----
-    if file_size > _MAX_TEXT_FILE_BYTES:
+    start_val = start_line if isinstance(start_line, int) and start_line > 0 else 1
+    has_explicit_range = isinstance(start_line, int) or isinstance(end_line, int)
+    is_oversized = file_size > _MAX_TEXT_FILE_BYTES
+
+    # ---- Strategy A: oversized text file (> 10 MB) without explicit line range -> head preview + hint ----
+    if is_oversized and not has_explicit_range:
         preview_lines: list[str] = []
         total_chars = 0
         try:
             with p.open("r", encoding="utf-8", errors="replace") as f:
                 for _ in range(_OVERSIZED_PREVIEW_LINES):
-                    ln, _ = _read_bounded_line(f)
+                    ln, _, _ = _read_bounded_line(f)
                     if ln is None:
                         break
                     if preview_lines and total_chars + len(ln) > _OVERSIZED_PREVIEW_CHARS:
@@ -241,7 +249,8 @@ def _read_single_file_sync(
             f"File is too large ({mb_str} > {limit_mb} limit). "
             f"Only the first {shown} lines (up to {_OVERSIZED_PREVIEW_CHARS // 1024} KB) are shown as a head preview; "
             f"full-file loading is disabled to prevent memory exhaustion. "
-            f"Use execute_command with head/tail/sed/grep to inspect specific sections."
+            f"Use startLine/endLine (e.g. startLine={shown + 1}) to stream subsequent sections, "
+            f"or use execute_command with head/tail/sed/grep."
         )
         return {
             "path": path_str,
@@ -258,10 +267,7 @@ def _read_single_file_sync(
             "hint": hint,
         }, None
 
-    # ---- Normal text file (<= 10 MB): streaming bounded read ----
-    start_val = start_line if isinstance(start_line, int) and start_line > 0 else 1
-    has_explicit_range = isinstance(start_line, int) or isinstance(end_line, int)
-
+    # ---- Streaming bounded read (<= 10 MB, or > 10 MB with explicit startLine/endLine) ----
     if isinstance(end_line, int) and end_line >= start_val:
         requested_end = end_line
     else:
@@ -277,20 +283,47 @@ def _read_single_file_sync(
     accumulated_chars = 0
     char_cap_hit = False
     total_lines = 0
+    scanned_chars = 0
+    stopped_early_oversized = False
+    has_more_after_collect = False
 
     try:
-        with p.open("r", encoding="utf-8") as f:
+        with p.open("r", encoding="utf-8", errors="replace" if is_oversized else "strict") as f:
             while True:
-                ln, _ = _read_bounded_line(f)
+                ln, _, raw_chars = _read_bounded_line(f)
                 if ln is None:
                     break
                 total_lines += 1
-                if start_val <= total_lines <= collect_end and not char_cap_hit:
+                scanned_chars += raw_chars
+                if total_lines < start_val:
+                    if is_oversized and scanned_chars > _MAX_OVERSIZED_SCAN_CHARS:
+                        return {
+                            "path": path_str,
+                            "success": False,
+                            "error": (
+                                f"startLine {start_val} exceeds the {_MAX_OVERSIZED_SCAN_CHARS // (1024 * 1024)} MB "
+                                f"streaming scan limit on oversized file (reached line {total_lines}). "
+                                f"Use execute_command with sed/tail/grep for deep offsets in huge files."
+                            ),
+                        }, None
+                    continue
+                if total_lines <= collect_end and not char_cap_hit:
                     if sliced and accumulated_chars + len(ln) > _MAX_OUTPUT_CHARS:
                         char_cap_hit = True
                     else:
                         sliced.append(ln)
                         accumulated_chars += len(ln) + 1
+                # 对 > 10 MB 的大文件，一旦收集完 collect_end 或触发 char_cap_hit，仅多探测 1 行即刻退出，绝不空扫全文件尾部
+                if is_oversized and (total_lines >= collect_end or char_cap_hit):
+                    if char_cap_hit and total_lines > len(sliced) + start_val - 1:
+                        has_more_after_collect = True
+                    else:
+                        peek_ln, _, _ = _read_bounded_line(f)
+                        if peek_ln is not None:
+                            has_more_after_collect = True
+                            total_lines += 1
+                    stopped_early_oversized = True
+                    break
     except UnicodeDecodeError:
         return {"path": path_str, "success": True, "type": "binary", "size": file_size}, None
     except Exception as exc:
@@ -305,9 +338,12 @@ def _read_single_file_sync(
 
     s = start_val - 1
     e = s + len(sliced)
-    desired_final_end = min(requested_end, total_lines) if requested_end is not None else total_lines
-    line_cap_hit = (not char_cap_hit) and (e < desired_final_end)
-    _auto_truncated = line_cap_hit or char_cap_hit
+    if stopped_early_oversized:
+        line_cap_hit = (not char_cap_hit) and has_more_after_collect and (requested_end is None or e < requested_end)
+    else:
+        desired_final_end = min(requested_end, total_lines) if requested_end is not None else total_lines
+        line_cap_hit = (not char_cap_hit) and (e < desired_final_end)
+    _auto_truncated = line_cap_hit or char_cap_hit or (is_oversized and has_more_after_collect)
 
     width = max(4, len(str(max(1, e))))
     numbered = "\n".join([f"{i + s + 1:>{width}} | {ln}" for i, ln in enumerate(sliced)])
@@ -316,15 +352,26 @@ def _read_single_file_sync(
         "path": path_str, "success": True, "type": "text",
         "content": numbered, "lineCount": len(sliced),
     }
+    if is_oversized:
+        result["oversized"] = True
+        result["size"] = file_size
     if has_explicit_range:
-        result["totalLines"] = total_lines
+        if not stopped_early_oversized:
+            result["totalLines"] = total_lines
         result["startLine"] = s + 1
         result["endLine"] = e
     if _auto_truncated:
         result["truncated"] = True
-        result["totalLines"] = total_lines
+        if not stopped_early_oversized:
+            result["totalLines"] = total_lines
         result["shownLines"] = len(sliced)
-        if char_cap_hit:
+        if is_oversized and stopped_early_oversized:
+            mb_str = f"{file_size / (1024 * 1024):.1f} MB"
+            result["hint"] = (
+                f"Showing lines {s + 1}-{e} of oversized file ({mb_str}). "
+                f"Use startLine={e + 1} to continue streaming, or use execute_command with sed/tail/grep."
+            )
+        elif char_cap_hit:
             result["hint"] = (
                 f"Output reached {_MAX_OUTPUT_CHARS // 1024} KB character limit at line {e} "
                 f"(total {total_lines} lines). Use startLine/endLine to read subsequent lines."

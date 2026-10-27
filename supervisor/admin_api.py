@@ -358,8 +358,8 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     def all_tool_names() -> list[str]:
         from toolbox.builtins import RESERVED_TOOL_NAMES
         builtin = set(RESERVED_TOOL_NAMES)
-        # Also include tools registered but not in _RESERVED (like cancel_active_tasks)
-        extra_builtins = {'cancel_active_tasks'}
+        # Also include tools registered but not in _RESERVED
+        extra_builtins: set[str] = set()
         names = builtin | extra_builtins
         # Scan external tools
         tools_dir = workspace_root / "tools"

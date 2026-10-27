@@ -5,7 +5,6 @@ description: Anonymous ephemeral child node invoked automatically by spawn_worke
 persistent: false
 control_tools:
   - finish
-  - ask
   - intermediate_reply
   - compact_context
   - manage_workers

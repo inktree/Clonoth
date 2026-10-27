@@ -283,8 +283,16 @@ async def _send_split_text(
     return sent
 
 
-def _record_bot_reply(rt: Any, channel_id: int, text: str, *, msg_id: int | None = None) -> None:
-    """将 Bot 回复记入频道历史。"""
+def _record_bot_reply(
+    rt: Any, channel_id: int, text: str, *,
+    msg_id: int | None = None, context_watermark: int | None = None,
+) -> None:
+    """记录已落地回复；仅推进该回复携带的历史快照，不截断后续并发消息。"""
+    if context_watermark is not None:
+        watermarks = rt.session_state.last_ctx_seq
+        watermarks[channel_id] = max(watermarks.get(channel_id, -1), context_watermark)
+    if not text:
+        return
     ts = datetime.datetime.now(_CST).strftime("%H:%M")
     # [2026-05-14 refactor note] This mirrors context._push_history locally to
     # keep messaging.py independent from context.py, as required by the split.
@@ -548,8 +556,9 @@ async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation
     return _resolve_attachment_path(rt, attachment)
 
 
-async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: str, segments: list[dict[str, str]]) -> None:
-    """逐段合成并发送 Discord 语音附件。"""
+async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: str, segments: list[dict[str, str]]) -> bool:
+    """逐段合成并发送 Discord 语音附件，返回是否成功落地。"""
+    sent = False
     for index, segment in enumerate(segments, start=1):
         path: Path | None = None
         try:
@@ -557,10 +566,12 @@ async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: st
             if path is None or not path.exists():
                 continue
             await channel.send(file=discord.File(str(path), filename=path.name), suppress_embeds=True)
+            sent = True
         except Exception as exc:
             logger.warning("send Discord TTS audio failed: segment=%s error=%s", index, exc)
         finally:
             _delete_audio_file_quietly(rt, path)
+    return sent
 
 
 def prepare_discord_tts_reply(rt: Any, text: str, input_modality: str) -> tuple[str, list[dict[str, str]]]:

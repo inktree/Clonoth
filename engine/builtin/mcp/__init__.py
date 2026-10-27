@@ -44,9 +44,12 @@ def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
     return {"ok": True, "data": {"result": result_text, **fields}}
 
 
-def _err(message: Any) -> dict[str, Any]:
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
     text = str(message)
-    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,12 @@ def _err(message: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def create_or_update_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    from toolbox._common import request_guard
+
+    cid = str(args.get("id") or "").strip()
+    _op, err = await request_guard(ctx, "write_file", {"path": "data/mcp_clients.yaml", "mcp_client_id": cid})
+    if err is not None:
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
     try:
         spec = mcp_runtime.upsert_client(ctx.workspace_root, args)
     except Exception as e:
@@ -96,9 +105,14 @@ async def list_mcp_clients(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
 
 async def delete_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    from toolbox._common import request_guard
+
     client_id = str(args.get("id", "")).strip()
     if not client_id:
         return _err("empty client id")
+    _op, err = await request_guard(ctx, "write_file", {"path": "data/mcp_clients.yaml", "delete_mcp_client": client_id})
+    if err is not None:
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
     try:
         ok = mcp_runtime.delete_client(ctx.workspace_root, client_id)
         if not ok:
@@ -282,11 +296,22 @@ async def refresh_mcp_tools(registry: Any) -> int:
                 if not isinstance(schema, dict):
                     schema = {"type": "object", "properties": {}, "required": []}
                 _sanitize_schema_patterns(schema)
+                _mcp_pure = bool(
+                    (isinstance(tool.get("annotations"), dict) and tool["annotations"].get("readOnlyHint"))
+                    or any(k in raw_name.lower() for k in (
+                        "search", "query", "list", "get_", "fetch", "resolve",
+                        "current_time", "relative_time", "days_in_month",
+                        "get_timestamp", "convert_time", "get_week_year",
+                        "db_info", "build_prompt", "rea_search", "rea_schema",
+                        "jsr_list", "jsr_schema",
+                    ))
+                )
                 dispose = registry.register_builtin_tool(
                     reg_name,
                     f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
                     schema,
                     _make_mcp_tool(ws, cid, raw_name),
+                    pure=_mcp_pure,
                 )
                 _BRIDGE["disposers"].append(dispose)
                 hooks = _BRIDGE.get("hooks")
@@ -470,6 +495,7 @@ PLUGIN_META = {
         },
         {
             "name": "list_mcp_clients",
+            "pure": True,
             "description": "List configured MCP clients.",
             "input_schema": {"type": "object", "properties": {}, "required": []},
             "func": list_mcp_clients,

@@ -122,19 +122,19 @@ _ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
     "sillytavern": ("st", "sillytavern", "酒馆"),
     "claude_code": ("cc", "claude code", "claude-code", "claude官cc", "claude官 cc"),
     "novelai": ("nai", "novelai", "novel ai"),
-    "uau": ("uau", "uuau", "uau_outputtool"),
-    "toolcall": ("toolcall", "tool_call", "纯toolcall", "toolcall破限", "toolcall引导"),
+    "uau": ("uau", "uuau", "uau_outputtool", "uas"),
+    "toolcall": ("toolcall", "tool_call", "纯toolcall", "toolcall破限", "toolcall引导", "工具调用"),
 }
 
 _CORROBORATE_TERMS = (
-    "反代", "预设", "网关", "渠道", "代理", "破甲", "流式", "工具调用", "toolcall", "appcheck", "app check",
+    "反代", "预设", "网关", "渠道", "代理", "破甲", "流式", "appcheck", "app check",
 )
 
 
 def _ascii_boundary_pattern(term: str) -> str:
     esc = re.escape(term.lower())
-    if term.isascii() and len(term) <= 3:
-        return rf"(?<![a-z0-9]){esc}(?![a-z0-9])"
+    if re.fullmatch(r"[a-zA-Z0-9_]+", term):
+        return rf"(?<![a-z0-9_]){esc}(?![a-z0-9_])"
     return esc
 
 
@@ -239,7 +239,7 @@ def compile_keyword(kw: str) -> re.Pattern[str] | str:
     alias_group = _resolve_alias_group(kw)
     if alias_group:
         return _ALIAS_GROUP_PATTERNS[alias_group]
-    if kw.isascii() and len(kw) <= 3:
+    if re.fullmatch(r"[a-zA-Z0-9_]+", kw):
         return re.compile(_ascii_boundary_pattern(kw), re.IGNORECASE)
     return kw.lower()
 
@@ -264,6 +264,26 @@ def match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
     return False
 
 
+def _strip_discord_wrapper_for_scan(text: str) -> str:
+    """Strip Discord group-chat history block and role-badge parentheses before keyword scanning."""
+    if not text or "【当前用户指令】" not in text:
+        return text
+    out_parts: list[str] = []
+    q_match = re.search(r"【当前消息引用】\s*\n(.*?)(?=\n当前时间:|\n【当前用户指令】)", text, flags=re.S)
+    if q_match:
+        q_body = re.sub(r"^\[[^\]]+\]\s*[^\n:：]{1,80}(?:\([^)\n]*\))?\s*:\s*", "", q_match.group(1).strip())
+        if q_body:
+            out_parts.append(q_body)
+    m = re.search(r"【当前用户指令】\s*\n?", text)
+    if m:
+        cmd_part = text[m.end():]
+        cmd_part = re.sub(r"\n*请根据以上上下文，执行当前用户的指令并给出回复。\s*$", "", cmd_part)
+        # Keep speaker name (without role list) + actual command body
+        cmd_part = re.sub(r"^([^\n（(]{1,80})(?:（身份组:\s*[^）\n]*）|\([^)\n]*\))\s*:\s*", r"\1: ", cmd_part)
+        out_parts.append(cmd_part)
+    return "\n".join(out_parts) if out_parts else text
+
+
 def build_scan_text(
     instruction_text: str,
     history: list[dict[str, Any]] | None,
@@ -274,7 +294,7 @@ def build_scan_text(
     # include the current instruction and append the last scan_depth conversation
     # rounds using the legacy user-message boundary rule. Purpose: keep keyword
     # activation scope unchanged after the files are merged.
-    parts: list[str] = [instruction_text or ""]
+    parts: list[str] = [_strip_discord_wrapper_for_scan(instruction_text or "")]
     if history and scan_depth > 0:
         # Why: the old implementation defined a round as a user message that
         # starts after a non-user message. How: walk backward until enough round
@@ -302,7 +322,7 @@ def build_scan_text(
                     continue
                 content = msg.get("content")
                 if isinstance(content, str):
-                    parts.append(content)
+                    parts.append(_strip_discord_wrapper_for_scan(content))
     return "\n".join(parts)
 
 
@@ -1068,7 +1088,7 @@ def _matched_entry_concepts(
         if tag not in concepts and _ALIAS_GROUP_PATTERNS[group].search(head_text):
             concepts.add(tag)
     for term in active_corroborate:
-        if term in head_text:
+        if f"kw:{term}" not in concepts and term in head_text:
             concepts.add(f"term:{term}")
     if not has_primary_hit and len(concepts) < 2:
         return set()
@@ -1123,7 +1143,7 @@ def _classify_and_match_entries(
 
     # Multi-concept co-occurrence pruning for non-people memories:
     # When multi-concept matches (score >= 2) exist, drop score==1 entries whose single concept
-    # is shared by multiple entries (e.g. generic 'zoa' or '4a' fan-out) unless priority > 0.
+    # is shared by multiple entries (e.g. generic 'zoa' or '4a' fan-out).
     non_people_scores = [
         len(c) for e, c in pending_memory_hits if str(e.get("book") or "") != "people"
     ]
@@ -1144,10 +1164,9 @@ def _classify_and_match_entries(
             not is_people
             and max_non_people_score >= 2
             and len(concepts) == 1
-            and int(entry.get("priority") or 0) <= 0
         ):
             sole_tag = next(iter(concepts))
-            if sole_tag.startswith("group:") or concept_freq.get(sole_tag, 0) >= 2:
+            if sole_tag.startswith(("group:", "term:")) or concept_freq.get(sole_tag, 0) >= 2:
                 continue
         buckets["memory_active"].append(entry)
         matched_memories.append(entry)
@@ -1222,7 +1241,7 @@ def _build_skill_outline(entry: dict[str, Any], max_preview_chars: int = 800) ->
     preview = "\n".join(intro)[:preview_limit]
     return (
         f'[Large skill (共 {len(content)} 字符) — 已展示结构大纲与导言。需要具体章节时请调用 '
-        f'read_file("skills/{entry["id"]}/SKILL.md", start_line=..., limit=...)]\n'
+        f'read_file(files=[{{"path": "skills/{entry["id"]}/SKILL.md", "startLine": ..., "endLine": ...}}])]\n'
         f'Description: {entry.get("description") or ""}\nOutline:\n'
         + "\n".join(headings) + f"\nPreview:\n{preview}"
     )
@@ -1443,9 +1462,12 @@ def build_knowledge_context(
     _node_mem = load_memory_catalog(workspace_root, memory_book=_mb)
     if _node_mem:
         # Dedup by (book, id) — workspace entries take precedence
-        _seen = {(str(e.get("_book","")), str(e.get("id",""))) for e in mem_entries}
+        _seen = {
+            (str(e.get("book") or e.get("_book") or ""), str(e.get("id") or ""))
+            for e in mem_entries
+        }
         for e in _node_mem:
-            _key = (str(e.get("_book","")), str(e.get("id","")))
+            _key = (str(e.get("book") or e.get("_book") or ""), str(e.get("id") or ""))
             if _key not in _seen:
                 mem_entries.append(e)
     if not mem_entries:
@@ -1522,6 +1544,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     name = str(args.get("name", "")).strip()
     description = str(args.get("description", "")).strip()
     content = args.get("content")
+    has_explicit_enabled = "enabled" in args and args.get("enabled") is not None
     enabled = bool(args.get("enabled", True))
 
     strategy = str(args.get("strategy", "")).strip().lower() or None
@@ -1596,7 +1619,11 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
             meta["description"] = description
         elif not isinstance(meta.get("description"), str):
             meta["description"] = ""
-        meta["enabled"] = enabled
+        if has_explicit_enabled or "enabled" not in meta:
+            meta["enabled"] = enabled
+        else:
+            enabled = bool(meta.get("enabled", True))
+            meta["enabled"] = enabled
         if strategy:
             meta["strategy"] = strategy
         if visibility:
@@ -1619,6 +1646,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     res = await write_file({"path": path, "content": content}, ctx)
     if not res.get("ok"):
         return res
+    _SkillCache.invalidate(ctx.workspace_root)
     return _tool_ok(f"Skill written: {path}", path=path, name=name, enabled=enabled)
 
 
@@ -1718,6 +1746,7 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     shutil.rmtree(skill_dir)
+    _SkillCache.invalidate(ctx.workspace_root)
     return _tool_ok(f"Skill deleted: {name}", deleted=True, name=name)
 
 
@@ -1749,15 +1778,14 @@ def _load_book(path: Path) -> dict[str, Any]:
 
 
 def _save_book(path: Path, data: dict[str, Any]) -> None:
-    """Write a memory book yaml back to disk."""
-    # Why: save_memory and delete_memory still write YAML books directly. How:
-    # retain the old safe_dump format and parent creation. Purpose: keep files
-    # compatible with existing memory books.
+    """Write a memory book yaml back to disk atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(
         data, sort_keys=False, allow_unicode=True, default_flow_style=False,
     )
-    path.write_text(text, encoding="utf-8")
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 def _invalidate_cache(workspace_root: Path, *, memory_book: str = "") -> None:
@@ -1792,12 +1820,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     #   extra 由 Node.load_node 在加载 yaml 时一次性收集，通过 ai_step 传入。
     # 目的：插件层零 IO 拿到业务配置，引擎核心不知道具体字段的存在。
     _user_book = str(args.get("book") or "").strip()
-    if _user_book:
-        book = _user_book
-    else:
-        # 从 Node.extra dict 零 IO 读取 memory_book
-        _extra = getattr(ctx, "_node_extra", None) or {}
-        book = str(_extra.get("memory_book") or "").strip() or "default"
+    book = _user_book if _user_book else "default"
     if not _BOOK_NAME_RE.fullmatch(book):
         return _tool_err("invalid book name")
 
@@ -2016,18 +2039,24 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
     _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
     _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
-    book = str(args.get("book") or "default").strip()
+    _explicit_book = str(args.get("book") or "").strip()
+    book = _explicit_book or "default"
     # [AutoC 2026-08-31] 查找顺序与 save_memory 的默认落点（scope=workspace）
     # 对齐：当前 workspace 子目录优先，其次节点级，最后 root 兜底。How: 第一个
     # 包含目标 id 的书文件胜出；书文件存在但不含该 id 时继续向下找。Purpose:
     # 节点能删掉自己刚保存的 workspace 作用域记忆，无需显式传 scope。
     _ws_name = str(getattr(ctx, "workspace_name", "") or "").strip()
+    _book_names = [book]
+    # 向后兼容：旧版 save_memory 在未显式传 book 时曾以 _ns_memory_book 作为书名
+    if not _explicit_book and _ns_memory_book and _ns_memory_book not in _book_names:
+        _book_names.append(_ns_memory_book)
     candidates: list[tuple[Path, str]] = []
-    if _ws_name:
-        _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
-        candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{book}.yaml", _ws_ns))
-    candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml", _ns_memory_book))
-    candidates.append((memory_dir(ctx.workspace_root, "") / f"{book}.yaml", ""))
+    for _b in _book_names:
+        if _ws_name:
+            _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
+            candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{_b}.yaml", _ws_ns))
+        candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{_b}.yaml", _ns_memory_book))
+        candidates.append((memory_dir(ctx.workspace_root, "") / f"{_b}.yaml", ""))
 
     book_path: Path | None = None
     for _cand_path, _cand_ns in candidates:
@@ -2109,6 +2138,7 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "list_skills",
+        "pure": True,
         "description": "List local skills under skills/*/SKILL.md.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "func": list_skills,
@@ -2159,6 +2189,7 @@ PLUGIN_META["tools"] = [
     },
     {
         "name": "list_memories",
+        "pure": True,
         "description": "List memory entries (node-level and workspace-scoped), optionally filtered by book name. Each entry carries scope/workspace fields indicating where it is stored.",
         "input_schema": {
             "type": "object",

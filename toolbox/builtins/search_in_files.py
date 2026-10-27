@@ -156,6 +156,9 @@ def _search_result_text(matches: list[dict[str, Any]], truncated: bool) -> str:
         if m.get("context"):
             for cl in str(m["context"]).splitlines():
                 lines.append(f"  {cl}")
+    return "\n".join(lines)
+
+
 def _files_only_result_text(files: list[str], truncated: bool) -> str:
     lines = [f"{len(files)} files found{' (truncated)' if truncated else ''}:"]
     lines.extend(files)
@@ -381,10 +384,16 @@ async def _do_search(
 def _do_replace_sync(
     root: Path, regex: re.Pattern, replace_str: str,
     pattern: str, max_files: int, max_file_size: int, effective_workspace: Path,
+    is_regex: bool = False,
 ) -> dict[str, Any]:
     all_matches: list[dict[str, Any]] = []
     files_modified: list[str] = []
     files_processed = 0
+    # 兼容 $1/$2 捕获组语法（仅 is_regex=True 时转换未转义的 $1~$99 为 \g<N>；is_regex=False 时按字面量替换）
+    if is_regex:
+        _norm_repl = re.sub(r"(?<!\\)\$(\d+)", r"\\g<\1>", replace_str)
+    else:
+        _norm_repl = replace_str
 
     for p, rel in _collect_files(root, pattern, max_file_size, effective_workspace):
         try:
@@ -405,7 +414,10 @@ def _do_replace_sync(
         if not file_matches:
             continue
 
-        new_text = regex.sub(replace_str, text)
+        if is_regex:
+            new_text = regex.sub(_norm_repl, text)
+        else:
+            new_text = regex.sub(lambda _: _norm_repl, text)
         try:
             p.write_text(new_text, encoding="utf-8")
         except Exception:
@@ -446,6 +458,7 @@ def _do_replace_sync(
 async def _do_replace(
     root: Path, regex: re.Pattern, query: str, replace_str: str,
     pattern: str, max_files: int, max_file_size: int, ctx: ToolContext,
+    is_regex: bool = False,
 ) -> dict[str, Any]:
     # Approval guard — replace is a write operation
     _op, err = await request_guard(
@@ -457,7 +470,7 @@ async def _do_replace(
 
     return await asyncio.to_thread(
         _do_replace_sync,
-        root, regex, replace_str, pattern, max_files, max_file_size, ctx.effective_workspace,
+        root, regex, replace_str, pattern, max_files, max_file_size, ctx.effective_workspace, is_regex,
     )
 
 
@@ -518,7 +531,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     if mode == "replace":
         return await _do_replace(
-            root, regex, query, replace_str, pattern, max_files, max_file_size_bytes, ctx,
+            root, regex, query, replace_str, pattern, max_files, max_file_size_bytes, ctx, is_regex,
         )
     else:
         return await _do_search(

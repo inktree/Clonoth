@@ -38,41 +38,50 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if not _SCHEDULE_ID_RE.fullmatch(sid):
         return _err("invalid schedule id: only [A-Za-z_][A-Za-z0-9_-]{0,63} allowed")
 
-    cron_expr = str(args.get("cron") or "").strip()
+    schedules = load_schedules(ctx.workspace_root)
+    existing: dict[str, Any] | None = None
+    for s in schedules:
+        if str(s.get("id") or "").strip() == sid:
+            existing = dict(s)
+            break
+    prev = existing or {}
+
+    cron_expr = str(args.get("cron") if args.get("cron") is not None else prev.get("cron") or "").strip()
     if not cron_expr:
         return _err("empty cron expression")
     parts = cron_expr.split()
     if len(parts) != 5:
         return _err("cron must be 5 fields: minute hour day month weekday")
 
-    stype = str(args.get("type") or "message").strip()
+    stype = str(args.get("type") if args.get("type") is not None else prev.get("type") or "message").strip()
     if stype not in ("message", "script"):
         return _err(f"invalid type: {stype}, must be 'message' or 'script'")
 
-    text = str(args.get("text") or "").strip()
+    text = str(args.get("text") if args.get("text") is not None else prev.get("text") or "").strip()
     if stype == "message" and not text:
         return _err("empty text (required for message type)")
 
-    command = str(args.get("command") or "").strip()
+    command = str(args.get("command") if args.get("command") is not None else prev.get("command") or "").strip()
     if stype == "script" and not command:
         return _err("empty command (required for script type)")
 
-    conv_key = str(args.get("conversation_key") or "").strip()
+    conv_key = str(args.get("conversation_key") if args.get("conversation_key") is not None else prev.get("conversation_key") or "").strip()
     if not conv_key:
         # [2026-05-25] Auto-inherit from ToolContext (populated by supervisor
         # task_context → engine RunContext → ToolContext, zero I/O overhead).
         conv_key = str(getattr(ctx, "conversation_key", "") or "").strip()
     if not conv_key:
         conv_key = f"scheduler:{sid}"
-    entry_node_id = str(args.get("entry_node_id") or "").strip()
-    workflow_id = str(args.get("workflow_id") or "").strip()
-    enabled = bool(args.get("enabled", True))
-    once = bool(args.get("once", False))
+    entry_node_id = str(args.get("entry_node_id") if args.get("entry_node_id") is not None else prev.get("entry_node_id") or "").strip()
+    workflow_id = str(args.get("workflow_id") if args.get("workflow_id") is not None else prev.get("workflow_id") or "").strip()
+    enabled = bool(args.get("enabled") if args.get("enabled") is not None else prev.get("enabled", True))
+    once = bool(args.get("once") if args.get("once") is not None else prev.get("once", False))
 
     _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
     if err is not None:
         return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
+    # Reload after approval wait in case concurrent updates occurred
     schedules = load_schedules(ctx.workspace_root)
     entry: dict[str, Any] = {
         "id": sid,
@@ -84,9 +93,11 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if stype == "script":
         entry["type"] = "script"
         entry["command"] = command
-        timeout = int(args.get("timeout") or 30)
+        raw_timeout = args.get("timeout") if args.get("timeout") is not None else prev.get("timeout")
+        timeout = int(raw_timeout or 30)
         entry["timeout"] = max(5, min(timeout, 300))
-        entry["silent"] = bool(args.get("silent", True))
+        raw_silent = args.get("silent") if args.get("silent") is not None else prev.get("silent", True)
+        entry["silent"] = bool(raw_silent)
         if text:
             entry["text"] = text
     else:

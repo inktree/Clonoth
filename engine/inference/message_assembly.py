@@ -213,7 +213,16 @@ def assemble_messages_with_injections(
         if _already_in_history:
             messages.pop()
 
-        # --- dynamic (在 instruction 之前) ---
+        # --- instruction（固定历史前缀） ---
+        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
+        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
+        # 中已有的原 instruction 重复。
+        if attachments:
+            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
+        elif instruction:
+            messages.append({"role": "user", "content": instruction})
+
+        # --- dynamic (在 instruction 之后) ---
         _dynamic_parts_s: list[str] = []
         if len(system_prompt) >= 2 and system_prompt[1].get("content"):
             _dynamic_parts_s.append(system_prompt[1]["content"])
@@ -230,15 +239,6 @@ def assemble_messages_with_injections(
                 "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
                 "_dynamic": True,
             })
-
-        # --- instruction（始终在 dynamic 之后） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
 
     return messages, _is_block_mode
 
@@ -419,7 +419,16 @@ def assemble_initial_messages(
         if _already_in_history:
             messages.pop()
 
-        # --- dynamic (在 instruction 之前) ---
+        # --- instruction（固定历史前缀） ---
+        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
+        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
+        # 中已有的原 instruction 重复。
+        if attachments:
+            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
+        elif instruction:
+            messages.append({"role": "user", "content": instruction})
+
+        # --- dynamic (在 instruction 之后) ---
         _dynamic_parts_s: list[str] = []
         if len(system_prompt) >= 2 and system_prompt[1].get("content"):
             _dynamic_parts_s.append(system_prompt[1]["content"])
@@ -436,15 +445,6 @@ def assemble_initial_messages(
                 "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
                 "_dynamic": True,
             })
-
-        # --- instruction（始终在 dynamic 之后） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
 
     return messages, _is_block_mode, system_prompt
 
@@ -463,17 +463,21 @@ def rebuild_dynamic_context(
     workspace_name: str = "",
     task_context: dict[str, Any] | None = None,
 ) -> None:
-    """Rebuild the ``_dynamic`` message in an existing prompt, in place.
+    """Append incremental ``_dynamic`` context for a mid-task preempt without mutating prior messages.
 
-    Why: when a preempt message arrives mid-task, the per-turn dynamic context
-    must be refreshed for the new instruction. How: drop old ``_dynamic``
-    messages, render all dynamic-scope prompt sections (knowledge injection
-    included), and append one rebuilt dynamic message using the same prefix
-    rules as initial assembly. Purpose: callers such as the preempt handler no
-    longer import injection plugins directly or duplicate the block/string
-    branch logic.
+    Why: removing the initial ``_dynamic`` message from the middle of ``messages``
+    shifts every subsequent message index and invalidates the Prefix KV Cache built
+    during earlier steps of the same turn. How: keep existing ``_dynamic`` messages
+    in place, render dynamic sections for the new instruction, filter out sections
+    already present in earlier ``_dynamic`` messages of this turn, and only append
+    a new ``_dynamic`` message when genuinely new dynamic content (e.g. newly
+    activated skills/memories) appears.
     """
-    messages[:] = [m for m in messages if not m.get("_dynamic")]
+    existing_dynamic_texts = [
+        str(m.get("content") or "")
+        for m in messages
+        if m.get("_dynamic")
+    ]
     section_context = PromptSectionContext(
         workspace_root=workspace_root,
         node=node,
@@ -485,9 +489,15 @@ def rebuild_dynamic_context(
         workspace_name=workspace_name,
     )
     parts: list[str] = []
-    if not is_block_mode and len(system_prompt) >= 2 and system_prompt[1].get("content"):
+    if not existing_dynamic_texts and not is_block_mode and len(system_prompt) >= 2 and system_prompt[1].get("content"):
         parts.append(system_prompt[1]["content"])
-    parts.extend(prompt_section_registry.render_scope("dynamic", section_context))
+    rendered_parts = prompt_section_registry.render_scope("dynamic", section_context)
+    for part in rendered_parts:
+        if not part:
+            continue
+        if existing_dynamic_texts and any(part in prev for prev in existing_dynamic_texts):
+            continue
+        parts.append(part)
     if not parts:
         return
     prefix = (

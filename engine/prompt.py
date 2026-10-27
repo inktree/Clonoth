@@ -176,20 +176,21 @@ def assemble_prompt(
         pass
 
     merged = _build_variables(workspace_root, node, variables)
-    rendered = _render_variables(expanded, merged)
 
     # 拆分静态/动态段
     marker = "# %%DYNAMIC%%"
-    if marker in rendered:
-        idx = rendered.index(marker)
-        static_part = rendered[:idx].strip()
-        dynamic_part = rendered[idx + len(marker):].strip()
+    if marker in expanded:
+        raw_static, raw_dynamic = expanded.split(marker, 1)
+        static_variables = _build_variables(workspace_root, node, None)
+        static_variables.pop("now")
+        static_part = _render_variables(raw_static, static_variables).strip()
+        dynamic_part = _render_variables(raw_dynamic, merged).strip()
         msgs: list[dict[str, Any]] = []
         if static_part:
             msgs.append({"role": "system", "content": static_part})
         if dynamic_part:
             msgs.append({"role": "system", "content": dynamic_part})
-        return msgs if msgs else [{"role": "system", "content": rendered}]
+        return msgs if msgs else [{"role": "system", "content": ""}]
 
     # 没有标记，整体作为一条 system 消息
-    return [{"role": "system", "content": rendered}]
+    return [{"role": "system", "content": _render_variables(expanded, merged)}]

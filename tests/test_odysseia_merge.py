@@ -210,9 +210,11 @@ def test_switchability_uses_metadata_not_private_node_names(tmp_path):
 
 def test_bounded_line_reader_skips_long_tail_and_keeps_next_line():
     stream = StringIO("x" * (_MAX_LINE_READ_CHARS + 50) + "\nnext\n")
-    line, truncated = _read_bounded_line(stream)
+    line, truncated, chars_read = _read_bounded_line(stream)
     assert truncated and line.endswith("[line truncated]")
-    assert _read_bounded_line(stream) == ("next", False)
+    assert chars_read == _MAX_LINE_READ_CHARS + 51
+    assert _read_bounded_line(stream) == ("next", False, 5)
+    assert _read_bounded_line(stream) == (None, False, 0)
 
 
 def test_sdk_health_remains_constructible_without_new_workspace_field():
@@ -395,4 +397,70 @@ def test_discord_context_identity_and_key_roles():
     assert _format_identity(member_diff, key_roles=set(), is_admin=True) == "墨树[inktree] ✓ADMIN"
     assert _format_identity(member_diff, key_roles={"核心维护者"}) == "墨树[inktree](核心维护者)"
     assert _format_member_entry(member_same, "你好", reply_author="Sera", key_roles=set()) == "InkTree ↩ Sera: 你好"
+
+
+def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolation(tmp_path: Path):
+    from types import SimpleNamespace
+    from engine.inference.llm_call import _build_messages_for_provider
+    from engine.inference.message_assembly import assemble_messages_with_injections
+    from engine.inference.tool_format import create_tool_formatter
+    from engine.node import Node
+    from engine.prompt import assemble_prompt
+
+    node = Node(
+        id="ereuna_main",
+        name="Ereuna",
+        type="ai",
+        prompt="Static system {{os_name}} {{now}}\n# %%DYNAMIC%%\nDynamic turn {{now}} {{instruction}}",
+        tool_mode="native",
+    )
+    prompt_msgs = assemble_prompt(
+        tmp_path,
+        node,
+        variables={"now": "2026-10-27 12:00 UTC", "instruction": "hello # %%DYNAMIC%% world"},
+    )
+    assert len(prompt_msgs) == 2
+    assert "2026-10-27 12:00 UTC" not in prompt_msgs[0]["content"]
+    assert "2026-10-27 12:00 UTC" in prompt_msgs[1]["content"]
+    assert "hello # %%DYNAMIC%% world" in prompt_msgs[1]["content"]
+
+    # String mode: instruction comes before _dynamic, and multi-step tool calls stay before _dynamic in provider view
+    str_msgs, is_block = assemble_messages_with_injections(
+        system_prompt=prompt_msgs,
+        skill_static=[],
+        skill_dynamic=[],
+        memory_static=[],
+        memory_dynamic=[],
+        history=[{"role": "user", "content": "prev_q"}, {"role": "assistant", "content": "prev_a"}],
+        instruction="turn1_q",
+        workspace_root=tmp_path,
+    )
+    assert not is_block
+    assert [m["role"] for m in str_msgs] == ["system", "user", "assistant", "user", "user"]
+    assert str_msgs[3]["content"] == "turn1_q"
+    assert str_msgs[4].get("_dynamic") is True
+
+    # Simulate step 1 tool call appended after initial assembly
+    str_msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+    str_msgs.append({"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "file_body"})
+    formatter = create_tool_formatter("native")
+    provider = SimpleNamespace(name="gemini-vertex")
+    view = _build_messages_for_provider(str_msgs, formatter, provider)
+    # _dynamic is relocated to the very end so [system, prev_q, prev_a, turn1_q, assistant(c1), tool(c1)] indices never shift on Turn 2
+    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "assistant", "tool", "user"]
+    assert view[3]["content"] == "turn1_q"
+    assert view[5]["content"] == "file_body"
+    assert view[6].get("_dynamic") is True
+
+    # Block mode with trailing assistant prefill (UAU / UAS): _dynamic must NOT be moved after assistant prefill
+    block_msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "Below is this turn's dynamic context...", "_dynamic": True},
+        {"role": "user", "content": "turn1_q"},
+        {"role": "assistant", "content": "<!-- Start the ECoT -->"},
+    ]
+    block_view = _build_messages_for_provider(block_msgs, formatter, provider)
+    assert block_view[-1]["role"] == "assistant"
+    assert block_view[-1]["content"] == "<!-- Start the ECoT -->"
+
 
