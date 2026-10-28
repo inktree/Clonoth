@@ -38,8 +38,25 @@ def _ensure_web_frontend(workspace_root: Path, log_func) -> None:
         log_func("[web] 前端 dist 不存在，且未找到 npm。请执行：cd adapters/web/frontend && npm ci && npm run build")
         return
     if not node_modules.is_dir():
-        log_func("[web] 前端 dist 不存在。请执行：cd adapters/web/frontend && npm ci && npm run build")
-        return
+        log_func("[web] 前端 node_modules 不存在，开始自动执行 npm ci")
+        try:
+            ci_res = subprocess.run(
+                [npm, "ci"],
+                cwd=str(frontend_dir),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+                check=False,
+            )
+        except Exception as exc:
+            log_func(f"[web] 前端依赖安装失败：{exc}")
+            return
+        if ci_res.returncode != 0:
+            log_func(f"[web] 前端 npm ci 失败，退出码 {ci_res.returncode}")
+            return
 
     log_func("[web] 前端 dist 不存在，开始自动执行 npm run build")
     try:
