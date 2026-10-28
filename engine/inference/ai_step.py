@@ -516,6 +516,10 @@ def _is_pure_tool_call(name: str, args: dict[str, Any], spec: dict[str, Any] | N
     """判断单个真实工具调用是否无副作用（pure）或声明式后台（async_mode），可安全并发执行。"""
     if spec and (spec.get("pure") or spec.get("async_mode")):
         return True
+    if name in ("manage_skill", "manage_schedule", "manage_mcp_client"):
+        act = str((args or {}).get("action") or "").strip().lower()
+        if act == "list" or (not act and not (args or {}).get("name") and not (args or {}).get("id")):
+            return True
     if name in ("grep", "search_in_files"):
         return str((args or {}).get("mode") or "search").lower() != "replace"
     return name in ("list_skills", "list_memories", "list_mcp_clients", "list_dir", "read_file", "list_schedules", "get_context_window")

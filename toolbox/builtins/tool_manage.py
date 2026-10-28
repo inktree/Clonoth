@@ -95,10 +95,9 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
         input_schema = {"type": "object", "properties": {}, "required": []}
 
     spec = {"name": name, "description": description, "input_schema": input_schema}
-    if "pure" in args:
-        spec["pure"] = bool(args["pure"])
-    if "enabled" in args:
-        spec["enabled"] = bool(args["enabled"])
+    for key in ("pure", "async_mode", "enabled"):
+        if key in args:
+            spec[key] = bool(args[key])
     code = _render_tool_py(
         spec=spec,
         script_body=script.strip(),
@@ -131,3 +130,15 @@ async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         return _ok(f"Tools reloaded: {count} local", tools=count)
     except Exception as e:
         return _err(e)
+
+
+async def manage_tool(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified external tool management: upsert (create/update a tool script) or reload tools/ directory."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        action = "upsert" if (args.get("name") or args.get("script")) else "reload"
+    if action == "reload":
+        return await reload_tools(args, ctx)
+    if action in ("upsert", "create", "update"):
+        return await create_or_update_tool(args, ctx)
+    return _err(f"invalid action: {action!r}, must be 'upsert' or 'reload'")

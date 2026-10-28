@@ -582,3 +582,23 @@ def test_anthropic_finish_result_merges_next_turn_text_without_continued():
     assert not any(block.get("text") == "(continued)" for m in converted for block in m["content"])
 
 
+
+
+def test_anthropic_prevents_tool_result_after_merged_text_block():
+    from providers.anthropic import _convert_messages
+
+    _, converted = _convert_messages([
+        {"role": "tool", "tool_call_id": "first", "content": "result one"},
+        {"role": "user", "content": "ordinary text"},
+        {"role": "tool", "tool_call_id": "second", "content": "result two"},
+    ])
+    assert converted == [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "first", "content": "result one"},
+            {"type": "text", "text": "ordinary text"},
+        ]},
+        {"role": "assistant", "content": [{"type": "text", "text": "(continued)"}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "second", "content": "result two"},
+        ]},
+    ]

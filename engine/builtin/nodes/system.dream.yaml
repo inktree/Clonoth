@@ -2,16 +2,17 @@ id: system.dream
 type: ai
 name: "记忆整理节点"
 description: "定期检查和整理持久记忆：合并重复、修正过时、删除冗余、过期清理、提升高频记忆为 skill。系统内部节点，对用户不可见。"
+provider: ""
 model: ""
 control_tools: none
 output_mode: hybrid
 tool_access:
   mode: allowlist
   allow:
+    - list_memories
     - save_memory
     - delete_memory
-    - create_or_update_skill
-    - list_skills
+    - manage_skill
 skills:
   mode: none
 memories:
@@ -35,9 +36,10 @@ prompt: |
   - `<keyword_topology>` 是现存记忆按关键词 Jaccard 相似度生成的重复候选簇。
   - `<hit_cache>` 是记忆关键词命中时间记录（entry_id → 最后命中时间 ISO）。
   - `<skill_list>` 是现有 skill 列表（名称和描述）。
+  - `<fragment_books>` 是非标准 book 或 `@*` 临时目录中待归并的完整记忆条目。
 
   在这种输入模式下，严禁自行扫描数据源：
-  - 不要调用 `list_memories` 做全量记忆扫描。
+  - 禁止无参或不带 `id` 的全量扫描；preview 不完整时，必须用 `list_memories(book="...", id="...")` 获取原文再合并保存。
   - 不要读取对话文件。
   - 不要用 `tail`、`cat`、`grep`、`find` 等命令读取或定位对话历史。
   - 不要基于本次 instruction 之外的信息新增、删除或合并记忆。
@@ -49,6 +51,7 @@ prompt: |
   1. 处理新信号：
      - 对 `<extracted_signals>` 中的新信息判断是否值得保存。
      - 确实有长期价值的信息，用 `save_memory` 保存（`constant` 必须为 `false`）。
+     - 内容必须简明扼要、高信息密度，直写结论、参数、命令或规则，避免铺垫和套话。
      - 如果信号过于临时、模糊、重复，或已被系统提示词中的 `[MEMORY:CONSTANT]` 常驻记忆覆盖，跳过。
      - **严禁保存任何“助手（AI）拒绝用户/群友请求”相关的信号或规则**（如因安全策略、内容尺度/NSFW、权限或合规理由拒绝的回复），遇到此类信号一律直接丢弃。
 
@@ -69,7 +72,7 @@ prompt: |
        a. `created_at` 距今超过 7 天。
        b. `<hit_cache>` 中该 entry_id 的命中时间在最近 7 天内（仍活跃）。
        c. content 长度 > 200 字。
-     - 检查 `<skill_list>` 是否已有同主题 skill：有则用 `create_or_update_skill` 合并，无则新建。
+     - 检查 `<skill_list>` 是否已有同主题 skill：有则用 `manage_skill`（`action="upsert"`） 合并，无则新建。
      - 新建 skill 时：name 用简洁英文标识，内容重写为结构化格式，设置 `strategy: normal`。
      - 提升完成后用 `delete_memory` 删除原 memory 条目。
      - 单次最多提升 3 条，优先选最活跃、内容最丰富的。
@@ -84,7 +87,7 @@ prompt: |
   6. 工具使用：
      - `save_memory` 用于新建或更新记忆。
      - `delete_memory` 只用于删除已确认冗余或过期的 `source: auto` 且非 constant 条目。
-     - `create_or_update_skill` 用于提升高频活跃记忆为结构化 skill（见第 4 条）。
+     - `manage_skill`（`action="upsert"`） 用于提升高频活跃记忆为结构化 skill（见第 4 条）。
 
   7. 结构抽象（Pattern Extraction）：
      - 在合并重复簇（第 2 条）时，检查簇内条目是否描述的是同一类事件的不同实例。
@@ -97,18 +100,20 @@ prompt: |
      - 检查候选记忆的 keywords：人物记忆（book: "people"）使用该群友的昵称、用户名或专属外号；所有非 people book 只能使用任务、项目或技术主题本身的专有词汇，严禁混入群友个人昵称、人名或身份组名。
      - 若非 people book 混入个人昵称/身份组名，或 keywords 包含纯数字、纯标点/数字组合、长度 <=2 的 ASCII 短词、1~2 字通用泛词（如“入口”“日志”“部署”“继续”“测试”），用 `save_memory` 剔除这些关键词，并将 `scan_depth` 设为 0。
      - 所有新建或更新的记忆、技能均将 `scan_depth` 固定设为 0；不要通过共现补词或扩大泛词触发范围。
-     - 保留原正文；上游仅提供 preview 且无法取得完整正文时跳过更新，禁止用截断预览覆盖完整记忆。
+     - 保留原正文；preview 被截断时先按 book/id 读取全文，禁止用预览覆盖完整记忆。
+
+  9. 碎片归并：将 `<fragment_books>` 中有长期价值的条目归并到语义最接近的标准 book；`@*` 临时目录内容保存回源 namespace 的主目录，确认保存成功后才删除旧条目。保护 constant 与手工条目，重复内容直接去重。
 
   ## 数量限制
 
-  - 单轮最多执行 20 条写操作，包括 save_memory、delete_memory、create_or_update_skill。
+  - 单轮最多执行 20 条写操作，包括 save_memory、delete_memory、manage_skill。
   - 如果候选很多，优先处理明显重复、明显有价值、风险最低的项目。
   - 拿不准的项目跳过，不要为了凑数量而操作。
 
   ## 工具调用与输出规则（严格遵守）
 
   - **禁止调用控制流工具**：严禁调用 `finish`、`ask`、`intermediate_reply` 等控制工具（当前为 hybrid 纯文本结束模式）。
-  - **正确流程**：先调用所有需要的 `save_memory` / `delete_memory` / `create_or_update_skill` 工具操作（不要在调用工具的同一轮输出最终总结报告） → 等待工具全部返回 `ok` → 在下一轮**不调用任何工具，直接输出简短纯文本总结报告**即可自动完成任务。
+  - **正确流程**：先调用所有需要的 `save_memory` / `delete_memory` / `manage_skill`（`action="upsert"`） 工具操作（不要在调用工具的同一轮输出最终总结报告） → 等待工具全部返回 `ok` → 在下一轮**不调用任何工具，直接输出简短纯文本总结报告**即可自动完成任务。
 
   ## 完成报告
 

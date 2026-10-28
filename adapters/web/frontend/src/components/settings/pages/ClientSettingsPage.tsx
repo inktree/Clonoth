@@ -100,6 +100,14 @@ const KNOWN_TOOL_RULES: KnownToolInfo[] = [
   { toolName: 'delete_mcp_client', label: 'delete_mcp_client', description: '删除 MCP 客户端配置。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'create_agent', label: 'create_agent', description: '创建持久化子节点。智能模式默认自动放行，可以在这里关闭。' },
   { toolName: 'preempt_task', label: 'preempt_task', description: '向运行中的子任务追加指令。智能模式默认自动放行，可以在这里关闭。' },
+  { toolName: 'read_media', label: 'read_media', description: '分析本地图片或视频。智能模式默认自动放行。' },
+  { toolName: 'manage_skill', label: 'manage_skill', description: '列出、创建、更新或删除本地技能。智能模式默认自动放行。' },
+  { toolName: 'manage_schedule', label: 'manage_schedule', description: '列出、创建、更新或删除定时任务。智能模式默认自动放行。' },
+  { toolName: 'manage_tool', label: 'manage_tool', description: '创建、更新或重载外部工具。智能模式默认自动放行。' },
+  { toolName: 'manage_mcp_client', label: 'manage_mcp_client', description: '列出、创建、更新或删除 MCP 客户端。智能模式默认自动放行。' },
+  { toolName: 'manage_workers', label: 'manage_workers', description: '管理运行中的子任务（列表、注入指令、抢占、取消）。智能模式默认自动放行。' },
+  { toolName: 'dispatch_to', label: 'dispatch_to', description: '委派任务给专属子节点。智能模式默认自动放行。' },
+  { toolName: 'spawn_worker', label: 'spawn_worker', description: '派发匿名临时 Worker 子代理。智能模式默认自动放行。' },
   { toolName: 'read_image', label: 'read_image', description: '分析本地图片。智能模式默认自动放行。' },
   { toolName: 'discord_manage', label: 'discord_manage', description: '执行 Discord Bot 管理代码。智能模式默认自动放行，可以在这里关闭。' },
 ];
@@ -115,9 +123,9 @@ const TOOL_CATEGORY_DEFS: ToolCategoryDef[] = [
   { id: 'files', title: '📄 文件操作', description: '读取、搜索、列目录和修改文件。', toolNames: ['read_file', 'write_file', 'apply_diff', 'list_dir', 'grep'] },
   { id: 'commands', title: '💻 命令执行', description: '本地命令执行。', toolNames: ['execute_command'] },
   { id: 'memory', title: '🔖 记忆管理', description: '保存、查看和删除长期记忆。', toolNames: ['save_memory', 'list_memories', 'delete_memory'] },
-  { id: 'system', title: '⚙️ 系统管理', description: '上下文、节点切换、工具、技能、定时任务和服务管理。', toolNames: ['request_restart', 'switch_node', 'compact_context', 'clear_context', 'cancel_active_tasks', 'get_context_window', 'clonoth_debug', 'create_or_update_skill', 'list_skills', 'delete_skill', 'create_schedule', 'list_schedules', 'delete_schedule', 'create_or_update_tool', 'reload_tools', 'create_or_update_mcp_client', 'list_mcp_clients', 'delete_mcp_client'] },
-  { id: 'delegation', title: '🤖 节点委派', description: '创建节点、委派任务和向运行任务追加指令。', toolNames: ['create_agent', 'preempt_task'] },
-  { id: 'external', title: '🧩 外部工具', description: 'MCP、图片分析、Discord 和其他外部服务工具。', toolNames: ['read_image', 'discord_manage'] },
+  { id: 'system', title: '⚙️ 系统管理', description: '上下文、节点切换、工具、技能、定时任务和服务管理。', toolNames: ['request_restart', 'switch_node', 'compact_context', 'clear_context', 'get_context_window', 'clonoth_debug', 'manage_skill', 'manage_schedule', 'manage_tool', 'manage_mcp_client'] },
+  { id: 'delegation', title: '🤖 节点委派', description: '创建节点、委派任务和管理运行中的子代理。', toolNames: ['dispatch_to', 'spawn_worker', 'manage_workers', 'create_agent'] },
+  { id: 'external', title: '🧩 外部工具', description: 'MCP、媒体读取、Discord 和其他外部服务工具。', toolNames: ['read_media', 'read_image', 'discord_manage'] },
   { id: 'other', title: '🔧 其他', description: '无法归入上述分类的工具。', toolNames: [] },
 ];
 

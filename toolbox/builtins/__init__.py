@@ -32,12 +32,15 @@ RESERVED_TOOL_NAMES = {
     "create_or_update_skill",
     "list_skills",
     "delete_skill",
+    "manage_skill",
     "create_or_update_tool",
     "reload_tools",
+    "manage_tool",
     "request_restart",
     "create_schedule",
     "list_schedules",
     "delete_schedule",
+    "manage_schedule",
     "save_memory",
     "list_memories",
     "delete_memory",
@@ -47,6 +50,7 @@ RESERVED_TOOL_NAMES = {
     "create_or_update_mcp_client",
     "list_mcp_clients",
     "delete_mcp_client",
+    "manage_mcp_client",
     "create_agent",
     "read_todos",
     "update_todos",
@@ -67,9 +71,9 @@ from .search_in_files import search_in_files  # noqa: E402,F401
 # Why: skill CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed skill-tool module.
 # Purpose: registry startup no longer depends on deleted knowledge files.
-from .tool_manage import create_or_update_tool, reload_tools  # noqa: E402,F401
+from .tool_manage import create_or_update_tool, reload_tools, manage_tool  # noqa: E402,F401
 from .system import request_restart  # noqa: E402,F401
-from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: E402,F401
+from .schedules import create_schedule, list_schedules, delete_schedule, manage_schedule  # noqa: E402,F401
 from .tasks import cancel_active_tasks, list_active_tasks, get_context_window  # noqa: E402,F401
 # Why: memory CRUD tools moved into engine.builtin.knowledge_inject. How: keep the
 # names reserved above but stop importing the removed memory-tool module.

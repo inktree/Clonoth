@@ -70,21 +70,28 @@ class DreamMemoryRouter(Handler):
         target_ns = ""
         target_ws = ""
 
-        # Mode 1: Dream route table (book -> {ns, ws})
+        # Mode 1: Dream route table (supports exact 'book/id' key and book key)
         memory_route: dict[str, Any] = task_context.get("_memory_route") or {}
         if memory_route:
             book = str(tool_args.get("book") or "default").strip()
-            target = memory_route.get(book)
+            mid = str(tool_args.get("id") or "").strip()
+            target = None
+            if mid and tool_name in ("delete_memory", "list_memories"):
+                target = memory_route.get(f"{book}/{mid}")
+            if target is None:
+                target = memory_route.get(book)
             if target is None:
                 # Book not in route table (new book created by dream).
                 # Fall back to the first route entry's namespace.
-                _first = next(iter(memory_route.values()), None)
+                _first = next((v for v in memory_route.values() if not v.get("ws")), None) or next(iter(memory_route.values()), None)
                 if _first:
                     target = _first
             if target:
                 target_ns = str(target.get("ns") or "").strip()
-                target_ws = str(target.get("ws") or "").strip()
-
+                if node_id == "system.dream" and tool_name == "save_memory":
+                    target_ws = ""
+                else:
+                    target_ws = str(target.get("ws") or "").strip()
         # Mode 2: Direct namespace from memory_extractor
         if not target_ns:
             _direct_ns = str(task_context.get("_memory_route_ns") or "").strip()
@@ -109,9 +116,10 @@ class DreamMemoryRouter(Handler):
         if hasattr(tool_ctx, "_node_extra"):
             tool_ctx._node_extra = {}  # type: ignore[attr-defined]
 
-        if target_ws:
-            # Strip the @ prefix for workspace_name (save_memory adds it back)
-            tool_ctx.workspace_name = target_ws.lstrip("@")
+        # Dream consolidates writes into the source namespace, not a temporary workspace.
+        if node_id == "system.dream" and tool_name == "save_memory":
+            target_ws = ""
+        tool_ctx.workspace_name = target_ws.lstrip("@")
 
         log.info(
             "[dream_router] redirected %s book=%s from ns=%s to ns=%s ws=%s",

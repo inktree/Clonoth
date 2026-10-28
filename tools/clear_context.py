@@ -113,6 +113,7 @@ if __name__ == "__main__":
             results["session_reset"] = "ok"
             results["old_session_id"] = data.get("old_session_id", "")
             results["cleared_children"] = data.get("cleared_children", 0)
+            results["cancelled_tasks"] = data.get("cancelled_tasks", 0)
             results["context_files_cleaned"] = data.get("context_files_cleaned", 0)
         elif resp.status_code == 404:
             # conversation not found = already clean, not a failure

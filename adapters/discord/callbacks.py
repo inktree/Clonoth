@@ -96,12 +96,27 @@ def _tool_inline_summary(tool_name: str, args: dict) -> str:
         return f'写入记忆 {str(args.get("id") or "")[:30]}'
     if name == "delete_memory":
         return f'删除记忆 {str(args.get("id") or "")[:30]}'
-    if name == "read_image":
-        p = str(args.get("image_path") or "")
-        return f"读取图片 {_basename(p)}" if p else "读取图片"
+    if name in ("read_media", "read_image", "read_video"):
+        paths = args.get("paths")
+        if isinstance(paths, list) and len(paths) > 1:
+            return f"读取 {len(paths)} 个媒体文件"
+        p = str(args.get("path") or args.get("image_path") or args.get("video_path") or (paths[0] if isinstance(paths, list) and paths else "") or "")
+        return f"读取媒体 {_basename(p)}" if p else "读取媒体"
+    if name in ("manage_skill", "manage_schedule", "manage_mcp_client", "manage_tool", "manage_workers"):
+        default_action = "upsert" if args.get("name") or args.get("script") else "reload"
+        act = str(args.get("action") or (default_action if name == "manage_tool" else "list"))
+        tgt = str(args.get("name") or args.get("id") or args.get("target") or "")[:24]
+        return f"{name}({act}) {tgt}".strip()
     if name == "discord_manage":
         port = args.get("port", "")
         return f"Discord({port})" if port else "Discord"
+    if name == "spawn_worker":
+        instruction = str(args.get("instruction") or "")
+        return f"派发 Worker: {_clip(instruction, 30)}" if instruction else "派发 Worker"
+    if name == "dispatch_to":
+        target = str(args.get("target") or "")
+        inst = str(args.get("instruction") or args.get("text") or "")[:30]
+        return f"委派 {target}: {inst}" if inst else f"委派 {target}"
     if name.startswith("dispatch_to_") or name.startswith("dispatch:"):
         target = name.replace("dispatch_to_", "").replace("dispatch:", "")
         inst = str(args.get("instruction") or args.get("text") or "")[:30]

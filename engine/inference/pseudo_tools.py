@@ -675,15 +675,42 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return result
 
 
+_LEGACY_TO_CONSOLIDATED: dict[str, str] = {
+    "read_image": "read_media",
+    "read_video": "read_media",
+    "list_schedules": "manage_schedule",
+    "create_schedule": "manage_schedule",
+    "delete_schedule": "manage_schedule",
+    "list_mcp_clients": "manage_mcp_client",
+    "create_or_update_mcp_client": "manage_mcp_client",
+    "delete_mcp_client": "manage_mcp_client",
+    "list_skills": "manage_skill",
+    "create_or_update_skill": "manage_skill",
+    "delete_skill": "manage_skill",
+    "create_or_update_tool": "manage_tool",
+    "reload_tools": "manage_tool",
+}
+
+
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mode = (node.tool_access.mode or "none").lower()
     if mode == "all":
         denied = set(node.tool_access.deny)
         if denied:
-            return [s for s in all_specs if s.get("name") not in denied]
+            legacy_groups: dict[str, set[str]] = {}
+            for legacy, consolidated in _LEGACY_TO_CONSOLIDATED.items():
+                legacy_groups.setdefault(consolidated, set()).add(legacy)
+            expanded_denied = denied | {
+                consolidated for consolidated, aliases in legacy_groups.items()
+                if aliases <= denied
+            }
+            return [s for s in all_specs if s.get("name") not in expanded_denied]
         return list(all_specs)
     if mode == "allowlist":
         allowed = set(node.tool_access.allow)
+        for k, v in _LEGACY_TO_CONSOLIDATED.items():
+            if k in allowed:
+                allowed.add(v)
         return [s for s in all_specs if s.get("name") in allowed]
     return []
 
@@ -700,6 +727,10 @@ def build_node_tool_specs(
     """Build the model-visible tool list and the allowed real-tool name set."""
     tool_specs = _filter_tool_specs(node, registry.list_specs())
     allowed = {s.get("name") for s in tool_specs if s.get("name")}
+    # Authorize legacy alias names whenever their consolidated tool is allowed
+    for leg_name, cons_name in _LEGACY_TO_CONSOLIDATED.items():
+        if cons_name in allowed and leg_name not in node.tool_access.deny:
+            allowed.add(leg_name)
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
 
     _ct_raw = getattr(node, "control_tools", "all")

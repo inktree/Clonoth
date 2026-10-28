@@ -444,69 +444,199 @@ async def open_session(workspace_root: Path, client_id: str):
         yield session
 
 
+# ---------------------------------------------------------------------------
+#  Persistent stdio session actor pool (single-task lifecycle per client)
+# ---------------------------------------------------------------------------
+
+class _StdioSessionActor:
+    """Maintains a persistent stdio_client + ClientSession inside one dedicated asyncio.Task.
+
+    Why: anyio cancel scopes inside mcp.client.stdio require entering and exiting
+    on the exact same asyncio.Task, while stateful MCP servers
+    need their child process to survive across
+    consecutive tool calls. How: run the context manager inside one background
+    worker task and dispatch list_tools/call_tool requests via an asyncio.Queue.
+    """
+
+    def __init__(self, spec_sig: str, command: str, args: list[str], env: dict[str, str]) -> None:
+        self.spec_sig = spec_sig
+        self.command = command
+        self.args = args
+        self.env = env
+        self._queue: asyncio.Queue | None = None
+        self._task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+
+    def is_alive(self) -> bool:
+        return self._task is not None and not self._task.done() and self._queue is not None
+
+    async def _ensure_started(self) -> asyncio.Queue:
+        async with self._lock:
+            if self.is_alive():
+                return self._queue  # type: ignore[return-value]
+            q: asyncio.Queue = asyncio.Queue()
+            ready = asyncio.get_running_loop().create_future()
+            self._queue = q
+            self._task = asyncio.create_task(self._worker_loop(q, ready))
+            await asyncio.wait_for(ready, timeout=45.0)
+            return q
+
+    async def _worker_loop(self, q: asyncio.Queue, ready: asyncio.Future) -> None:
+        params = StdioServerParameters(command=self.command, args=self.args, env=self.env)
+        try:
+            async with stdio_client(params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    if not ready.done():
+                        ready.set_result(True)
+                    while True:
+                        op, tool_name, arguments, fut = await q.get()
+                        if op == "stop":
+                            if not fut.done():
+                                fut.set_result(True)
+                            break
+                        try:
+                            if op == "list":
+                                res = await session.list_tools()
+                            else:
+                                res = await session.call_tool(tool_name, arguments=arguments or {})
+                            if not fut.done():
+                                fut.set_result(res)
+                        except Exception as exc:
+                            if not fut.done():
+                                fut.set_exception(exc)
+                            # Break worker loop on broken pipe/EOF so next call reconnects cleanly
+                            if any(k in type(exc).__name__ for k in ('Broken', 'Closed', 'EOF', 'Connection')):
+                                break
+        except Exception as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+
+    async def stop(self) -> None:
+        async with self._lock:
+            q, t = self._queue, self._task
+            self._queue = None
+            self._task = None
+            if q is not None and t is not None and not t.done():
+                try:
+                    fut = asyncio.get_running_loop().create_future()
+                    q.put_nowait(("stop", "", {}, fut))
+                    await asyncio.wait_for(t, timeout=2.0)
+                except asyncio.TimeoutError:
+                    # wait_for cancels and joins the worker, closing its child process.
+                    pass
+
+    async def request(self, op: str, tool_name: str = "", arguments: dict[str, Any] | None = None, *, timeout: float = 120.0) -> Any:
+        for attempt in range(2):
+            try:
+                q = await self._ensure_started()
+                fut = asyncio.get_running_loop().create_future()
+                await q.put((op, tool_name, arguments or {}, fut))
+                return await asyncio.wait_for(fut, timeout=timeout)
+            except asyncio.TimeoutError:
+                await self.stop()
+                raise
+            except Exception:
+                await self.stop()
+                if attempt == 1:
+                    raise
+
+
+_STDIO_ACTORS: dict[tuple[int, str], _StdioSessionActor] = {}
+_STDIO_ACTORS_LOCK = asyncio.Lock()
+
+
+async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessionActor | None:
+    _ensure_sdk()
+    spec = get_client_spec(workspace_root, client_id)
+    if not bool(spec.get("enabled", True)):
+        raise RuntimeError(f"MCP client is disabled: {client_id}")
+    if str(spec.get("transport") or "stdio") != "stdio":
+        return None
+    command = str(spec.get("command") or "").strip()
+    if not command:
+        raise RuntimeError("stdio client missing command")
+    args = [str(x) for x in (spec.get("args") or [])]
+    env = os.environ.copy()
+    for k, v in (spec.get("env") or {}).items():
+        env[str(k)] = resolve_env_ref(v)
+    sig = json.dumps({"c": command, "a": args, "e": {str(k): env.get(str(k), "") for k in (spec.get("env") or {})}}, sort_keys=True)
+    loop_id = id(asyncio.get_running_loop())
+    key = (loop_id, client_id)
+    async with _STDIO_ACTORS_LOCK:
+        existing = _STDIO_ACTORS.get(key)
+        if existing is not None:
+            if existing.spec_sig == sig:
+                return existing
+            await existing.stop()
+        actor = _StdioSessionActor(sig, command, args, env)
+        _STDIO_ACTORS[key] = actor
+        return actor
+
+
 async def list_tools(workspace_root: Path, client_id: str) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        res = await session.list_tools()
-        raw = _to_plain(res)
-        tools = raw.get("tools") if isinstance(raw, dict) else []
-        items = [_normalize_tool_entry(t) for t in tools] if isinstance(tools, list) else []
-        return {"ok": True, "client_id": client_id, "tools": items}
+    actor = await _get_stdio_actor(workspace_root, client_id)
+    if actor is not None:
+        res = await actor.request("list", timeout=45.0)
+    else:
+        async with open_session(workspace_root, client_id) as session:
+            res = await session.list_tools()
+    raw = _to_plain(res)
+    tools = raw.get("tools") if isinstance(raw, dict) else []
+    items = [_normalize_tool_entry(t) for t in tools] if isinstance(tools, list) else []
+    return {"ok": True, "client_id": client_id, "tools": items}
 
 
-# [2026-06-10] Default MCP tool call timeout in seconds.
-# Why: MCP servers can hang indefinitely (network issues, server bugs).
-# How: wrap session.call_tool in asyncio.wait_for with a configurable timeout.
-# Purpose: prevent tool calls from blocking the engine forever.
 MCP_CALL_TIMEOUT = 120.0
 
 
 async def call_tool(workspace_root: Path, client_id: str, tool_name: str, arguments: dict[str, Any] | None, *, timeout: float = MCP_CALL_TIMEOUT) -> dict[str, Any]:
-    async with open_session(workspace_root, client_id) as session:
-        try:
-            res = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments=arguments or {}),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            return {
-                "ok": False,
-                "error": f"MCP tool '{tool_name}' on client '{client_id}' timed out after {timeout}s",
-                "data": {"result": f"MCP tool call timed out after {timeout}s", "client_id": client_id, "tool_name": tool_name, "attachments": []},
-                "attachments": [],
-            }
-        # Why: MCP image content can be much larger than the context budget. How:
-        # serialize the result through the MCP-aware helper that saves oversized
-        # images to disk and returns AttachmentCollector-compatible metadata.
-        # Purpose: keep tool history compact while still exposing generated files.
-        result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
-        # [AutoC 2026-05-31] Why: MCP SDK results have provider-specific content
-        # payloads, but the engine now consumes a unified ok/data/error contract.
-        # How: flatten text, image, and resource parts into data.result while keeping
-        # the original processed MCP payload under data.mcp_result. Purpose: make MCP
-        # tool history readable and preserve structured data plus attachments.
-        result_text_parts: list[str] = []
-        if isinstance(result, dict) and isinstance(result.get("content"), list):
-            for part in result["content"]:
-                if isinstance(part, dict):
-                    if part.get("type") == "text":
-                        result_text_parts.append(str(part.get("text", "")))
-                    elif part.get("type") == "image":
-                        result_text_parts.append(f"[image: {part.get('mimeType') or part.get('mime_type') or part.get('mime') or '?'}]")
-                    elif part.get("type") == "resource":
-                        resource = part.get("resource")
-                        uri = part.get("uri") or (resource.get("uri") if isinstance(resource, dict) else None)
-                        result_text_parts.append(f"[resource: {uri or '?'}]")
-        result_text = "\n".join(result_text_parts) if result_text_parts else json.dumps(result, ensure_ascii=False, indent=2)
-        is_error = bool(result.get("isError") or result.get("is_error")) if isinstance(result, dict) else False
+    actor = await _get_stdio_actor(workspace_root, client_id)
+    try:
+        if actor is not None:
+            res = await actor.request("call", tool_name, arguments or {}, timeout=timeout)
+        else:
+            async with open_session(workspace_root, client_id) as session:
+                res = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=arguments or {}),
+                    timeout=timeout,
+                )
+    except asyncio.TimeoutError:
         return {
-            "ok": not is_error,
-            "data": {
-                "result": result_text,
-                "mcp_result": result,
-                "client_id": client_id,
-                "tool_name": tool_name,
-                "attachments": attachments or [],
-            },
-            "error": result_text if is_error else None,
-            "attachments": attachments or [],
+            "ok": False,
+            "error": f"MCP tool '{tool_name}' on client '{client_id}' timed out after {timeout}s",
+            "data": {"result": f"MCP tool call timed out after {timeout}s", "client_id": client_id, "tool_name": tool_name, "attachments": []},
+            "attachments": [],
         }
+
+    result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
+    result_text_parts: list[str] = []
+    if isinstance(result, dict) and isinstance(result.get("content"), list):
+        for part in result["content"]:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    result_text_parts.append(str(part.get("text", "")))
+                elif part.get("type") == "image":
+                    result_text_parts.append(f"[image: {part.get('mimeType') or part.get('mime_type') or part.get('mime') or '?'}]")
+                elif part.get("type") == "resource":
+                    resource = part.get("resource")
+                    uri = part.get("uri") or (resource.get("uri") if isinstance(resource, dict) else None)
+                    result_text_parts.append(f"[resource: {uri or '?'}]")
+    result_text = "\n".join(result_text_parts) if result_text_parts else json.dumps(result, ensure_ascii=False, indent=2)
+    is_error = isinstance(result, dict) and (
+        result.get("isError") is True or result.get("is_error") is True
+    )
+    if not is_error and result_text.lstrip().startswith("ERROR:"):
+        is_error = True
+    return {
+        "ok": not is_error,
+        "data": {
+            "result": result_text,
+            "mcp_result": result,
+            "client_id": client_id,
+            "tool_name": tool_name,
+            "attachments": attachments or [],
+        },
+        "error": result_text if is_error else None,
+        "attachments": attachments or [],
+    }

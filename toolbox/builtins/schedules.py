@@ -171,3 +171,22 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     save_schedules(ctx.workspace_root, schedules)
     return _ok(f"Schedule deleted: {sid}", deleted=True, id=sid)
+
+
+async def manage_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified schedule management tool: list, upsert (create/update), or delete scheduled tasks."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        if not args.get("id"):
+            action = "list"
+        elif any(args.get(k) is not None for k in ("cron", "text", "command", "type", "enabled", "once")):
+            action = "upsert"
+        else:
+            action = "list"
+    if action == "list":
+        return await list_schedules(args, ctx)
+    if action in ("upsert", "create", "update"):
+        return await create_schedule(args, ctx)
+    if action in ("delete", "remove"):
+        return await delete_schedule(args, ctx)
+    return _err(f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'")

@@ -123,6 +123,25 @@ async def delete_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         return _err(e)
 
 
+async def manage_mcp_client(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    """Unified MCP client management tool: list, upsert (create/update), or delete MCP clients."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        if not args.get("id"):
+            action = "list"
+        elif any(args.get(k) is not None for k in ("transport", "command", "url", "args", "env", "headers", "enabled", "stateful")):
+            action = "upsert"
+        else:
+            action = "list"
+    if action == "list":
+        return await list_mcp_clients(args, ctx)
+    if action in ("upsert", "create", "update"):
+        return await create_or_update_mcp_client(args, ctx)
+    if action in ("delete", "remove"):
+        return await delete_mcp_client(args, ctx)
+    return _err(f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'")
+
+
 async def _refresh_and_notify(ctx: Any) -> int:
     """配置变更后：本 worker 立即刷新，并 bump reload-seq 通知其他 worker。
 
@@ -259,6 +278,10 @@ async def refresh_mcp_tools(registry: Any) -> int:
                 if callable(forget):
                     forget(dispose)
         _BRIDGE["disposers"].clear()
+        for mapping in (registry._tool_specs, registry._tool_funcs):
+            for name in list(mapping):
+                if name.startswith("mcp_"):
+                    del mapping[name]
 
         count = 0
         ws = Path(getattr(registry, "workspace_root"))
@@ -302,9 +325,9 @@ async def refresh_mcp_tools(registry: Any) -> int:
                         "search", "query", "list", "get_", "fetch", "resolve",
                         "current_time", "relative_time", "days_in_month",
                         "get_timestamp", "convert_time", "get_week_year",
-                        "db_info", "build_prompt", "rea_search", "rea_schema",
-                        "jsr_list", "jsr_schema",
+                        "db_info", "build_prompt",
                     ))
+                    or raw_name.lower().endswith(("_list", "_schema", "_search", "_query", "_get", "_fetch", "_read"))
                 )
                 dispose = registry.register_builtin_tool(
                     reg_name,
@@ -474,43 +497,32 @@ PLUGIN_META = {
     },
     "tools": [
         {
-            "name": "create_or_update_mcp_client",
-            "description": "Create or update an MCP client config in data/mcp_clients.yaml. Supports stdio, sse, and streamable_http transports. New tools go live immediately on this worker; other workers follow within seconds.",
+            "name": "manage_mcp_client",
+            "description": (
+                "Manage MCP client configurations in data/mcp_clients.yaml: "
+                "action='list' lists all configured MCP clients; "
+                "action='upsert' creates or updates an MCP client (stdio, sse, or streamable_http; tools go live immediately); "
+                "action='delete' removes an MCP client by id."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string"},
-                    "description": {"type": "string"},
-                    "enabled": {"type": "boolean"},
-                    "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"]},
-                    "command": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "env": {"type": "object"},
-                    "url": {"type": "string"},
-                    "headers": {"type": "object"},
+                    "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'."},
+                    "id": {"type": "string", "description": "[upsert/delete] MCP client ID."},
+                    "description": {"type": "string", "description": "[upsert] Client description."},
+                    "enabled": {"type": "boolean", "description": "[upsert] Whether the client is enabled."},
+                    "transport": {"type": "string", "enum": ["stdio", "sse", "streamable_http", "streamable-http", "http"], "description": "[upsert] Transport type."},
+                    "command": {"type": "string", "description": "[upsert stdio] Executable command."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "[upsert stdio] Command arguments."},
+                    "env": {"type": "object", "description": "[upsert stdio] Environment variables."},
+                    "stateful": {"type": "boolean", "description": "[upsert stdio] Whether the server holds cross-call state (uses 1800s idle TTL instead of 900s)."},
+                    "idle_ttl_sec": {"type": "number", "description": "[upsert stdio] Optional custom idle timeout in seconds before reaping the stdio subprocess."},
+                    "url": {"type": "string", "description": "[upsert sse/http] Remote MCP endpoint URL."},
+                    "headers": {"type": "object", "description": "[upsert sse/http] Optional HTTP headers."},
                 },
-                "required": ["id", "transport"],
+                "required": [],
             },
-            "func": create_or_update_mcp_client,
-        },
-        {
-            "name": "list_mcp_clients",
-            "pure": True,
-            "description": "List configured MCP clients.",
-            "input_schema": {"type": "object", "properties": {}, "required": []},
-            "func": list_mcp_clients,
-        },
-        {
-            "name": "delete_mcp_client",
-            "description": "Delete an MCP client config by id. Its tools are removed from this worker immediately; other workers follow within seconds.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                },
-                "required": ["id"],
-            },
-            "func": delete_mcp_client,
+            "func": manage_mcp_client,
         },
     ],
 }

@@ -73,7 +73,7 @@ class Node:
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
     # [AutoC 2026-08-30] control_tools: 控制类伪工具（finish/ask/intermediate_reply/
-    # compact_context/preempt_task/spawn_worker/manage_workers/switch_node）的注入开关。Why: 此前这些工具无条件
+    # compact_context/dispatch_to/spawn_worker/manage_workers/switch_node）的注入开关。Why: 此前这些工具无条件
     # 注入，无法声明一个只有 execute_command 的最小节点。How: "all"（默认，旧行为）/
     # "none"（全部不注入）/ 名称列表（只注入列出的）。Purpose: 插件声明的极简节点
     # 不再被框架强行塞入控制面工具。
@@ -261,7 +261,7 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     # both beside the other non-terminal control tools. Purpose: "all" and list-based
     # node policies expose the same supported pseudo-tool vocabulary.
     _CONTROL_NAMES = {"finish", "ask", "intermediate_reply", "compact_context",
-                      "preempt_task", "spawn_worker", "manage_workers", "switch_node"}
+                      "dispatch_to", "preempt_task", "spawn_worker", "manage_workers", "switch_node"}
     if isinstance(_ct_raw, str):
         control_tools: Any = _ct_raw.strip().lower() if _ct_raw.strip().lower() in {"all", "none"} else "all"
     elif isinstance(_ct_raw, list):

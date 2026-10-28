@@ -1750,6 +1750,25 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     return _tool_ok(f"Skill deleted: {name}", deleted=True, name=name)
 
 
+async def manage_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified skill management tool: list, upsert (create/update), or delete skills under skills/<name>/SKILL.md."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        if not args.get("name"):
+            action = "list"
+        elif any(args.get(k) is not None for k in ("content", "description", "keywords", "strategy", "enabled", "priority", "order", "scan_depth", "visibility")):
+            action = "upsert"
+        else:
+            action = "list"
+    if action == "list":
+        return await list_skills(args, ctx)
+    if action in ("upsert", "create", "update"):
+        return await create_or_update_skill(args, ctx)
+    if action in ("delete", "remove"):
+        return await delete_skill(args, ctx)
+    return _tool_err(f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'")
+
+
 # ---------------------------------------------------------------------------
 #  Memory CRUD tools
 # ---------------------------------------------------------------------------
@@ -1937,7 +1956,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             break
     if not found:
         # 新建：写入 created_at，source 由调用方决定（memory_extract 会补 auto）
-        if _caller_nid == "system.memory_extractor" and not new_entry.get("source"):
+        if _is_sys_mem_node and not new_entry.get("source"):
             new_entry["source"] = "auto"
         new_entry["created_at"] = _now_iso
         new_entry["updated_at"] = _now_iso
@@ -2097,10 +2116,9 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if new_entries:
         _save_book(book_path, data)
     else:
-        try:
-            book_path.unlink()
-        except Exception:
-            pass
+        book_path.unlink(missing_ok=True)
+        if book_path.parent.name.startswith("@") and not any(book_path.parent.iterdir()):
+            book_path.parent.rmdir()
 
     # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
@@ -2116,57 +2134,45 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 # exist. Purpose: let engine.builtin.loader register plugin-owned builtin tools.
 PLUGIN_META["tools"] = [
     {
-        "name": "create_or_update_skill",
-        "description": "Create or update a skill under skills/<name>/SKILL.md.",
+        "name": "manage_skill",
+        "description": (
+            "Manage local skills under skills/<name>/SKILL.md: "
+            "action='list' lists all local skills; "
+            "action='upsert' creates or updates a skill (frontmatter normalized); "
+            "action='delete' deletes a skill directory."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string"},
-                "description": {"type": "string"},
-                "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
-                "enabled": {"type": "boolean"},
-                "strategy": {"type": "string", "description": "constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
-                "keywords": {"type": "array", "items": {"type": "string"}, "description": "activation keywords; supports /regex/flags syntax"},
-                "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
-                "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
-                "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
-                "visibility": {"type": "string", "description": "public (constant/keyword activation allowed) or private (injected only when pinned to a workspace); default public", "enum": ["public", "private"]},
+                "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'."},
+                "name": {"type": "string", "description": "[upsert/delete] Skill name (directory name under skills/)."},
+                "description": {"type": "string", "description": "[upsert] Short skill description."},
+                "content": {"type": "string", "description": "[upsert] Full SKILL.md content (optional; frontmatter will be normalized)."},
+                "enabled": {"type": "boolean", "description": "[upsert] Whether the skill is enabled."},
+                "strategy": {"type": "string", "description": "[upsert] constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "[upsert] Activation keywords; supports /regex/flags syntax."},
+                "order": {"type": "integer", "description": "[upsert] Injection order within the same block; higher values are placed later (closer to conversation)."},
+                "priority": {"type": "integer", "description": "[upsert] Budget priority; higher values are kept first when token budget is exceeded."},
+                "scan_depth": {"type": "integer", "description": "[upsert] Number of recent conversation rounds to scan for keyword matching; 0 = current message only."},
+                "visibility": {"type": "string", "description": "[upsert] public (constant/keyword activation allowed) or private (injected only when pinned to a workspace); default public", "enum": ["public", "private"]},
             },
-            "required": ["name"],
+            "required": [],
         },
-        "func": create_or_update_skill,
-    },
-    {
-        "name": "list_skills",
-        "pure": True,
-        "description": "List local skills under skills/*/SKILL.md.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-        "func": list_skills,
-    },
-    {
-        "name": "delete_skill",
-        "description": "Delete a skill directory under skills/<name>/.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-            },
-            "required": ["name"],
-        },
-        "func": delete_skill,
+        "func": manage_skill,
     },
     {
         "name": "save_memory",
         "description": "Save or update a memory entry in a book. "
         "Use this when you learn something worth remembering across conversations: "
         "user preferences, corrections, project context, external resource pointers, "
-        "or character profiles in group chat.",
+        "or character profiles in group chat. "
+        "Memory content MUST be concise, high-density, and to the point (写记忆文字需简明扼要，不啰嗦不水字数).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
                 "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
-                "content": {"type": "string", "description": "Memory content text."},
+                "content": {"type": "string", "description": "Memory content text. Must be concise, high-density, and free of filler/padding (文字需简明扼要，不啰嗦不水字数)."},
                 "keywords": {
                     "type": "array",
                     "items": {"type": "string"},

@@ -266,9 +266,9 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=stdout_text[:2000] if stdout_text else "",
             )
 
-        if len(stdout_text) > max_output:
-            stdout_text = stdout_text[:max_output]
-
+        # Parse structured JSON output BEFORE applying plain-text length truncation,
+        # so valid JSON payloads >16KB (e.g. search_web / clonoth_debug) are not sliced
+        # mid-JSON and misclassified as plain text. Downstream SpillPolicy bounds inline size.
         try:
             result = json.loads(stdout_text)
             if isinstance(result, dict):
@@ -277,11 +277,16 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
             # engine now expects ok/data/error. How: keep the scalar under value and
             # expose its string form as data.result. Purpose: make every successful
             # external script output readable through the same contract.
-            return {"ok": True, "data": {"result": str(result), "value": result}}
+            text_val = str(result)
+            if len(text_val) > max_output:
+                text_val = text_val[:max_output]
+            return {"ok": True, "data": {"result": text_val, "value": result}}
         except json.JSONDecodeError:
             # [AutoC 2026-05-31] Why: legacy scripts may still print plain text.
             # How: wrap stdout as both data.result and data.output. Purpose: keep
             # plain-text scripts usable while conforming to the unified schema.
+            if len(stdout_text) > max_output:
+                stdout_text = stdout_text[:max_output]
             return {"ok": True, "data": {"result": stdout_text, "output": stdout_text}}
 
     return _run
@@ -518,30 +523,23 @@ class ToolRegistry:
                 _builtins.search_in_files,
             ),
             (
-                "create_or_update_tool",
-                "Create/update an external tool under tools/. "
-                "Provide 'script' (Python code body). "
-                "The tool runs as a subprocess: JSON in via stdin, JSON out via stdout.",
+                "manage_tool",
+                "Manage external tools under tools/: action='upsert' creates or updates a Python tool script (JSON in via stdin, JSON out via stdout) and reloads the registry; action='reload' reloads tools/ directory.",
                 {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "input_schema": {"type": "object"},
-                        "script": {"type": "string", "description": "Python script body. Has access to: args (dict from stdin), output(result), fail(error)."},
-                        "timeout_sec": {"type": "number"},
-                        "pure": {"type": "boolean", "description": "Whether the tool is pure/side-effect-free (safe for parallel execution in the same turn). Default false."},
-                        "async_mode": {"type": "boolean", "description": "Whether the tool runs asynchronously in background and delivers results via preempt. Default false."},
+                        "action": {"type": "string", "enum": ["upsert", "reload"], "description": "Operation: 'upsert' (create/update tool script, default when name/script given) or 'reload' (reload tools/ directory)."},
+                        "name": {"type": "string", "description": "[upsert] Tool name."},
+                        "description": {"type": "string", "description": "[upsert] Tool description."},
+                        "input_schema": {"type": "object", "description": "[upsert] JSON Schema for tool parameters."},
+                        "script": {"type": "string", "description": "[upsert] Python script body. Has access to: args (dict from stdin), output(result), fail(error)."},
+                        "timeout_sec": {"type": "number", "description": "[upsert] Execution timeout in seconds."},
+                        "pure": {"type": "boolean", "description": "[upsert] Whether the tool is pure/side-effect-free (safe for parallel execution in the same turn). Default false."},
+                        "async_mode": {"type": "boolean", "description": "[upsert] Whether the tool runs asynchronously in background and delivers results via preempt. Default false."},
                     },
-                    "required": ["name", "script"],
+                    "required": ["action"],
                 },
-                _builtins.create_or_update_tool,
-            ),
-            (
-                "reload_tools",
-                "Reload tools/ directory (MCP tools live in reload snapshots).",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.reload_tools,
+                _builtins.manage_tool,
             ),
             (
                 "request_restart",
@@ -557,47 +555,28 @@ class ToolRegistry:
                 _builtins.request_restart,
             ),
             (
-                "create_schedule",
-                "Create or update a scheduled task in data/schedules.yaml. "
-                "Supports type='message' (default, injects text as inbound) and type='script' "
-                "(runs a shell command, parses stdout JSON for inbound injection). "
-                "Requires approval.",
+                "manage_schedule",
+                "Manage scheduled tasks in data/schedules.yaml: action='list' lists all schedules; action='upsert' creates or updates a schedule (type='message' or 'script', requires approval); action='delete' deletes a schedule by id (requires approval).",
                 {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "unique schedule id"},
-                        "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
-                        "text": {"type": "string", "description": "message text injected as inbound (for message type); prefix text (for script type)"},
-                        "type": {"type": "string", "enum": ["message", "script"], "description": "schedule type: message (default) or script"},
-                        "command": {"type": "string", "description": "shell command to run (required for script type). stdout must be a single-line JSON object with a 'text' field: {\"text\": \"message to inject\"}. Optional 'attachments' field for file paths. Empty stdout = silent skip (if silent=true) or prefix-only injection."},
-                        "timeout": {"type": "integer", "description": "script timeout in seconds (default 30, script type only)"},
-                        "silent": {"type": "boolean", "description": "if true, skip inbound when script stdout is empty (default true, script type only)"},
-                        "conversation_key": {"type": "string", "description": "conversation key (defaults to current session's conversation_key; falls back to scheduler:{id} if none)"},
-                        "entry_node_id": {"type": "string", "description": "optional entry node override for the injected inbound"},
-                        "enabled": {"type": "boolean"},
-                        "once": {"type": "boolean", "description": "if true, auto-delete after first trigger"},
+                        "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: 'list' (default), 'upsert' (create/update), or 'delete'."},
+                        "id": {"type": "string", "description": "[upsert/delete] Unique schedule id."},
+                        "cron": {"type": "string", "description": "[upsert] 5-field cron: minute hour day month weekday (UTC)."},
+                        "text": {"type": "string", "description": "[upsert] Message text injected as inbound (for message type); prefix text (for script type)."},
+                        "type": {"type": "string", "enum": ["message", "script"], "description": "[upsert] Schedule type: message (default) or script."},
+                        "command": {"type": "string", "description": "[upsert] Shell command to run (required for script type). stdout must be a single-line JSON object with a 'text' field: {\"text\": \"message to inject\"}. Optional 'attachments' field for file paths. Empty stdout = silent skip (if silent=true) or prefix-only injection."},
+                        "timeout": {"type": "integer", "description": "[upsert] Script timeout in seconds (default 30, script type only)."},
+                        "silent": {"type": "boolean", "description": "[upsert] If true, skip inbound when script stdout is empty (default true, script type only)."},
+                        "conversation_key": {"type": "string", "description": "[upsert] Conversation key (defaults to current session's conversation_key; falls back to scheduler:{id} if none)."},
+                        "entry_node_id": {"type": "string", "description": "[upsert] Optional entry node override for the injected inbound."},
+                        "workflow_id": {"type": "string", "description": "[upsert] Optional workflow override."},
+                        "enabled": {"type": "boolean", "description": "[upsert] Whether the schedule is active."},
+                        "once": {"type": "boolean", "description": "[upsert] If true, auto-delete after first trigger."},
                     },
-                    "required": ["id"],
+                    "required": ["action"],
                 },
-                _builtins.create_schedule,
-            ),
-            (
-                "list_schedules",
-                "List all scheduled tasks from data/schedules.yaml.",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.list_schedules,
-            ),
-            (
-                "delete_schedule",
-                "Delete a scheduled task by id. Requires approval.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "schedule id to delete"},
-                    },
-                    "required": ["id"],
-                },
-                _builtins.delete_schedule,
+                _builtins.manage_schedule,
             ),
             (
                 "get_context_window",
@@ -610,7 +589,7 @@ class ToolRegistry:
             ),
         ]
 
-        _pure_builtins = {"list_dir", "read_file", "list_schedules", "get_context_window"}
+        _pure_builtins = {"list_dir", "read_file", "get_context_window"}
         for name, desc, schema, func in builtins:
             # Why: built-in tools now have a public registration path shared by
             # registry-owned and plugin-owned tools. How: seed the central table
@@ -693,28 +672,52 @@ class ToolRegistry:
 
         return len(self._tool_specs)
 
+    _LEGACY_ALIAS_MAP: dict[str, tuple[str, str | None]] = {
+        "read_image": ("read_media", None),
+        "read_video": ("read_media", None),
+        "list_schedules": ("manage_schedule", "list"),
+        "create_schedule": ("manage_schedule", "upsert"),
+        "delete_schedule": ("manage_schedule", "delete"),
+        "list_mcp_clients": ("manage_mcp_client", "list"),
+        "create_or_update_mcp_client": ("manage_mcp_client", "upsert"),
+        "delete_mcp_client": ("manage_mcp_client", "delete"),
+        "list_skills": ("manage_skill", "list"),
+        "create_or_update_skill": ("manage_skill", "upsert"),
+        "delete_skill": ("manage_skill", "delete"),
+        "create_or_update_tool": ("manage_tool", "upsert"),
+        "reload_tools": ("manage_tool", "reload"),
+    }
+
+    def _resolve_alias(self, name: str, arguments: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+        args = dict(arguments or {})
+        if name in self._tool_funcs:
+            return name, args
+        alias = self._LEGACY_ALIAS_MAP.get(name)
+        if alias is not None:
+            target_name, default_action = alias
+            if default_action and "action" not in args:
+                args["action"] = default_action
+            return target_name, args
+        return name, args
+
     def list_specs(self) -> list[dict[str, Any]]:
         return list(self._tool_specs.values())
 
     def get_spec(self, name: str) -> dict[str, Any] | None:
-        """按名称获取单个工具的 spec，不存在返回 None。"""
-        return self._tool_specs.get(name)
+        """按名称获取单个工具的 spec，不存在返回 None（支持旧工具名别名回退）。"""
+        spec = self._tool_specs.get(name)
+        if spec is not None:
+            return spec
+        alias = self._LEGACY_ALIAS_MAP.get(name)
+        if alias is not None:
+            return self._tool_specs.get(alias[0])
+        return None
 
     async def authorize(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any] | None:
-        """Run the policy + approval gate without executing the tool.
-
-        [AutoC 2026-08-28] Why: the adaptive async scheduler must finish
-        approval before its execution task — and its upgrade timer — start.
-        Approval waiting used to happen inside the running task, so the
-        threshold counted dialog time and long-pending approvals were
-        mislabeled "auto-upgraded to async". How: extract the request_guard
-        half of execute(); execute() delegates here unless the caller passes
-        _authorized=True after a successful pre-flight. Purpose: denied
-        commands never start, and the threshold measures only approved,
-        actually-running execution time.
-
-        Returns None when the call may proceed, else the error-shaped result.
-        """
+        """Run the policy + approval gate without executing the tool."""
+        if name == "cancel_active_tasks" and name not in self._tool_funcs:
+            return None
+        name, arguments = self._resolve_alias(name, arguments)
         if name not in self._tool_funcs:
             return _error_tool_response(f"tool not found: {name}")
         from ._common import request_guard
@@ -756,12 +759,9 @@ class ToolRegistry:
         return None
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any, _authorized: bool = False) -> dict[str, Any]:
-        # [AutoC 2026-08-10] 统一工具级审批：所有真实工具调用先过 supervisor policy。
-        # 伪工具（finish / intermediate_reply 等）不经过 registry，天然跳过。
-        # 内部已有路径/命令级审批的工具（read_file / write_file / execute_command
-        # 等）在 policy.yaml tools.rules 里配 auto，避免双重拦截；其余工具默认
-        # approval_required，由前端/Discord 按 trust_level（空 = 无路径）+ 用户偏好
-        # 自动批准或弹人工审批。_authorized=True 供调度器预授权后跳过二次审批。
+        if name == "cancel_active_tasks" and name not in self._tool_funcs:
+            return _ensure_tool_response_shape(await _builtins.cancel_active_tasks(arguments or {}, ctx))
+        name, arguments = self._resolve_alias(name, arguments)
         if _authorized:
             if name not in self._tool_funcs:
                 return _error_tool_response(f"tool not found: {name}")

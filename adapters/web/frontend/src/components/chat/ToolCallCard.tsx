@@ -247,6 +247,14 @@ const TOOL_META_MAP: Record<string, ToolMeta> = {
   preempt_task: { icon: 'priority_high', label: '追加指令', descTemplate: '' },
   get_context_window: { icon: 'data_usage', label: '上下文窗口', descTemplate: '' },
   read_video: { icon: 'movie', label: '读取视频', descTemplate: '' },
+  read_media: { icon: 'perm_media', label: '读取媒体', descTemplate: '' },
+  manage_skill: { icon: 'bookmarks', label: '技能管理', descTemplate: '' },
+  manage_schedule: { icon: 'schedule', label: '定时管理', descTemplate: '' },
+  manage_tool: { icon: 'build', label: '工具管理', descTemplate: '' },
+  manage_mcp_client: { icon: 'extension', label: 'MCP管理', descTemplate: '' },
+  manage_workers: { icon: 'groups', label: '子代理管理', descTemplate: '' },
+  dispatch_to: { icon: 'call_split', label: '委派节点', descTemplate: '' },
+  spawn_worker: { icon: 'person_add', label: '派发Worker', descTemplate: '' },
 
   discord_manage: { icon: 'smart_toy', label: 'Discord', descTemplate: '' },
   clonoth_debug: { icon: 'bug_report', label: '调试', descTemplate: '' },
@@ -400,6 +408,32 @@ function getToolInlineSummary(tool: ToolExecution): string {
     case 'create_or_update_tool': {
       const tn = getStringValue(args.name);
       return tn ? `工具 ${tn}` : '';
+    }
+    case 'manage_skill':
+    case 'manage_schedule':
+    case 'manage_tool':
+    case 'manage_mcp_client':
+    case 'manage_workers': {
+      const defaultAction = name === 'manage_tool' ? (args.name || args.script ? 'upsert' : 'reload') : 'list';
+      const act = getStringValue(args.action) || defaultAction;
+      const tgt = getStringValue(args.name || args.id || args.target);
+      return tgt ? `${act} ${tgt}` : act;
+    }
+    case 'spawn_worker': {
+      const instruction = getStringValue(args.instruction);
+      return instruction.length > 30 ? `${instruction.slice(0, 27)}…` : instruction;
+    }
+    case 'dispatch_to': {
+      const tgt = getStringValue(args.target);
+      const inst = getStringValue(args.instruction || args.text);
+      const clip = inst.length > 26 ? `${inst.slice(0, 24)}…` : inst;
+      return tgt ? `${tgt}: ${clip}` : clip;
+    }
+    case 'read_media': {
+      const paths = Array.isArray(args.paths) ? args.paths : [];
+      if (paths.length > 1) return `读取 ${paths.length} 个媒体文件`;
+      const p = getStringValue(args.path || args.image_path || args.video_path || paths[0]);
+      return p ? basename(p) : '';
     }
     default: break;
   }

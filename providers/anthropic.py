@@ -265,9 +265,10 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
             prev_blocks = prev_content if isinstance(prev_content, list) else _content_to_blocks(prev_content)
             curr_blocks = curr_content if isinstance(curr_content, list) else _content_to_blocks(curr_content)
             prev_has_tr = any(b.get("type") == "tool_result" for b in prev_blocks)
+            prev_has_non_tr = any(b.get("type") != "tool_result" for b in prev_blocks)
             curr_has_tr = any(b.get("type") == "tool_result" for b in curr_blocks)
-            # Appending text after tool results preserves Anthropic's block order.
-            if prev_has_tr == curr_has_tr or (prev_has_tr and not curr_has_tr):
+            # Never append tool results after text, including an already mixed block.
+            if not curr_has_tr or (prev_has_tr and not prev_has_non_tr):
                 if isinstance(prev_content, list) and isinstance(curr_content, list):
                     prev_content.extend(curr_content)
                 elif isinstance(prev_content, list):
