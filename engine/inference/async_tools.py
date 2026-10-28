@@ -139,17 +139,8 @@ def is_async_tool_cancelled(async_id: str) -> bool:
 
 
 def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
-    """Return an immutable-enough ToolContext snapshot for background tool work."""
-    # [AutoC 2026-06-27] Why: _execute_real_tools reuses one ToolContext and rewrites
-    # tool_call_id for every tool in the batch. How: copy dataclass fields and the
-    # node-specific dynamic attributes before scheduling background work. Purpose:
-    # async execute_command callbacks keep the approval and artifact identity of the
-    # original tool call.
-    snapshot = replace(tool_ctx)
-    for attr in ("_node_id", "_node_extra", "_async_id"):
-        if hasattr(tool_ctx, attr):
-            setattr(snapshot, attr, getattr(tool_ctx, attr))
-    return snapshot
+    """Snapshot declared fields and isolate per-call approval fingerprints."""
+    return replace(tool_ctx, approved_guard_fps=set(tool_ctx.approved_guard_fps))
 
 
 def _execute_command_async_upgrade_threshold(

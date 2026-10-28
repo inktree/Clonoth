@@ -163,6 +163,7 @@ def test_unified_dispatch_to_spec_and_dynamic_refresh(tmp_path: Path) -> None:
         node=parent,
         openai_tools=specs,
         allowed_pseudo_tools=allowed_pseudo_names(specs, parent),
+        _cache_warm_fork=False,
     )
     changed = refresh_dispatch_to_spec(ls)
     assert changed is True
@@ -196,8 +197,10 @@ def test_spawn_worker_cache_warm_fork_persists_exact_parent_prefix(tmp_path: Pat
         supervisor_url="http://supervisor.test",
         session_id="branch_123",
         parent_session_id="main_parent_sid",
+        child_session_id="",
         sticky_session_id="main_parent_sid",
         task_id="task_parent",
+        current_llm_request_id="req_1",
         task_context={"conversation_key": "discord:123", "channel": "discord"},
         http=_StubHttp(),
         emit_event=lambda *a, **kw: asyncio.sleep(0),
@@ -210,6 +213,8 @@ def test_spawn_worker_cache_warm_fork_persists_exact_parent_prefix(tmp_path: Pat
         openai_tools=list(parent_tools),
         formatter=create_tool_formatter("native"),
         provider=SimpleNamespace(name="openai"),
+        _pending_shadow_writes=None,
+        _step_dispatch_conv_keys={},
     )
     call = SimpleNamespace(
         id="tc1",

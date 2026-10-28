@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
-from providers.base import BaseProvider
+from providers.base import BaseProvider, ToolCall
 from ..node import Node
 from ..context_store import save_context_snapshot, write_context_snapshot
 
@@ -143,6 +143,15 @@ class _LoopState:
     # 自动创建和销毁。插件通过 ls.plugin_data.setdefault("my_plugin", {})
     # 读写，无需向 _LoopState dataclass 添加字段。
     plugin_data: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    _pending_shadow_writes: list[tuple[dict[str, Any], str]] | None = None
+    _step_dispatch_conv_keys: dict[str, Any] = field(default_factory=dict)
+    _step_tool_calls: list[ToolCall] | None = None
+    _step_tool_msg_start: int = 0
+    _cache_warm_fork: bool = False
+    _reactive_compact_done: bool = False
+    _reasoning_started_iso: str | None = None
+    _reasoning_ended_iso: str | None = None
 
 
 def _persist_ctx(ls: _LoopState, step_count: int) -> str:

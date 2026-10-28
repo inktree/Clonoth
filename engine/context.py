@@ -18,12 +18,15 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 import httpx
 
 from engine.signals import Signal, get_bus
 from .registry_core import DisposalLedger
+
+if TYPE_CHECKING:
+    from .conversation_store import ConversationStore
 
 
 @dataclass
@@ -58,6 +61,7 @@ class RunContext:
     workspace: Path | None = None
     workspace_name: str = ""
     sticky_session_id: str = ""
+    conversation_store: ConversationStore | None = None
 
     def __post_init__(self) -> None:
         if not self.sticky_session_id:

@@ -77,76 +77,56 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 #  Phase 1: 影子写入辅助函数
 #  将 ls.messages.append() 产生的消息同步写入 ConversationStore（JSONL）。
-#  best-effort：任何异常静默忽略，绝不影响主推理流程。
+#  文件 I/O 失败记录 warning；内部构造和类型错误正常暴露。
 #  仅处理 assistant 和 tool_result 消息；_dynamic/_ephemeral 消息跳过。
 # ---------------------------------------------------------------------------
 
 def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> None:
-    """Best-effort shadow write to ConversationStore. Never breaks main flow.
+    """Write durable messages; log I/O failures while exposing internal defects.
 
-    Phase 3: 写入成功后将 Message.id 记录到 ls.last_shadow_message_id，
-    供 _persist_ctx 写入 snapshot 的 last_message_id 字段。
-
-    Child Session 隔离（Phase B）：写入目标优先使用 rctx.child_session_id，
-    使子节点的消息写入自己的 JSONL 而非父 session。
+    Child sessions take precedence over the runtime session. Message IDs are
+    tracked only after a successful append.
     """
-    pending = getattr(ls, "_pending_shadow_writes", None)
+    pending = ls._pending_shadow_writes
     if pending is not None and message_type == "tool_result":
         pending.append((msg_dict, message_type))
         return
+    store = ls.rctx.conversation_store
+    if store is None:
+        return
+    if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
+        return
+
+    from uuid import uuid4
+    msg_id = str(uuid4())
+    # Preserve multimodal content instead of coercing image blocks to text.
+    raw_content = msg_dict.get('content', '')
+    content = raw_content if isinstance(raw_content, (str, list)) else str(raw_content)
+    msg = Message(
+        id=msg_id,
+        role=msg_dict.get('role', 'user'),
+        content=content,
+        message_type=message_type,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        meta=msg_dict.get('_meta', {}),
+        response_info=dict(ls.rctx.response_info) if msg_dict.get('role') == 'assistant' else {},
+        source_node_id=ls.node.id,
+        source_task_id=ls.rctx.task_id,
+        tool_calls=msg_dict.get('tool_calls', []),
+        tool_call_id=str(msg_dict.get('tool_call_id') or ''),
+        name=str(msg_dict.get('name') or ''),
+    )
+    target_session = ls.rctx.child_session_id or ls.rctx.session_id
     try:
-        store = getattr(ls.rctx, 'conversation_store', None)
-        if store is None:
-            return
-        # 跳过 dynamic context 和 ephemeral 消息（如 retry hint）
-        if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
-            return
-        # [2026-05-07] 不再按 control_tool_name 跳过 finish。
-        # 原因：finish 已恢复为真实 API 工具，正常结果必须像普通工具一样进入 ConversationStore。
-        # 做法：这里只保留 dynamic/ephemeral 两类运行期消息过滤，普通 tool_result 全部写入。
-        # 目的：长期历史能够保存 assistant.tool_call 与 tool_result 的完整配对。
-        from uuid import uuid4
-        from datetime import datetime, timezone
-        msg_id = str(uuid4())
-        # [AutoC 2026-06-01] Why: converting non-string content with str()
-        # destroyed multimodal user image blocks before same-task history reload.
-        # How: pass provider-style list content through unchanged and only fall
-        # back to text for other unexpected content shapes. Purpose: shadow
-        # writes can preserve images for the active task while keeping legacy
-        # string behavior for ordinary messages.
-        _raw_content = msg_dict.get('content', '')
-        _content = _raw_content if isinstance(_raw_content, (str, list)) else str(_raw_content)
-        msg = Message(
-            id=msg_id,
-            role=msg_dict.get('role', 'user'),
-            content=_content,
-            message_type=message_type,
-            created_at=datetime.now(timezone.utc).isoformat(),
-            meta=msg_dict.get('_meta', {}),
-            response_info=dict(getattr(ls.rctx, 'response_info', {}) or {})
-                if msg_dict.get('role') == 'assistant' else {},
-            source_node_id=getattr(ls.node, 'id', ''),
-            source_task_id=getattr(ls.rctx, 'task_id', ''),
-            tool_calls=msg_dict.get('tool_calls', []),
-            # [2026-05-01] 影子写入时保留原生 role=tool 的配对字段。
-            # 原因：ConversationStore 是下一轮历史来源；丢失 tool_call_id 会破坏 true native。
-            tool_call_id=str(msg_dict.get('tool_call_id') or ''),
-            name=str(msg_dict.get('name') or ''),
-        )
-        # [Fork/Merge 2026-05-12] Child sessions still win, otherwise write to the runtime session.
-        # Why: rctx.session_id may now be an entry branch, not the user-facing parent session. How:
-        # keep child_session_id for delegated nodes and use rctx.session_id for main branch tasks.
-        # Purpose: ConversationStore writes stay isolated until supervisor merges the branch.
-        target_session = getattr(ls.rctx, 'child_session_id', '') or ls.rctx.session_id
         store.append(target_session, msg)
-        # Phase 3: 记录最后一次影子写入的 message id，供 snapshot 持久化使用
-        ls.last_shadow_message_id = msg_id
-        # P0 Task 内核化：追踪 first/last message ID 到 RunContext
-        if not ls.rctx.first_shadow_message_id:
-            ls.rctx.first_shadow_message_id = msg_id
-        ls.rctx.last_shadow_message_id = msg_id
-    except Exception:
-        pass  # best-effort, never break main flow
+    except OSError as exc:
+        logger.warning("Shadow write failed for session %s: %s", target_session, exc)
+        return
+
+    ls.last_shadow_message_id = msg_id
+    if not ls.rctx.first_shadow_message_id:
+        ls.rctx.first_shadow_message_id = msg_id
+    ls.rctx.last_shadow_message_id = msg_id
 
 
 def _close_execution(execution: Any) -> None:
@@ -174,14 +154,14 @@ def _close_execution(execution: Any) -> None:
 # ---------------------------------------------------------------------------
 
 def _flush_step_shadow_writes(ls: _LoopState) -> None:
-    pending = getattr(ls, "_pending_shadow_writes", None)
+    pending = ls._pending_shadow_writes
     if pending is None:
         return
     ls._pending_shadow_writes = None
     _align_step_tool_results_order(
         ls.messages,
-        getattr(ls, "_step_tool_msg_start", len(ls.messages)),
-        getattr(ls, "_step_tool_calls", None),
+        ls._step_tool_msg_start,
+        ls._step_tool_calls,
     )
     if not pending:
         return
@@ -234,7 +214,7 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
         # [2026-05-01] 工具结果必须带当前 tool_mode。
         # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
         set_message_meta(_err_msg, MessageMeta(
-            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+            tool_mode=ls.node.tool_mode,
             message_type="tool_result",
         ))
         # [fix 2026-06-24] 不在此处立即追加到 ls.messages。
@@ -281,23 +261,23 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
     # provider_meta 由 ProviderResponse 透传；engine 只搬运不解读
     # [fix 2026-04-18] provider 名称改为动态获取，不再硬编码 "openai"。
     # ls.provider.name 由 BaseProvider.name 提供，各 provider 子类在初始化时传入。
-    _provider_name = (getattr(ls.rctx, 'response_info', {}) or {}).get('provider') or getattr(ls.provider, 'name', '') or 'unknown'
+    _provider_name = (ls.rctx.response_info or {}).get('provider') or getattr(ls.provider, 'name', '') or 'unknown'
     _tc_meta = MessageMeta(
         provider=_provider_name,
-        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+        tool_mode=ls.node.tool_mode,
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+        llm_request_id=ls.rctx.current_llm_request_id,
         metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
         reasoning=resp.reasoning or "",
         has_reasoning=bool(resp.reasoning),
-        thought_summary=getattr(resp, "thought_summary", None) or "",
+        thought_summary=resp.thought_summary or "",
         inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
         # [thinking-time 2026-06-01] Persist precise reasoning timing from stream.
-        reasoning_started_at=getattr(ls, '_reasoning_started_iso', '') or '',
-        reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
+        reasoning_started_at=ls._reasoning_started_iso or '',
+        reasoning_ended_at=ls._reasoning_ended_iso or '',
     )
     set_message_meta(_assistant_msg, _tc_meta)
     ls.messages.append(_assistant_msg)
@@ -313,11 +293,11 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
     # [AutoC 2026-08-06] hybrid 模式下，伴随文本通过 assistant_text 事件推送给前端，
     # 前端可以 edit 消息来显示。tool_only 模式下行为不变（不推送）。
     _companion_text = (resp.text or "").strip()
-    if _companion_text and getattr(ls.node, 'output_mode', 'hybrid') == 'hybrid':
+    if _companion_text and ls.node.output_mode == 'hybrid':
         await ls.rctx.emit_event("assistant_text", {
             "node_id": ls.node.id,
             "task_id": ls.rctx.task_id,
-            "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
+            "llm_request_id": ls.rctx.current_llm_request_id,
             "text": _companion_text,
         })
 
@@ -359,7 +339,7 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
             # 目的：被拒绝的 finish 与同轮其他工具一样保持完整配对历史。
             _rejection_code = str(_before_result.reason or "before_tool_call_blocked")
             set_message_meta(_err, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                tool_mode=ls.node.tool_mode,
                 message_type="tool_result",
                 tool_rejected=True,
                 tool_rejection_code=_rejection_code,
@@ -403,7 +383,7 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
     #     for tc in resp.tool_calls:
     #         _err = ls.formatter.format_tool_result(tc, _reject_msg)
     #         set_message_meta(_err, MessageMeta(
-    #             tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+    #             tool_mode=ls.node.tool_mode,
     #             message_type="tool_result",
     #         ))
     #         ls.messages.append(_err)
@@ -555,27 +535,21 @@ async def _execute_real_tools(
         registry=ls.registry,
         task_id=ls.rctx.task_id,
         session_generation=ls.rctx.session_generation,
-        workspace=getattr(ls.rctx, 'workspace', None),
-        workspace_name=getattr(ls.rctx, 'workspace_name', '') or '',
+        workspace=ls.rctx.workspace,
+        workspace_name=ls.rctx.workspace_name or '',
         # [Fork/Merge 2026-05-17] Why: real tools may call supervisor APIs while
         # their node is running on a branch session. How: pass RunContext's parent
         # route session into ToolContext. Purpose: tool events, approvals, and
         # session-scoped built-ins stay attached to the durable user session.
-        parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
-        conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
+        parent_session_id=ls.rctx.parent_session_id or "",
+        conversation_key=str((ls.rctx.task_context or {}).get("conversation_key", "")).strip(),
         # [AutoC 2026-05-31] Why: the context object is created before iterating
         # individual real tool calls. How: initialize node_id here and set
         # tool_call_id inside each loop iteration below. Purpose: approval requests
         # made by built-in guards can carry the correct active tool identity.
         node_id=ls.node.id,
+        node_extra=dict(ls.node.extra or {}),
     )
-    # [2026-05-27 refactor] 传递通用节点上下文给插件层。
-    # 为什么：插件（如 save_memory）需要读取节点级配置（如 memory_book），
-    # 但不应让插件每次重新读取 yaml 文件。
-    # 怎么改：传递 node_id 和 node.extra dict，插件零 IO 从 extra 读取业务配置。
-    # 目的：引擎核心只提供通用上下文，不知道具体插件字段的存在。
-    _tool_ctx._node_id = ls.node.id  # type: ignore[attr-defined]
-    _tool_ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []
@@ -889,7 +863,7 @@ async def _execute_real_tools(
                 if _call_ctx.workspace is not None or (_t_name == 'set_workspace' and _call_ctx.workspace_name):
                     ls.rctx.workspace = _call_ctx.workspace
                     _tool_ctx.workspace = _call_ctx.workspace
-                if _call_ctx.workspace_name and _call_ctx.workspace_name != getattr(ls.rctx, 'workspace_name', ''):
+                if _call_ctx.workspace_name and _call_ctx.workspace_name != ls.rctx.workspace_name:
                     ls.rctx.workspace_name = _call_ctx.workspace_name
                     _tool_ctx.workspace_name = _call_ctx.workspace_name
 
@@ -952,7 +926,7 @@ def _persist_tool_results(
             _result_body,
         )
         set_message_meta(_tool_msg, MessageMeta(
-            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+            tool_mode=ls.node.tool_mode,
             message_type="tool_result",
         ))
         _tool_meta = _tool_msg.setdefault("_meta", {})
@@ -1139,7 +1113,7 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
-            workspace_name=getattr(rctx, 'workspace_name', '') or '',
+            workspace_name=rctx.workspace_name or '',
         )
         _assembled_fresh = True
 
@@ -1348,7 +1322,7 @@ async def run_ai_node(
                     await ls.rctx.emit_event("stream_text_final", {
                         "node_id": ls.node.id,
                         "task_id": ls.rctx.task_id,
-                        "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
+                        "llm_request_id": ls.rctx.current_llm_request_id,
                         "text": _clean_text,
                     })
 

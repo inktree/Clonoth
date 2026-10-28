@@ -1486,7 +1486,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
 
     if keywords is not None:
         keywords = [kw for kw in keywords if is_valid_keyword(kw)]
-    _caller_nid = str(getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or "").strip()
+    _caller_nid = (ctx.caller_node_id or ctx.node_id).strip()
     _is_sys_mem_node = _caller_nid in ("system.memory_extractor", "system.dream")
     if _is_sys_mem_node:
         scan_depth = 0
@@ -1747,7 +1747,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # [2026-05-27] memory_book namespace 支持：当节点 yaml 配置了 memory_book 时，
     # 没有显式指定 book 的 save_memory 调用将使用节点配置的默认 book 名称。
     # 为什么：持久节点的记忆应隔离到独立的 namespace，避免互相污染。
-    # 怎么改：从 ToolContext._node_extra dict 零 IO 读取 memory_book，
+    # 怎么改：从 ToolContext.node_extra dict 零 IO 读取 memory_book，
     #   extra 由 Node.load_node 在加载 yaml 时一次性收集，通过 ai_step 传入。
     # 目的：插件层零 IO 拿到业务配置，引擎核心不知道具体字段的存在。
     _user_book = str(args.get("book") or "").strip()
@@ -1773,7 +1773,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     keywords = [kw for kw in keywords if is_valid_keyword(kw)]
     constant = bool(args.get("constant", False))
     enabled = bool(args.get("enabled", True))
-    _caller_nid = str(getattr(ctx, "_caller_node_id", "") or ctx.node_id or getattr(ctx, "_node_id", "") or "").strip()
+    _caller_nid = (ctx.caller_node_id or ctx.node_id).strip()
     _is_sys_mem_node = _caller_nid in ("system.memory_extractor", "system.dream")
     if _is_sys_mem_node and constant:
         # System extraction/dream nodes are strictly forbidden from creating constant memories
@@ -1809,12 +1809,10 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
     # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
     # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _effective_memory_ns(ctx.node_extra, ctx.node_id)
     # [AutoC 2026-08-10] scope: "workspace" writes to @{workspace_name}/ subdir.
     _scope = str(args.get("scope") or "workspace").strip().lower()
-    _ws_name = str(getattr(ctx, 'workspace_name', '') or '').strip()
+    _ws_name = ctx.workspace_name.strip()
     if _scope == "workspace" and _ws_name:
         _target_ns = f"{_ns_memory_book}/@{_ws_name}"
     else:
@@ -1891,9 +1889,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # 每条目标记 scope/workspace 来源；ns 目录不存在时保留 root 兜底。
     book_filter = str(args.get("book") or "").strip() or None
     id_filter = str(args.get("id") or "").strip() or None
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _effective_memory_ns(ctx.node_extra, ctx.node_id)
 
     sources: list[tuple[Path, str, str]] = []  # (dir, scope, workspace)
     base_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
@@ -1967,16 +1963,14 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         return _tool_err("empty memory id")
 
     # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _effective_memory_ns(ctx.node_extra, ctx.node_id)
     _explicit_book = str(args.get("book") or "").strip()
     book = _explicit_book or "default"
     # [AutoC 2026-08-31] 查找顺序与 save_memory 的默认落点（scope=workspace）
     # 对齐：当前 workspace 子目录优先，其次节点级，最后 root 兜底。How: 第一个
     # 包含目标 id 的书文件胜出；书文件存在但不含该 id 时继续向下找。Purpose:
     # 节点能删掉自己刚保存的 workspace 作用域记忆，无需显式传 scope。
-    _ws_name = str(getattr(ctx, "workspace_name", "") or "").strip()
+    _ws_name = ctx.workspace_name.strip()
     _book_names = [book]
     # 向后兼容：旧版 save_memory 在未显式传 book 时曾以 _ns_memory_book 作为书名
     if not _explicit_book and _ns_memory_book and _ns_memory_book not in _book_names:

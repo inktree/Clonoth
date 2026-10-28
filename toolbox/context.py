@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,10 @@ class ToolContext:
     # merged into the matching ToolCallCard.
     tool_call_id: str = ""
     node_id: str = ""
+    node_extra: dict[str, Any] = field(default_factory=dict)
+    approved_guard_fps: set[str] = field(default_factory=set)
+    async_tool_id: str = ""
+    caller_node_id: str = ""
     # [AutoC 2026-08-10] Session-level working directory for file/command tools.
     # Why: workspace_root is the Clonoth install dir (config, data, nodes);
     # workspace is the project dir the AI operates on (cwd, path resolution).
@@ -75,7 +79,7 @@ class ToolContext:
                 # at runtime. Purpose: the supervisor can attach approval state to
                 # the active tool card while preserving legacy empty values.
                 "tool_call_id": self.tool_call_id or "",
-                "node_id": self.node_id or getattr(self, "_node_id", "") or "",
+                "node_id": self.node_id,
                 "task_id": self.task_id or "",
                 "workspace": str(self.workspace) if self.workspace else None,
             },

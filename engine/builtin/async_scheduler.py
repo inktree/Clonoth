@@ -99,10 +99,7 @@ class AsyncScheduler:
             snapshot = _snapshot_tool_context(tool_ctx)
             # [AutoC 2026-09-02] 异步工具级取消：快照携带 async_id，
             # execute_command 的轮询循环凭它查询取消登记表。
-            try:
-                snapshot._async_id = async_id
-            except AttributeError:
-                pass
+            snapshot.async_tool_id = async_id
             # [AutoC 2026-08-28] 声明式异步同样授权前置：先审批，获批后再
             # 宣称"已启动"。拒绝时同步返回错误结果，不出现占位。
             denied = await ls.registry.authorize(name=tool_name, arguments=tool_args, ctx=snapshot)
@@ -179,10 +176,7 @@ class AsyncScheduler:
                 "task_id": rctx.task_id,
                 "upgraded_from": "sync_timeout",
             }
-            try:
-                exec_ctx._async_id = async_id
-            except AttributeError:
-                pass
+            exec_ctx.async_tool_id = async_id
             asyncio.create_task(
                 _deliver_started_async_task(
                     exec_task,

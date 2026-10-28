@@ -29,11 +29,11 @@ def _async_cancel_marked(ctx: ToolContext) -> bool:
     """检查当前 execute_command 调用是否被异步工具取消标记命中。
 
     [AutoC 2026-09-02] Why: 异步托管后 supervisor 的 task 级取消检查已不适用，
-    取消意图挂在 async_id 上。How: 通过 ToolContext 快照携带的 _async_id 属性
+    取消意图挂在 async_id 上。How: 通过 ToolContext 快照携带的 async_tool_id 属性
     查询 engine 的取消登记表；engine 进程外（或标记缺失）一律返回 False。
     Purpose: execute_command 的 0.2s 轮询循环同时感知 task 级取消与异步工具级取消。
     """
-    async_id = getattr(ctx, "_async_id", "")
+    async_id = ctx.async_tool_id
     if not async_id:
         return False
     try:

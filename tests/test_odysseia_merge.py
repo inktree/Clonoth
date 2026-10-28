@@ -366,8 +366,8 @@ def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path
     ctx = SimpleNamespace(
         workspace_root=tmp_path,
         node_id="main",
-        _caller_node_id="system.memory_extractor",
-        _node_extra={},
+        caller_node_id="system.memory_extractor",
+        node_extra={},
         workspace_name="",
     )
     long_text = "A" * 600
@@ -674,3 +674,45 @@ def test_list_dir_reports_directory_read_errors(tmp_path, monkeypatch, recursive
     assert section["success"] is False
     assert "directory unreadable" in section["error"]
     assert section["entries"] == []
+
+
+def test_tool_context_snapshot_carries_approval_without_leaking_between_calls(tmp_path):
+    from engine.inference.async_tools import _snapshot_tool_context
+    from toolbox._common import request_guard
+    from toolbox.context import ToolContext
+
+    requested_ops = []
+
+    def respond(request):
+        if request.method == "POST":
+            requested_ops.append(request.url.path)
+            return httpx.Response(200, json={"safety_level": "allow"})
+        return httpx.Response(200, json={"cancelled": False})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            ctx = ToolContext(
+                supervisor_url="http://supervisor", session_id="session", run_id="run",
+                worker_id="worker", workspace_root=tmp_path, http=http, registry=None,
+                node_id="memory_target", caller_node_id="system.dream",
+                node_extra={"memory_book": "book"}, async_tool_id="async-1",
+            )
+            preflight = _snapshot_tool_context(ctx)
+            _, error = await request_guard(preflight, "execute_command", {"command": "echo ready"})
+            assert error is None
+            background = _snapshot_tool_context(preflight)
+            assert (background.node_id, background.caller_node_id, background.async_tool_id) == (
+                "memory_target", "system.dream", "async-1",
+            )
+            assert background.node_extra == {"memory_book": "book"}
+            _, error = await request_guard(background, "execute_command", {"command": "echo ready"})
+            assert error is None
+            assert requested_ops == ["/v1/ops/request"]
+            background.approved_guard_fps.clear()
+            assert preflight.approved_guard_fps
+            assert not ctx.approved_guard_fps
+            _, error = await request_guard(ctx, "execute_command", {"command": "echo ready"})
+            assert error is None
+            assert requested_ops == ["/v1/ops/request", "/v1/ops/request"]
+
+    asyncio.run(run())

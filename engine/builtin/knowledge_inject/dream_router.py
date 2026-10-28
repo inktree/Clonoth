@@ -107,14 +107,12 @@ class DreamMemoryRouter(Handler):
             return None
 
         # Rewrite ToolContext to redirect the write, preserving original caller node_id
-        old_node_id = getattr(tool_ctx, "_node_id", "") or getattr(tool_ctx, "node_id", "")
-        tool_ctx._caller_node_id = node_id  # type: ignore[attr-defined]
-        tool_ctx._node_id = target_ns  # type: ignore[attr-defined]
+        old_node_id = tool_ctx.node_id
+        tool_ctx.caller_node_id = node_id
         tool_ctx.node_id = target_ns
 
-        # Clear _node_extra memory_book so _effective_memory_ns falls back to _node_id
-        if hasattr(tool_ctx, "_node_extra"):
-            tool_ctx._node_extra = {}  # type: ignore[attr-defined]
+        # Clear memory_book so namespace resolution uses the redirected node_id.
+        tool_ctx.node_extra = {}
 
         # Dream consolidates writes into the source namespace, not a temporary workspace.
         if node_id == "system.dream" and tool_name == "save_memory":

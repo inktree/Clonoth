@@ -290,7 +290,7 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
             if n is None or n.type != "ai" or n.id in entries:
                 continue
             # Exclude system nodes, one-way nodes and explicit switchable: false nodes.
-            _ctl = getattr(n, "control_tools", "all")
+            _ctl = n.control_tools
             _can_switch_back = _ctl in (None, "all") or (isinstance(_ctl, (list, set, tuple)) and "switch_node" in _ctl)
             entries[n.id] = {
                 "id": n.id,
@@ -403,9 +403,9 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
-    if getattr(msg, "created_at", "") and not _meta.get("timestamp"):
+    if msg.created_at and not _meta.get("timestamp"):
         _meta["timestamp"] = msg.created_at
-    if getattr(msg, "message_type", ""):
+    if msg.message_type:
         d["message_type"] = msg.message_type
         _meta.setdefault("message_type", msg.message_type)
     if _meta:
@@ -415,9 +415,9 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # [2026-05-01] 恢复 true native role=tool 消息的配对字段。
     # 怎么改：ConversationStore.Message 新增 tool_call_id/name，这里转回 history dict。
     # 目的：build_llm_messages 在 native 模式下能原样透传 role=tool + tool_call_id。
-    if getattr(msg, "tool_call_id", ""):
+    if msg.tool_call_id:
         d["tool_call_id"] = msg.tool_call_id
-    if getattr(msg, "name", ""):
+    if msg.name:
         d["name"] = msg.name
     return d
 
@@ -950,11 +950,10 @@ async def _run_node_task(
         if _ws_p and _ws_p.is_dir():
             rctx.workspace = _ws_p
     # Phase 1 (Session Conversation Store): 创建 ConversationStore 实例并挂载到 rctx。
-    # ai_step 中的 _shadow_write 通过 getattr(ls.rctx, 'conversation_store', None) 访问。
-    # RunContext 是非 frozen dataclass，允许动态添加属性。
+    # ai_step 中的 _shadow_write 通过 RunContext 的正式 conversation_store 字段访问。
     # 数据目录: data/conversations/{session_id}.jsonl
     _conv_store = ConversationStore(ws_root / "data" / "conversations")
-    rctx.conversation_store = _conv_store  # type: ignore[attr-defined]
+    rctx.conversation_store = _conv_store
 
     history = []
     resume_data_raw = input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None
@@ -1110,7 +1109,7 @@ async def _run_node_task(
         global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
         if not isinstance(global_provider_options, dict):
             global_provider_options = {}
-        node_provider_options = getattr(node, "provider_options", {}) or {}
+        node_provider_options = node.provider_options or {}
         if not isinstance(node_provider_options, dict):
             node_provider_options = {}
         _po = _merge_provider_options(global_provider_options, node_provider_options)
@@ -1121,7 +1120,7 @@ async def _run_node_task(
         if input_data.get("_system_task") or str(node.id).startswith("system."):
             _sticky_sid = f"node:{node.id}"
         elif child_session_id:
-            if getattr(node, "persistent", False) or _ctx_mode_for_sticky == "accumulate":
+            if node.persistent or _ctx_mode_for_sticky == "accumulate":
                 _base_parent_sid = parent_session_id or session_id
                 _ckey_sticky = str(input_data.get("_context_key") or "").strip()
                 _sticky_sid = (
@@ -1385,7 +1384,7 @@ async def _run_node_task(
         "tool_call_log": list(rctx.tool_call_log),
         "total_usage": dict(rctx.total_usage) if rctx.total_usage else {},
     }
-    if getattr(rctx, "current_llm_request_id", "") and not _result.get("llm_request_id"):
+    if rctx.current_llm_request_id and not _result.get("llm_request_id"):
         # [AutoC 2026-06-04] Why: some TaskAction producers are hooks rather than
         # pseudo handlers, but they still end the current provider request. How: fill
         # the task result from RunContext when the action did not set it itself.

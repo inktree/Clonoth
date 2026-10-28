@@ -69,7 +69,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if not conv_key:
         # [2026-05-25] Auto-inherit from ToolContext (populated by supervisor
         # task_context → engine RunContext → ToolContext, zero I/O overhead).
-        conv_key = str(getattr(ctx, "conversation_key", "") or "").strip()
+        conv_key = ctx.conversation_key.strip()
     if not conv_key:
         conv_key = f"scheduler:{sid}"
     entry_node_id = str(args.get("entry_node_id") if args.get("entry_node_id") is not None else prev.get("entry_node_id") or "").strip()

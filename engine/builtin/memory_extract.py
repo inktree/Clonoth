@@ -99,11 +99,11 @@ class MemoryExtractHandler:
         # turns. How: keep the old action/kind/system-task gates using only task
         # values. Purpose: prevent child tasks or internal system tasks from
         # recursively triggering extraction.
-        act = str((getattr(task, "result", None) or {}).get("action") or "").strip()
+        act = str((task.result or {}).get("action") or "").strip()
         if act != "finish" or not _task_kind_is_node(task):
-            log.debug("memory_extract gate: blocked by action=%s kind=%s", act, getattr(task, "kind", "?"))
+            log.debug("memory_extract gate: blocked by action=%s kind=%s", act, task.kind)
             return
-        task_input = getattr(task, "input", {}) or {}
+        task_input = task.input or {}
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
@@ -113,7 +113,7 @@ class MemoryExtractHandler:
         # with valuable context worth extracting. How: check dispatch_context_mode
         # from task input — only skip fresh children. Purpose: enable memory
         # extraction for persistent sub-agents while still filtering throwaway tasks.
-        caller_tid = getattr(task, "caller_task_id", None)
+        caller_tid = task.caller_task_id
         if caller_tid:
             ctx_mode = str(task_input.get("dispatch_context_mode") or "").strip()
             if ctx_mode == "fresh" or not ctx_mode:
@@ -125,11 +125,11 @@ class MemoryExtractHandler:
         # on_entry_task_complete hook passes the merged parent session in ctx["session_id"].
         # Only filter by task_id prefix (which is never 'branch_' for entry tasks);
         # do NOT filter by task.session_id — that would block all entry task extractions.
-        task_id_str = str(getattr(task, "task_id", "") or "")
+        task_id_str = str(task.task_id or "")
         if task_id_str.startswith("branch_"):
             log.debug("memory_extract gate: blocked by branch task_id=%s", task_id_str[:16])
             return
-        log.debug("memory_extract: entered gate check for task %s node=%s", task_id_str[:8], getattr(task, 'node_id', '?'))
+        log.debug("memory_extract: entered gate check for task %s node=%s", task_id_str[:8], task.node_id)
 
         workspace_root = ctx.get("workspace_root")
         if workspace_root is None:
@@ -138,23 +138,23 @@ class MemoryExtractHandler:
         workspace_root = Path(workspace_root)
         runtime_cfg = load_runtime_config(workspace_root)
         entry_node_id = get_entry_node_id(runtime_cfg)
-        if getattr(task, "node_id", None) != entry_node_id:
-            log.debug("memory_extract gate: node_id=%s != entry_node_id=%s", getattr(task, "node_id", None), entry_node_id)
+        if task.node_id != entry_node_id:
+            log.debug("memory_extract gate: node_id=%s != entry_node_id=%s", task.node_id, entry_node_id)
             return
         if not get_bool(runtime_cfg, "memory.auto_extract.enabled", False):
             log.debug("memory_extract gate: auto_extract disabled")
             return
         log.debug(
             "memory_extract: passed gates for task %s runtime_session=%s route_session=%s",
-            str(getattr(task, "task_id", "?") or "?")[:8],
-            getattr(task, "session_id", "?"),
+            str(task.task_id or "?")[:8],
+            task.session_id,
             ctx.get("session_id"),
         )
 
         # Why: a task that explicitly saved memory has already handled the turn.
         # How: preserve the old save_memory tool-name mutual exclusion. Purpose:
         # avoid duplicate memory entries from automatic extraction.
-        tool_names = (getattr(task, "result", None) or {}).get("_tool_names") or []
+        tool_names = (task.result or {}).get("_tool_names") or []
         if "save_memory" in tool_names:
             log.debug("memory_extract TRACE: BLOCKED by save_memory in tool_names")
             return
@@ -165,11 +165,11 @@ class MemoryExtractHandler:
         # fall back to the task runtime session for legacy/non-branch tasks.
         # Purpose: pending task ids and transcript extraction read durable parent
         # history rather than the temporary branch name after merge.
-        session_id = str(ctx.get("session_id") or getattr(task, "session_id", "") or "").strip()
+        session_id = str(ctx.get("session_id") or task.session_id or "").strip()
         if not session_id:
             log.debug("memory_extract: skip, empty session_id")
             return
-        log.debug("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), getattr(task, 'session_id', '?'))
+        log.debug("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), task.session_id)
         # [2026-05-23] Why: entry-task completions remain monotonic within this
         # handler and are still useful for diagnostics. How: keep the historical
         # total task counter unchanged. Purpose: preserve observability while the
@@ -309,15 +309,15 @@ class MemoryExtractHandler:
         # [AutoC 2026-08-28] Capture the source node_id so the dream_router
         # hook can redirect save_memory writes to the correct namespace.
         _entry_nid = get_entry_node_id(runtime_cfg)
-        source_node_id = str(getattr(task, "node_id", "") or "").strip() or _entry_nid
+        source_node_id = str(task.node_id or "").strip() or _entry_nid
         return {
             "session_id": session_id,
-            "session_generation": int(getattr(task, "session_generation", 0) or 0),
+            "session_generation": int(task.session_generation or 0),
             "transcript": transcript,
             "task_count": task_count,
             "pending_task_ids": pending_task_ids,
             "extractor_node": extractor_node,
-            "kind": getattr(task, "kind", "node"),
+            "kind": task.kind,
             "_source_node_id": source_node_id,
         }
 
@@ -443,14 +443,8 @@ class MemoryExtractHandler:
 
 
 def _task_kind_is_node(task: Any) -> bool:
-    """Return whether a task is a node task without depending on task enums."""
-    # Why: importing the supervisor task enum would recreate the cycle this move is
-    # meant to remove. How: compare the enum value when present, otherwise compare
-    # the plain string. Purpose: keep the gate compatible with real tasks and
-    # lightweight tests.
-    kind = getattr(task, "kind", "")
-    value = getattr(kind, "value", kind)
-    return str(value) == "node"
+    """TaskKind is a string enum, so no supervisor enum import is needed."""
+    return task.kind == "node"
 
 
 def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 12000) -> str:
@@ -469,10 +463,10 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
             message_type = str(msg.get("message_type") or msg.get("type") or "")
             name = str(msg.get("name") or "")
         else:
-            role = str(getattr(msg, "role", "") or "")
-            content = getattr(msg, "content", "")
-            message_type = str(getattr(msg, "message_type", "") or "")
-            name = str(getattr(msg, "name", "") or "")
+            role = str(msg.role or "")
+            content = msg.content
+            message_type = str(msg.message_type or "")
+            name = str(msg.name or "")
         if role == "system":
             continue
         if isinstance(content, list):

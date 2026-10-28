@@ -74,7 +74,7 @@ def _emit_pseudo_tool_result(
             tool_msg.setdefault("tool_call_id", _parsed.id)
         tool_msg.setdefault("name", control_tool_name)
     set_message_meta(tool_msg, MessageMeta(
-        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+        tool_mode=ls.node.tool_mode,
         message_type="tool_result",
         control_tool_name=control_tool_name,
         control_tool_status=control_tool_status,
@@ -193,7 +193,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             _tool_start_payload["attachments"] = list(final_atts)
         await ls.rctx.emit_event("tool_call_start", _tool_start_payload)
         _tool_meta_patch: dict[str, Any] = {
-            "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
+            "llm_request_id": ls.rctx.current_llm_request_id,
             "tool_result_raw_inline": "ok",
             "tool_result_format": "text",
         }
@@ -212,14 +212,14 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             node_id=ls.node.id,
             result=result_payload,
             context_ref=ctx_ref,
-            llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+            llm_request_id=ls.rctx.current_llm_request_id,
         )
 
     # switch_node 也需要 ctx_ref，单独计算
     if pseudo_call.name == "switch_node":
         switch_atts = list(ls.tool_produced_attachments)
         _emit_pseudo_tool_result(ls, pseudo_call, "ok", meta_patch={
-            "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
+            "llm_request_id": ls.rctx.current_llm_request_id,
             "attachments": switch_atts,
             "tool_result_attachments": switch_atts,
             "tool_result_raw_inline": "ok",
@@ -228,7 +228,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
-        route_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
+        route_session_id = ls.rctx.parent_session_id or ls.rctx.session_id
         try:
             await ls.rctx.http.post(
                 f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/switch_node",
@@ -247,7 +247,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 "attachments": switch_atts,
             },
             context_ref=ctx_ref,
-            llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
+            llm_request_id=ls.rctx.current_llm_request_id,
         )
 
     return None  # 未知伪工具，按非终止处理
@@ -264,9 +264,9 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
         pass
 
     target_session_id = str(
-        getattr(ls.rctx, "child_session_id", "")
-        or getattr(ls.rctx, "parent_session_id", "")
-        or getattr(ls.rctx, "session_id", "")
+        ls.rctx.child_session_id
+        or ls.rctx.parent_session_id
+        or ls.rctx.session_id
         or ""
     ).strip()
 
@@ -440,29 +440,30 @@ async def _resolve_child_target_with_fallback(
     tasks: list[dict[str, Any]],
     requested: str,
 ) -> tuple[str, str]:
-    """Resolve target via active child list first, then fallback to supervisor by-node lookup."""
+    """Resolve via active children, then supervisor by-node endpoints."""
     needle = str(requested or "").strip()
     if not needle:
         return "", "target is required"
     task_id, err = _resolve_active_child_task_id(tasks, needle)
     if task_id or err.startswith("ambiguous"):
         return task_id, err
-    # Fallback to supervisor by-node endpoints when needle looks like a node_id
-    if not _looks_like_task_id(needle) and hasattr(ls, "rctx") and hasattr(ls.rctx, "http"):
-        get_fn = getattr(ls.rctx.http, "get", None)
-        if callable(get_fn):
-            route_sid = getattr(ls.rctx, "parent_session_id", "") or getattr(ls.rctx, "session_id", "")
-            node_resp = await get_fn(f"{ls.rctx.supervisor_url}/v1/sessions/{route_sid}/tasks/by-node/{needle}")
-            if node_resp.status_code == 200:
-                tid = str((node_resp.json() or {}).get("task_id") or "").strip()
+    if not _looks_like_task_id(needle):
+        route_sid = ls.rctx.parent_session_id or ls.rctx.session_id
+        node_resp = await ls.rctx.http.get(
+            f"{ls.rctx.supervisor_url}/v1/sessions/{route_sid}/tasks/by-node/{needle}"
+        )
+        if node_resp.status_code == 200:
+            tid = str((node_resp.json() or {}).get("task_id") or "").strip()
+            if tid:
+                return tid, ""
+        elif node_resp.status_code == 404:
+            glob_resp = await ls.rctx.http.get(
+                f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{needle}"
+            )
+            if glob_resp.status_code == 200:
+                tid = str((glob_resp.json() or {}).get("task_id") or "").strip()
                 if tid:
                     return tid, ""
-            elif node_resp.status_code == 404:
-                glob_resp = await get_fn(f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{needle}")
-                if glob_resp.status_code == 200:
-                    tid = str((glob_resp.json() or {}).get("task_id") or "").strip()
-                    if tid:
-                        return tid, ""
     return "", err
 
 
@@ -484,17 +485,13 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
     """List, message, gracefully preempt, or cancel active child agents in the routed session."""
     action = str(args.get("action") or "").strip()
     route_session_id = str(
-        getattr(ls.rctx, "parent_session_id", "")
-        or getattr(ls.rctx, "session_id", "")
+        ls.rctx.parent_session_id
+        or ls.rctx.session_id
         or ""
     ).strip()
 
     async def _active_tasks() -> list[dict[str, Any]]:
-        discover = getattr(ls.rctx, "list_active_child_tasks", None)
-        if not callable(discover):
-            return []
-        result = await discover()
-        return [dict(item) for item in result if isinstance(item, dict)] if isinstance(result, list) else []
+        return await ls.rctx.list_active_child_tasks()
 
     if action == "list":
         try:
@@ -567,7 +564,7 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
         try:
             if explicit_node_id and not requested_target:
                 params = {
-                    "exclude_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+                    "exclude_task_id": str(ls.rctx.task_id or ""),
                     "node_id": explicit_node_id,
                 }
                 response = await ls.rctx.http.post(
@@ -583,7 +580,7 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
                     # If target is a node_id and no active tasks matched locally, allow session-level cancel by node_id
                     if not _looks_like_task_id(requested_target) and not tasks:
                         params = {
-                            "exclude_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+                            "exclude_task_id": str(ls.rctx.task_id or ""),
                             "node_id": requested_target,
                         }
                         response = await ls.rctx.http.post(
@@ -607,7 +604,7 @@ async def _handle_manage_workers(ls: _LoopState, args: dict, pseudo_call) -> Non
             else:
                 response = await ls.rctx.http.post(
                     f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
-                    params={"exclude_task_id": str(getattr(ls.rctx, "task_id", "") or "")},
+                    params={"exclude_task_id": str(ls.rctx.task_id or "")},
                     timeout=10.0,
                 )
                 cancelled = "all"
@@ -687,11 +684,11 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     if not is_ephemeral_worker and ctx_mode != "accumulate" and _raw_ctx_mode is None:
         from ..node import load_node as _load_node
         _target_node = _load_node(Path(ls.rctx.workspace_root), target)
-        if _target_node is not None and getattr(_target_node, "persistent", False):
+        if _target_node is not None and _target_node.persistent:
             ctx_mode = "accumulate"
 
-    parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
-    task_ctx = getattr(ls.rctx, "task_context", None) or {}
+    parent_session_id = ls.rctx.parent_session_id or ls.rctx.session_id
+    task_ctx = ls.rctx.task_context or {}
     parent_conv_key = str(
         task_ctx.get("route_conversation_key")
         or task_ctx.get("conversation_key")
@@ -707,11 +704,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             conv_key = f"agent:{target_node_id}:{ctx_key}:{parent_conv_key}"
         else:
             conv_key = f"agent:{target_node_id}:{parent_conv_key}"
-        _seen_conv = getattr(ls, "_step_dispatch_conv_keys", None)
-        if _seen_conv is None:
-            _seen_conv = {}
-            setattr(ls, "_step_dispatch_conv_keys", _seen_conv)
-        _step_tag = f"{getattr(ls.rctx, 'current_llm_request_id', '')}:{conv_key}"
+        _seen_conv = ls._step_dispatch_conv_keys
+        _step_tag = f"{ls.rctx.current_llm_request_id}:{conv_key}"
         _cnt = _seen_conv.get(_step_tag, 0) + 1
         _seen_conv[_step_tag] = _cnt
         if _cnt > 1:
@@ -720,7 +714,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     dispatch_origin: dict[str, Any] = {
         "parent_session_id": parent_session_id,
         "caller_node_id": ls.node.id,
-        "origin_task_id": str(getattr(ls.rctx, "task_id", "") or ""),
+        "origin_task_id": str(ls.rctx.task_id or ""),
         "parent_conversation_key": parent_conv_key,
         "context_mode": ctx_mode,
     }
@@ -729,7 +723,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     # exact cache-warmed prefix (system prompt + static blocks + history + tools + sticky_session_id)
     # so the child worker hits 100% of the parent session's upstream KV cache!
     if ctx_mode == "fork" and is_ephemeral_worker and target == "_worker":
-        parent_sticky_sid = str(getattr(ls.rctx, "sticky_session_id", "") or parent_session_id or "").strip()
+        parent_sticky_sid = str(ls.rctx.sticky_session_id or parent_session_id or "").strip()
         if parent_sticky_sid:
             dispatch_origin["parent_sticky_session_id"] = parent_sticky_sid
         prefix_msgs = _extract_cache_warm_fork_prefix(ls)
@@ -740,7 +734,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             snap_path = snap_dir / snap_name
             snap_payload = {
                 "messages": prefix_msgs,
-                "openai_tools": copy.deepcopy(getattr(ls, "openai_tools", None) or []),
+                "openai_tools": copy.deepcopy(ls.openai_tools or []),
                 "sticky_session_id": parent_sticky_sid,
             }
             snap_path.write_text(json.dumps(snap_payload, ensure_ascii=False), encoding="utf-8")
@@ -757,7 +751,7 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "dispatch_context_mode": ctx_mode,
     }
     if ctx_mode == "fork":
-        inbound_payload["dispatch_fork_from_session"] = getattr(ls.rctx, "session_id", "") or parent_session_id
+        inbound_payload["dispatch_fork_from_session"] = ls.rctx.session_id or parent_session_id
 
     _call_id = getattr(pseudo_call, "id", "") or ""
     _call_args = dict(pseudo_call.arguments or {})

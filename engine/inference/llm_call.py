@@ -154,10 +154,11 @@ async def call_provider_once(ls: _LoopState, step: int, provider: Any, *, messag
     provider or exposing private loop state to the plugin. No recursive hooks:
     after_llm_call is fired only by the outer inference loop.
     """
-    call = replace(ls, provider=provider, messages=ls.messages if messages is None else messages,
-                   use_stream=False, retry_max=0)
     # A replacement call does not start another reactive-compaction attempt.
-    call._reactive_compact_done = True
+    call = replace(
+        ls, provider=provider, messages=ls.messages if messages is None else messages,
+        use_stream=False, retry_max=0, _reactive_compact_done=True,
+    )
     try:
         return await _call_llm_with_retry(call, step)
     finally:
@@ -231,6 +232,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     _bus.emit(Signal(name="llm.call.start", payload=_sig_payload, span_id=_span_id))
 
     while True:
+        ls._reasoning_started_iso = None
+        ls._reasoning_ended_iso = None
         # [AutoC 2026-06-04] Why: retries and multi-step tasks can issue several
         # provider requests under one task id. How: create a fresh request id at the
         # start of each actual provider call attempt, before any stream delta can be
@@ -490,7 +493,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 or "maximum context" in _err_text
                 or "token limit" in _err_text
             )
-            if _is_too_long and not getattr(ls, '_reactive_compact_done', False):
+            if _is_too_long and not ls._reactive_compact_done:
                 ls._reactive_compact_done = True  # 只尝试一次
                 # 从尾部往前找 tool_result，保留最近 3 个，清除其余
                 from engine.compact import microcompact_messages

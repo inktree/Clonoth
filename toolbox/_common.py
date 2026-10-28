@@ -156,7 +156,7 @@ async def request_guard(
     # scheduler snapshots before pre-flight), so fingerprints cannot leak
     # across calls. Purpose: one approval per exact guarded operation, with the
     # wait happening outside any execution timer.
-    if _guard_fingerprint(op, parameters) in (getattr(ctx, "_approved_guard_fps", None) or ()):
+    if _guard_fingerprint(op, parameters) in ctx.approved_guard_fps:
         return {}, None
     op_res = await ctx.request_op(op, parameters)
     safety_level = str(op_res.get("safety_level") or "")
@@ -178,14 +178,7 @@ async def request_guard(
     if await ctx.check_cancelled():
         return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}
 
-    try:
-        approved = getattr(ctx, "_approved_guard_fps", None)
-        if not isinstance(approved, set):
-            approved = set()
-            setattr(ctx, "_approved_guard_fps", approved)
-        approved.add(_guard_fingerprint(op, parameters))
-    except Exception:
-        pass
+    ctx.approved_guard_fps.add(_guard_fingerprint(op, parameters))
 
     return op_res, None
 

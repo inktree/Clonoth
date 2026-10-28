@@ -279,7 +279,7 @@ def _is_audio_attachment(attachment: dict[str, Any]) -> bool:
 
 def _delete_audio_file_quietly(rt: Any, path: Path | None) -> None:
     """按配置删除临时音频文件。失败只记日志，不影响主流程。"""
-    if not path or not getattr(rt, "discord_delete_audio_after_use", True):
+    if not path or not rt.discord_delete_audio_after_use:
         return
     try:
         if path.exists() and path.is_file():
@@ -293,7 +293,7 @@ async def _transcribe_discord_audio_attachments(
     attachments: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str], bool]:
     """把 Discord 音频附件转写为文本，并从入站附件中移除已转写音频。"""
-    if not attachments or not getattr(rt, "discord_voice_input", True):
+    if not attachments or not rt.discord_voice_input:
         return attachments, [], False
 
     kept: list[dict[str, Any]] = []
@@ -360,7 +360,7 @@ def _compose_discord_user_text(raw_text: str, transcripts: list[str], had_audio:
 
 def append_discord_reply_modality_hint(rt: Any, inbound_text: str, input_modality: str, is_dm: bool) -> str:
     """按运行配置给模型加入 Discord TTS 协议提示。"""
-    if not getattr(rt, "discord_voice_reply", True):
+    if not rt.discord_voice_reply:
         return inbound_text
     protocol = (
         "Discord 适配器已接入语音合成；这不是需要调用或搜索的模型工具。"
@@ -371,7 +371,7 @@ def append_discord_reply_modality_hint(rt: Any, inbound_text: str, input_modalit
         "每个 TTS 段都可以独立选择；适配器会原样传给合成后端，不会用语言检测覆盖明确选择。"
         "正常文字必须包含完整回复，TTS 只能作为附加语音；不要发送纯 TTS。"
     )
-    if input_modality == "voice" and getattr(rt, "discord_voice_reply_on_voice_input", True):
+    if input_modality == "voice" and rt.discord_voice_reply_on_voice_input:
         hint = (
             "【Discord 回复方式提示】\n"
             f"{protocol}本轮用户通过 Discord 语音消息发来请求，请优先附加简短、自然的语音版本。"
@@ -404,9 +404,9 @@ def _fallback_spoken_text(display_text: str) -> str:
 
 def _discord_voice_reply_allowed(rt: Any, input_modality: str, has_tts_segments: bool) -> bool:
     """根据配置和输入方式判断是否发送 Discord 语音回复。"""
-    if not getattr(rt, "discord_voice_reply", True):
+    if not rt.discord_voice_reply:
         return False
-    if input_modality == "voice" and getattr(rt, "discord_voice_reply_on_voice_input", True):
+    if input_modality == "voice" and rt.discord_voice_reply_on_voice_input:
         return True
     return bool(has_tts_segments)
 
@@ -419,13 +419,13 @@ async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation
     body: dict[str, Any] = {
         "text": spoken,
         "conversation_key": conversation_key or "discord_audio",
-        "format": getattr(rt, "discord_tts_format", "wav") or "wav",
+        "format": rt.discord_tts_format or "wav",
     }
     # Segment parameters are authoritative. Runtime values are only fallbacks.
-    backend = (segment.get("backend") or getattr(rt, "discord_tts_backend", "") or "").strip().lower()
+    backend = (segment.get("backend") or rt.discord_tts_backend or "").strip().lower()
     preset = (segment.get("preset") or "").strip().lower()
-    voice = (segment.get("voice") or getattr(rt, "discord_tts_voice", "") or "").strip()
-    instruction = (segment.get("instruction") or getattr(rt, "discord_tts_instruction", "") or "").strip()
+    voice = (segment.get("voice") or rt.discord_tts_voice or "").strip()
+    instruction = (segment.get("instruction") or rt.discord_tts_instruction or "").strip()
     if backend in TTS_BACKENDS:
         body["backend"] = backend
     if preset in TTS_PRESETS:

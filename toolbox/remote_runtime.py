@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from .context import ToolContext
+
 # Module-level httpx client for connection pooling across remote tool calls.
 _http_client: httpx.AsyncClient | None = None
 
@@ -86,26 +88,14 @@ async def list_remote_tools(supervisor_url: str) -> list[dict[str, Any]]:
     return [dict(item) for item in tools if isinstance(item, dict)] if isinstance(tools, list) else []
 
 
-def _context_payload(ctx: Any) -> dict[str, Any]:
-    # [AutoC 2026-08-01] Pass routing metadata to the remote broker. Why: Supervisor
-    # uses session/conversation identity for stateful worker affinity and logs remote
-    # calls beside the originating task. How: read the same attributes carried by
-    # ToolContext. Purpose: computer-use tools keep screenshot/click affinity per
-    # visible conversation.
-    route_session_id = ""
-    route_method = getattr(ctx, "route_session_id", None)
-    if callable(route_method):
-        try:
-            route_session_id = str(route_method() or "").strip()
-        except Exception:
-            route_session_id = ""
+def _context_payload(ctx: ToolContext) -> dict[str, Any]:
     return {
-        "session_id": route_session_id or str(getattr(ctx, "session_id", "") or ""),
-        "task_id": str(getattr(ctx, "task_id", "") or getattr(ctx, "run_id", "") or ""),
-        "tool_call_id": str(getattr(ctx, "tool_call_id", "") or ""),
-        "node_id": str(getattr(ctx, "node_id", "") or getattr(ctx, "_node_id", "") or ""),
-        "conversation_key": str(getattr(ctx, "conversation_key", "") or ""),
-        "worker_id": str(getattr(ctx, "worker_id", "") or ""),
+        "session_id": ctx.route_session_id(),
+        "task_id": ctx.task_id or ctx.run_id,
+        "tool_call_id": ctx.tool_call_id,
+        "node_id": ctx.node_id,
+        "conversation_key": ctx.conversation_key,
+        "worker_id": ctx.worker_id,
     }
 
 
@@ -154,7 +144,7 @@ async def call_remote_tool(ctx: Any, registered_name: str, args: dict[str, Any],
 
     while True:
         try:
-            if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
+            if await ctx.check_cancelled():
                 await _cancel_remote_call(http, base_url, call_id, "task cancelled")
                 return _result(False, "ERROR: remote tool cancelled", error="remote tool cancelled", cancelled=True, call_id=call_id)
         except Exception:
