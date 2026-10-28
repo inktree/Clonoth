@@ -9,7 +9,6 @@ Phase 2 (2026-04-17): 初始创建，将 bot_adapter.py 中散落的全局 dict 
   _child_task_logs         → SessionState.child_task_states (dict[str, ChildTaskState])
   _conversation_sessions   → SessionState.conversation_sessions
   session_conv_map         → SessionState.session_conv_map
-  _pending_watermarks      → SessionState.pending_watermarks
   _last_ctx_seq            → SessionState.last_ctx_seq
 
 不纳入的状态：
@@ -73,14 +72,6 @@ class TriggerInfo:
         对应 bot_adapter.py 中多处 trigger["created_at"] = time.time()。
         """
         self.created_at = time.time()
-
-    def is_stale(self, timeout: float = 600.0) -> bool:
-        """判断 trigger 是否已超时（默认 600 秒 = 10 分钟）。
-
-        对应 bot_adapter.py L1252：
-          _now - info["created_at"] > 600
-        """
-        return time.time() - self.created_at > timeout
 
 
 @dataclass
@@ -176,19 +167,8 @@ class SessionState:
         self.child_task_states: dict[str, ChildTaskState] = {}
 
         # ---- watermark 管理 ----
-        # 对应 _pending_watermarks: dict[int, tuple[int, int]]  (inbound_seq → (channel_id, wm_seq), L251)
-        self.pending_watermarks: dict[int, tuple[int, int]] = {}
         # 对应 _last_ctx_seq: dict[int, int]  (channel_id → high watermark seq, L250)
         self.last_ctx_seq: dict[int, int] = {}
-        # [AutoC 2026-08-30] 先到确认缓冲。Why: supervisor 在 /v1/inbound 请求
-        # 处理内同步广播 inbound_accepted（WS 队列 put_nowait），Bot 的 WS 读
-        # 循环可能在 POST 响应返回（register_watermark 执行）之前消费该事件，
-        # 导致 accept 找不到 pending key、水位永不推进（生产实测 2300+ 条
-        # pending 堆积）。How: accept 未命中时记入此集合；register 时若 seq 已
-        # 确认则立即推进水位。Purpose: 消除时序竞争，两个方向谁先谁后都正确。
-        self.accepted_unmatched: dict[int, None] = {}
-        self._ACCEPTED_UNMATCHED_CAP = 512
-        self._PENDING_WATERMARKS_CAP = 2048
 
         # ---- DM 频道映射 ----
         # trigger 消费后子节点仍能找到 DM 频道
@@ -315,7 +295,7 @@ class SessionState:
                              if _now - info["created_at"] > 600]
           for seq in _stale_triggers: ...
 
-        同时清理关联的 pending_watermarks 和 main_task_states。
+        同时清理关联的 main_task_states。
         调用方负责处理平台侧清理（edit status_msg、delete log_msg 等），
         可遍历返回的列表和对应的 MainTaskState（通过 platform_data）操作。
         """
@@ -327,7 +307,6 @@ class SessionState:
         stale_triggers: list[TriggerInfo] = []
         for seq in stale_seqs:
             trigger = self.triggers.pop(seq)
-            self.pending_watermarks.pop(seq, None)
             # 把关联的 MainTaskState 附带在 trigger 的 platform_data 中，
             # 供调用方执行平台侧清理（如删除 log_msg）
             main_state = self.main_task_states.pop(seq, None)
@@ -335,27 +314,6 @@ class SessionState:
                 trigger.platform_data["_stale_main_state"] = main_state
             stale_triggers.append(trigger)
         return stale_triggers
-
-    def update_trigger_platform(
-        self, inbound_seq: int, **updates: Any,
-    ) -> TriggerInfo | None:
-        """更新 trigger 的 platform_data 字段。
-
-        对应 bot_adapter.py L918-919：
-          _trigger_messages[my_inbound_seq]["status_msg"] = status_msg
-        以及 preempt V2 中更新 trigger 的 message/status_msg（L833-836）。
-
-        Args:
-            inbound_seq: trigger 的 inbound_seq
-            **updates: 要更新/新增的 platform_data 键值对
-
-        Returns:
-            更新后的 TriggerInfo，不存在则返回 None。
-        """
-        trigger = self.triggers.get(inbound_seq)
-        if trigger is not None:
-            trigger.platform_data.update(updates)
-        return trigger
 
     # ================================================================
     #  MainTaskState 管理
@@ -420,91 +378,9 @@ class SessionState:
         """
         return self.child_task_states.pop(task_key, None)
 
-    def trim_child_states(self, max_count: int = 50) -> None:
-        """当子任务状态过多时，删除最旧的一半。
-
-        对应 bot_adapter.py L1688-1691 的大小限制清理：
-          if len(_child_task_logs) > 50:
-              _to_remove = list(_child_task_logs.keys())[:25]
-              for _k in _to_remove: del _child_task_logs[_k]
-        """
-        if len(self.child_task_states) > max_count:
-            keys_to_remove = list(self.child_task_states.keys())[: max_count // 2]
-            for key in keys_to_remove:
-                del self.child_task_states[key]
-
-    def find_child_states_by_session(
-        self, session_id: str,
-    ) -> list[tuple[str, ChildTaskState]]:
-        """查找属于指定 session 的所有子任务状态。
-
-        通过 task_key 后缀 ":{session_id}" 匹配（与 bot_adapter.py 的
-        task_key 生成规则一致：task_id 或 "{node_id}:{session_id}"）。
-
-        对应 bot_adapter.py task_preempted 事件处理 L1876 中的子节点清理。
-        """
-        suffix = f":{session_id}"
-        return [
-            (key, state)
-            for key, state in self.child_task_states.items()
-            if key.endswith(suffix)
-        ]
-
     # ================================================================
     #  Watermark 管理
     # ================================================================
-
-    def register_watermark(
-        self, inbound_seq: int, channel_id: int, watermark_seq: int,
-    ) -> None:
-        """注册待确认的水位标记。
-
-        对应 bot_adapter.py L882-883：
-          _pending_watermarks[my_inbound_seq] = (channel_id, _new_wm)
-
-        水位在 inbound_accepted 事件到达后才正式推进，防止 engine 未接受
-        消息时错误地认为历史已发送。
-
-        [AutoC 2026-08-30] 若该 seq 的 inbound_accepted 已经先到（WS 快于
-        POST 响应的时序竞争），立即推进水位而不再挂起。
-        """
-        if inbound_seq in self.accepted_unmatched:
-            del self.accepted_unmatched[inbound_seq]
-            self.last_ctx_seq[channel_id] = max(
-                self.last_ctx_seq.get(channel_id, -1), watermark_seq,
-            )
-            return
-        self.pending_watermarks[inbound_seq] = (channel_id, watermark_seq)
-        # 防御性上限：确认事件永久丢失时（engine 拒绝、连接中断窗口）避免
-        # 无界增长。超出时丢弃最旧的一半。
-        if len(self.pending_watermarks) > self._PENDING_WATERMARKS_CAP:
-            keys = list(self.pending_watermarks.keys())
-            for key in keys[: len(keys) // 2]:
-                del self.pending_watermarks[key]
-
-    def accept_watermark(self, inbound_seq: int) -> tuple[int, int] | None:
-        """确认水位标记并推进 last_ctx_seq 高水位。
-
-        对应 bot_adapter.py L1984-1989 inbound_accepted 事件处理：
-          _ia_ch_id, _ia_wm = _pending_watermarks.pop(_ia_seq)
-          _last_ctx_seq[_ia_ch_id] = max(_last_ctx_seq.get(..., -1), _ia_wm)
-
-        Returns:
-            成功推进时返回 (channel_id, new_watermark)，无待确认水位返回 None。
-        """
-        wm = self.pending_watermarks.pop(inbound_seq, None)
-        if wm is None:
-            # [AutoC 2026-08-30] 确认先于注册到达：记入缓冲，register_watermark
-            # 时会消费。缓冲定长 FIFO，防止未知 seq 无限堆积。
-            self.accepted_unmatched[inbound_seq] = None
-            while len(self.accepted_unmatched) > self._ACCEPTED_UNMATCHED_CAP:
-                self.accepted_unmatched.pop(next(iter(self.accepted_unmatched)))
-            return None
-        channel_id, watermark_seq = wm
-        self.last_ctx_seq[channel_id] = max(
-            self.last_ctx_seq.get(channel_id, -1), watermark_seq,
-        )
-        return channel_id, self.last_ctx_seq[channel_id]
 
     def reset_channel_watermark(self, channel_id: int) -> None:
         """重置频道的高水位（context_reset 时调用）。
@@ -593,7 +469,6 @@ class SessionState:
         for seq in stale_seqs:
             trigger = self.triggers.pop(seq)
             main_state = self.main_task_states.pop(seq, None)
-            self.pending_watermarks.pop(seq, None)
             if main_state is not None:
                 trigger.platform_data["_stale_main_state"] = main_state
             cleaned_triggers.append(trigger)

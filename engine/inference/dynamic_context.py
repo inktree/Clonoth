@@ -71,23 +71,3 @@ def _load_dynamic_context_vars(
             _dclog.warning("dynamic_context var %r eval failed: %s (expr=%r)", name, exc, expr)
             result[str(name)] = ""
     return result
-
-
-def _format_context_vars_block(vars_dict: dict[str, str]) -> str:
-    """Format dynamic context vars into a delimited block for per-step updates.
-
-    Returns a text block like:
-        [CONTEXT_VARS]
-        - beijing_time: 2026-04-13 08:22 CST
-        - context_utilization: 45%
-        [/CONTEXT_VARS]
-    """
-    if not vars_dict:
-        return ""
-    lines = []
-    for k, v in vars_dict.items():
-        if v:
-            lines.append(f"- {k}: {v}")
-    if not lines:
-        return ""
-    return "\n\n[CONTEXT_VARS]\n" + "\n".join(lines) + "\n[/CONTEXT_VARS]"

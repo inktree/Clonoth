@@ -403,7 +403,7 @@ def test_discord_context_identity_and_key_roles():
 def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolation(tmp_path, provider_name):
     from types import SimpleNamespace
     from engine.inference.llm_call import _build_messages_for_provider
-    from engine.inference.message_assembly import assemble_messages_with_injections
+    from engine.inference.message_assembly import assemble_initial_messages
     from engine.inference.tool_format import create_tool_formatter
     from engine.node import Node
     from engine.prompt import assemble_prompt
@@ -426,15 +426,12 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     assert "hello # %%DYNAMIC%% world" in prompt_msgs[1]["content"]
 
     # Scheme C: history -> instruction -> dynamic; tool steps only append afterward.
-    str_msgs, is_block = assemble_messages_with_injections(
-        system_prompt=prompt_msgs,
-        skill_static=[],
-        skill_dynamic=[],
-        memory_static=[],
-        memory_dynamic=[],
-        history=[{"role": "user", "content": "prev_q"}, {"role": "assistant", "content": "prev_a"}],
-        instruction="turn1_q",
+    str_msgs, is_block, _ = assemble_initial_messages(
         workspace_root=tmp_path,
+        runtime_cfg={},
+        node=node,
+        instruction="turn1_q",
+        history=[{"role": "user", "content": "prev_q"}, {"role": "assistant", "content": "prev_a"}],
     )
     assert not is_block
     assert [m["role"] for m in str_msgs] == ["system", "user", "assistant", "user", "user"]
@@ -580,8 +577,6 @@ def test_anthropic_finish_result_merges_next_turn_text_without_continued():
         {"type": "text", "text": "I2"},
     ]
     assert not any(block.get("text") == "(continued)" for m in converted for block in m["content"])
-
-
 
 
 def test_anthropic_prevents_tool_result_after_merged_text_block():

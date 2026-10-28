@@ -187,17 +187,6 @@ class HookRegistry:
         self._ledger.record(_dispose, key=("hook", self, point, name))
         return _dispose
 
-    def unregister(self, hook_point: str, handler_name: str) -> bool:
-        """Remove a handler by name and report whether anything changed."""
-        point = _normalize_hook_point(hook_point)
-        handlers = self._hooks.get(point)
-        if not handlers:
-            return False
-        before = len(handlers)
-        handlers[:] = [entry for entry in handlers if entry.name != handler_name]
-        if not handlers:
-            self._hooks.pop(point, None)
-        return len(handlers) != before
 
     def register_plugin_meta(self, meta: dict) -> None:
         """Register or replace metadata for one loaded plugin."""
@@ -271,13 +260,6 @@ class HookRegistry:
             except Exception as exc:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
         return HookResult(modified=modified, channels=channels)
-
-    def list_hooks(self) -> dict[str, list[str]]:
-        """Return registered hook points and handler names."""
-        return {
-            hook_point: [entry.name for entry in handlers]
-            for hook_point, handlers in self._hooks.items()
-        }
 
 
 def _normalize_hook_point(hook_point: Any) -> str:

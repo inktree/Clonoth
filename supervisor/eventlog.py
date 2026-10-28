@@ -59,13 +59,6 @@ class EventLog:
     def run_id(self) -> str:
         return self._run_id
 
-    @property
-    def events(self) -> list[dict[str, Any]]:
-        return self._events
-
-    @property
-    def path(self) -> Path:
-        return self._path
 
     def _load_existing(self) -> None:
         if not self._path.exists():

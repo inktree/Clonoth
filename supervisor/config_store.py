@@ -133,9 +133,6 @@ class ConfigStore:
             self._save_yaml(self._config)
             return self._config.model_copy(deep=True)
 
-    def get_secret(self) -> AppConfigSecret:
-        with self._lock:
-            return self._config.model_copy(deep=True)
 
     def get_public(self) -> AppConfigPublic:
         with self._lock:

@@ -32,7 +32,7 @@ from .attachments import build_multimodal_content
 from .context import RunContext
 from .model import ResolvedProvider, _current_sticky_sid_var, resolve_provider, wrap_http_with_sticky_session
 from .context_store import load_context_snapshot
-from .inference.tool_format import sanitize_control_tool_history
+from .inference.tool_format import repair_tool_result_pairing
 
 from .node import Node, load_node
 from engine.faces import nodes as _plugin_nodes
@@ -477,45 +477,6 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
         result[-1] = {"role": role, "content": pre_text}
         return result
     return result[:-1]
-
-
-def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
-    """Strip image_url parts from multimodal content, return plain text with references.
-
-    Historical images should not be re-sent every turn as base64 (expensive and redundant).
-    Current turn's images are passed separately via the attachments mechanism.
-    """
-    text_parts: list[str] = []
-    image_refs: list[str] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        if part.get("type") == "image_url":
-            url = ""
-            image_url = part.get("image_url")
-            if isinstance(image_url, dict):
-                url = str(image_url.get("url", ""))
-            elif isinstance(image_url, str):
-                url = image_url
-
-            # Why: the old generic marker hid the saved attachment path, so later
-            # tasks could not reopen historical images. How: keep file:// paths as
-            # lightweight text references while replacing non-file payloads with an
-            # inline marker. Purpose: avoid re-sending image bytes but preserve a
-            # read_file-compatible path when one exists.
-            if url.startswith("file://"):
-                image_refs.append(f"[image: {url[7:]}]")
-            else:
-                image_refs.append("[image: <inline>]")
-        elif part.get("type") == "text":
-            t = str(part.get("text", "")).strip()
-            if t:
-                text_parts.append(t)
-    text = "\n".join(text_parts)
-    if image_refs:
-        refs = "\n".join(image_refs)
-        text = f"{text}\n{refs}" if text else refs
-    return text
 
 
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
@@ -1045,7 +1006,7 @@ async def _run_node_task(
             # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
             # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
             # 目的：父会话不会回放子任务 finish 伪工具。
-            history = sanitize_control_tool_history(history)
+            history = repair_tool_result_pairing(history)
             history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
         context_ref = ""
@@ -1063,9 +1024,9 @@ async def _run_node_task(
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
             # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
             # 原因：旧 _strip_trailing_pseudo_call 只能处理 fake-native 文本 marker。
-            # 做法：sanitize_control_tool_history 处理 tool_calls/role=tool，再调用旧兼容函数。
+            # 做法：repair_tool_result_pairing 处理 tool_calls/role=tool，再调用旧兼容函数。
             # 目的：主会话与子会话的历史恢复语义一致。
-            history = sanitize_control_tool_history(history)
+            history = repair_tool_result_pairing(history)
             history = _strip_trailing_pseudo_call(history)
             # 仅新 inbound（非 resume）需要 pop 尾部重复 instruction：
             # shadow_write 会在本轮再次写入 user 消息，若 JSONL 里上一条就是本轮 instruction，
@@ -1089,7 +1050,7 @@ async def _run_node_task(
             # 原因：旧快照可能保存 true native role=tool finish result。
             # 做法：先清理结构化控制工具，再执行旧文本 marker 清理。
             # 目的：所有历史来源都不向 LLM 回放 finish 伪工具。
-            history = sanitize_control_tool_history(history)
+            history = repair_tool_result_pairing(history)
             history = _strip_trailing_pseudo_call(history)
         elif use_context:
             # 快照加载失败，降级为 session_messages

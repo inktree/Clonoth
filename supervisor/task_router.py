@@ -4,10 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import queue
-import threading
 import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
@@ -19,33 +16,11 @@ from .types import Task, TaskKind, TaskStatus
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class PostCompletionWork:
-    """Frozen payload for non-critical work after a task completion is routed.
-
-    Why: outbound_message must become visible as soon as the critical route has
-    merged branch history and appended the user reply. How: copy the completed
-    task and its task-scoped message snapshot before the supervisor lock is
-    released, then let a background worker run hooks and turn-summary creation.
-    Purpose: preserve memory extraction and turn summaries without keeping bot
-    event polling blocked behind their I/O and preprocessing.
-    """
-
-    task: Task
-    route_session_id: str
-    session_generation: int
-    task_messages: list[Any] = field(default_factory=list)
-
-
 def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
     """Convert a task message into the history shape used for summary input.
 
-    Why: post-completion work now receives a frozen task-message snapshot from
-    the completion critical section instead of reloading ConversationStore later.
-    How: accept both Message objects and serialized dictionaries, then copy role,
-    content, metadata, tool calls, and native tool-result pairing fields into the
-    same shape runner uses. Purpose: one sanitizer protects LLM replay and
-    system.turn_summarizer input while the summary path stays I/O-free.
+    Preserve content, metadata, tool calls, and native tool-result pairing fields
+    for both Message objects and serialized dictionaries.
     """
     if isinstance(message, dict):
         d: dict[str, Any] = {
@@ -93,13 +68,10 @@ def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
 
 def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
     """Format task messages for system.turn_summarizer without control-tool plumbing."""
-    from engine.inference.tool_format import sanitize_control_tool_history
+    from engine.inference.tool_format import repair_tool_result_pairing
 
-    # [2026-05-07] 轮摘要输入必须跳过 finish 控制流工具历史。
-    # 原因：system.turn_summarizer 从 ConversationStore 重新读取任务消息，旧数据中可能已有 finish tool_call/tool_result。
-    # 做法：把 Message 转成与 LLM 历史一致的 dict 后复用控制流清洗，再拼接摘要输入。
-    # 目的：摘要子任务只看到已交付文本和普通工具结果，不继续传播 finish 协议占位内容。
-    cleaned = sanitize_control_tool_history([
+    # 与 LLM replay 共用配对修复，保留有效的 finish tool_call/tool_result。
+    cleaned = repair_tool_result_pairing([
         _message_to_turn_summary_dict(message) for message in messages
     ])
 
@@ -152,49 +124,6 @@ class TaskRouterMixin:
     self.tasks / self._event_task_snapshot / self.append_outbound_message 等。
     """
 
-    # ------------------------------------------------------------------ #
-    #  后置工作队列
-    # ------------------------------------------------------------------ #
-
-    def _ensure_post_completion_worker(self) -> None:
-        """Lazily start the background worker that runs completion hooks.
-
-        Why: memory extraction hooks and turn-summary task creation should not
-        delay outbound_message visibility. How: create one daemon worker and a
-        queue on first use, protected by the existing supervisor lock during
-        initialization. Purpose: keep the critical completion route short without
-        dropping existing post-completion features.
-        """
-        if getattr(self, "_post_completion_worker_started", False):
-            return
-        if not hasattr(self, "_post_completion_queue"):
-            self._post_completion_queue = queue.Queue()
-        worker = threading.Thread(
-            target=self._post_completion_worker_loop,
-            daemon=True,
-            name="post-completion-worker",
-        )
-        self._post_completion_worker_started = True
-        self._post_completion_worker = worker
-        worker.start()
-
-    def _enqueue_post_completion_work(self, work: PostCompletionWork | None) -> None:
-        """Queue non-critical completion work after the caller releases _lock."""
-        if work is None:
-            return
-        self._ensure_post_completion_worker()
-        self._post_completion_queue.put(work)
-
-    def _post_completion_worker_loop(self) -> None:
-        """Drain queued post-completion work without blocking outbound polling."""
-        while True:
-            work = self._post_completion_queue.get()
-            try:
-                self._post_completion_work(work)
-            except Exception as exc:
-                log.warning("post completion work failed for task %s: %s", getattr(work.task, "task_id", "")[:12], exc)
-            finally:
-                self._post_completion_queue.task_done()
 
     # ------------------------------------------------------------------ #
     #  统一路由入口
@@ -702,13 +631,13 @@ class TaskRouterMixin:
             return self._route_ask_to_caller_locked(task, result)
         return self._route_finish_to_caller_or_user_locked(task, result)
 
-    def _build_child_result_resume_data(self, task: Task, result: dict[str, Any], *, action_type: str = "finish") -> dict[str, Any]:
+    def _build_child_result_resume_data(self, task: Task, result: dict[str, Any]) -> dict[str, Any]:
         """Build the structured child_result resume payload for caller resumption."""
         return {
             "type": "child_result",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "result": result,
-            "action_type": action_type,
+            "action_type": "finish",
         }
 
     def _route_ask_to_caller_locked(self, task: Task, result: dict[str, Any]) -> None:
@@ -726,7 +655,7 @@ class TaskRouterMixin:
         self._finalize_branch_task_locked(task, merge=True)
         self._resume_caller_or_output_locked(
             task,
-            self._build_child_result_resume_data(task, result, action_type="finish"),
+            self._build_child_result_resume_data(task, result),
             result,
             action_type="finish",
         )
@@ -881,13 +810,6 @@ class TaskRouterMixin:
                 caller.updated_at = _now()
                 # 注入 resume_data 到 caller 的 input 中
                 caller.input["resume_data"] = resume_data
-                if action_type:
-                    # [AutoC 2026-05-31] Why: ask and finish currently resume the
-                    # caller through the same code path. How: copy action_type into
-                    # resume_data for callers and also into input for cheap
-                    # supervisor inspection. Purpose: preserve ask identity for
-                    # upcoming topology routing without changing the payload shape.
-                    caller.input["_last_child_action_type"] = str(action_type).strip()
                 caller.input["context_ref"] = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
                 # 标记防重复恢复
                 if task.batch_id:
@@ -1379,9 +1301,6 @@ class TaskRouterMixin:
         """在 session 中查找 running 状态的入口 task。"""
         return self._find_entry_task_by_status_locked(session_id, {TaskStatus.running})
 
-    def _find_suspended_entry_task_locked(self, session_id: str) -> Task | None:
-        """在 session 中查找 suspended 状态的入口 task。"""
-        return self._find_entry_task_by_status_locked(session_id, {TaskStatus.suspended})
 
     # ------------------------------------------------------------------ #
     #  child session 清理

@@ -97,7 +97,6 @@ _REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
 _group_history: DefaultDict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=_HISTORY_MAX_LEN))
 
 # EventRouter 回调只拿到 session/trigger，因此这里保存发送最终回复所需的平台对象。
-_session_targets: Dict[str, Dict[str, Any]] = {}
 _conversation_bots: Dict[str, Bot] = {}
 _last_bot: Optional[Bot] = None
 
@@ -745,7 +744,6 @@ async def _try_preempt_running_task(
                 )
             )
 
-        _session_targets[existing_sid] = dict(fresh_platform)
         _conversation_bots[conversation_key] = bot
         logger.info("preempt_v2: injected into QQ task %s", rt.task_id[:8])
         return True
@@ -1189,15 +1187,6 @@ class TangQiuCallbacks:
         event = platform_data.get("event")
         await _clear_message_reacts(bot, event)
 
-    async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:
-        """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
-        target = _session_targets.get(session_id)
-        if not target:
-            return
-        bot = target.get("bot") or _get_fallback_bot()
-        if bot:
-            await _send_attachment_path(bot, target, Path(path))
-
     async def send_intermediate_reply(self, trigger: TriggerInfo, text: str) -> None:
         """发送主节点中间回复，但不写入群历史。"""
         if not text:
@@ -1370,12 +1359,6 @@ class TangQiuCallbacks:
     async def on_engine_restarted(self, payload: Dict[str, Any]) -> None:
         return None
 
-    async def on_task_complete(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-    async def on_task_fail(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
 
 @driver.on_startup
 async def _startup() -> None:
@@ -1537,7 +1520,6 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
         await _agent_matcher.finish("Clonoth Agent 未接受本次请求。")
 
     _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "group", "group_id": group_id, "bot": bot, "event": event, "_qq_input_modality": input_modality}
     _conversation_bots[conversation_key] = bot
 
     if result.inbound_seq:
@@ -1643,7 +1625,6 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         await _private_matcher.finish("Clonoth Agent 未接受本次请求。")
 
     _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "private", "user_id": user_id, "bot": bot, "event": event, "_qq_input_modality": input_modality}
     _conversation_bots[conversation_key] = bot
 
     if result.inbound_seq:

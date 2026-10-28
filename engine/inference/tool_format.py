@@ -804,7 +804,6 @@ def create_tool_formatter(mode: str = "fake-native") -> ToolFormatter:
 # ---------------------------------------------------------------------------
 
 _FINISH_TOOL_NAME = "finish"
-_FINISH_TOOL_RESULT_TEXT = "ok"
 
 
 def _tool_call_name(call: Any) -> str:
@@ -930,31 +929,6 @@ def _assistant_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
             "arguments": _tool_call_arguments(call),
         })
     return calls
-
-
-def _make_finish_tool_result(call: dict[str, Any], tool_mode: str) -> dict[str, Any]:
-    """Build a missing ordinary finish tool_result for old dangling histories."""
-    mode = _normalize_tool_mode(tool_mode)
-    call_id = str(call.get("id") or "")
-    if mode == "native":
-        # Why: true-native providers require role=tool with the original call id.
-        # How: synthesize the same ok result that the engine now writes at finish.
-        # Purpose: old assistant.finish calls can be repaired instead of deleted.
-        return {
-            "role": "tool",
-            "tool_call_id": call_id,
-            "name": _FINISH_TOOL_NAME,
-            "content": _FINISH_TOOL_RESULT_TEXT,
-            "_meta": {"tool_mode": "native", "message_type": "tool_result"},
-        }
-    meta: dict[str, Any] = {"message_type": "tool_result"}
-    if mode != "fake-native":
-        meta["tool_mode"] = mode
-    return {
-        "role": "user",
-        "content": f'Tool result for "{_FINISH_TOOL_NAME}":\n{_FINISH_TOOL_RESULT_TEXT}',
-        "_meta": meta,
-    }
 
 
 def repair_tool_result_pairing_with_stats(
@@ -1189,35 +1163,6 @@ def repair_tool_result_pairing(messages: list[dict[str, Any]]) -> list[dict[str,
     return repaired
 
 
-def sanitize_assistant_control_tools(
-    message: dict[str, Any],
-    *,
-    deliver_control_text: bool = True,
-    suppressed_control_call_ids: set[str] | None = None,
-    suppress_all_control_text: bool = False,
-    drop_if_only_control: bool = False,
-) -> dict[str, Any] | None:
-    """Legacy compatibility wrapper that no longer strips finish tool calls.
-
-    Why: external callers may still import this helper, but finish is now a real
-    persistent API tool. How: return the assistant message unchanged and ignore the
-    old control-flow arguments. Purpose: avoid reintroducing finish filtering while
-    keeping the public helper import-safe during the transition.
-    """
-    return dict(message)
-
-
-def sanitize_control_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Legacy name for repair_tool_result_pairing.
-
-    Why: existing runner, compactor, and provider-bypass call sites still use the
-    old sanitizer name. How: delegate to the new pairing repair routine, which
-    preserves valid finish tool_use/tool_result pairs. Purpose: make the semantic
-    correction without a noisy cross-file rename in this urgent patch.
-    """
-    return repair_tool_result_pairing(messages)
-
-
 # ---------------------------------------------------------------------------
 #  反序列化辅助：将存储消息列表转换为 LLM 可消费格式
 # ---------------------------------------------------------------------------
@@ -1243,7 +1188,7 @@ def build_llm_messages(
     # 原因：build_llm_messages 是所有非旁路 provider 的 L2 入口，旧存储中可能已有孤儿 tool_result。
     # 做法：在模式路由前只移除无法配对的结果，完整工具轮包括 finish 都保留。
     # 目的：普通工具和 finish 都按各自 formatter 回放，避免 provider 配对错误。
-    cleaned_messages = sanitize_control_tool_history(messages)
+    cleaned_messages = repair_tool_result_pairing(messages)
 
     result: list[dict] = []
     for msg in cleaned_messages:

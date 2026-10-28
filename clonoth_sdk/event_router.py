@@ -1300,22 +1300,6 @@ class EventRouter:
             logger.error("on_context_reset callback failed: %s", e)
 
     # ------------------------------------------------------------------
-    #  inbound_accepted — 水位确认
-    # ------------------------------------------------------------------
-
-    async def _handle_inbound_accepted(self, event: Event) -> None:
-        """处理 inbound_accepted 事件：推进频道高水位。
-
-        inbound 消息被 Supervisor 正式接受后，才将 pending_watermark
-        推进为 last_ctx_seq，防止未接受的消息错误地认为历史已发送。
-        对应 bot_adapter.py L1984-1989。
-        """
-        p = event.payload
-        ia_seq = int(p.get("inbound_seq") or 0)
-        if ia_seq:
-            self._state.accept_watermark(ia_seq)
-
-    # ------------------------------------------------------------------
     #  engine_registered — Engine 重启检测
     # ------------------------------------------------------------------
 
@@ -1407,7 +1391,6 @@ class EventRouter:
         "compact_failed":    _handle_compact,
         "snip_compact":      _handle_compact,
         "context_reset":     _handle_context_reset,
-        "inbound_accepted":  _handle_inbound_accepted,
         "engine_registered": _handle_engine_registered,
         "engine_restarting": _handle_engine_restarting,
         # [SDK WS 2026-05-19] Why: these new events should reach raw-event hooks

@@ -40,7 +40,7 @@ from .types import (
     ApprovalStatus,
     ConfigReloadOut,
     Event,
-    HandoffEventIn,
+    SessionEventIn,
     HealthOut,
     InboundAckIn,
     InboundAckOut,
@@ -1767,7 +1767,7 @@ def create_app(
         return out
 
     @app.post("/v1/sessions/{session_id}/events")
-    async def session_event(session_id: str, ev: HandoffEventIn) -> dict[str, Any]:
+    async def session_event(session_id: str, ev: SessionEventIn) -> dict[str, Any]:
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")

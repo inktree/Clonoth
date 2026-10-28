@@ -296,7 +296,3 @@ class ConversationStore:
         if non_system:
             self.append_batch(target_session_id, non_system)
         return len(non_system)
-
-    def invalidate_cache(self, session_id: str) -> None:
-        """手动使缓存失效，下次 load 时强制从文件重新读取。"""
-        self._cache.pop(session_id, None)

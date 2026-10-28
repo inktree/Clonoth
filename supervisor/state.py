@@ -135,13 +135,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # supervisor node list and switch-node discovery in this process.
         from engine.faces.nodes import PluginNodesFace
         _supervisor_ctx.contributions.mount("nodes", PluginNodesFace())
-        _builtin_handlers = auto_discover_and_register(self.hook_registry, context=_supervisor_ctx)
-        # Why: the Clonoth runtime may temporarily run with a reduced built-in
-        # handler set while features are being rolled out. How: keep optional
-        # references with dict.get instead of indexing. Purpose: synchronizing
-        # this file does not remove the existing deployment compatibility guard.
-        self._memory_extract_handler = _builtin_handlers.get("memory_extract")
-        self._dream_handler = _builtin_handlers.get("dream")
+        auto_discover_and_register(self.hook_registry, context=_supervisor_ctx)
 
         # External plugins: same mechanism as engine, scan plugins/ directory
         from engine.hooks.loader import load_external_plugins
@@ -427,7 +421,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "session_messages": lambda sid, limit=0: self.session_messages(session_id=sid, limit=limit),
             "create_task": self._create_task_from_hook_locked,
             "acquire_lock": self._lock,
-            "format_transcript": self._format_transcript_for_extract_callback,
             "current_session_generation": lambda sid: self._current_session_generation_locked(sid),
             "session_count": lambda: len(self.sessions),
             "task_snapshots": self._task_snapshots_from_hook_locked,
@@ -508,38 +501,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         data.setdefault("caller_task_id", None)
         return self._create_task_locked(**data)
 
-    @staticmethod
-    def _format_transcript_for_extract_callback(messages: list[dict[str, Any]], *, max_chars: int = 12000) -> str:
-        """Format conversation messages into transcript text for extraction hooks."""
-        # Why: MemoryExtractHandler now receives formatting as an injected callback
-        # rather than importing supervisor code. How: keep the previous pure
-        # formatter on SupervisorState and pass it through ctx. Purpose: retain the
-        # fallback transcript format while removing handler-side supervisor imports.
-        parts: list[str] = []
-        total = 0
-        for msg in reversed(messages):
-            role = msg.get("role", "")
-            if role == "system":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and isinstance(p.get("text"), str)
-                ]
-                content = "\n".join(texts)
-            if not isinstance(content, str):
-                content = str(content)
-            if len(content) > 2000:
-                content = content[:2000] + "...<truncated>"
-            line = f"[{role}]\n{content}"
-            total += len(line)
-            if total > max_chars:
-                break
-            parts.append(line)
-        parts.reverse()
-        return "\n\n---\n\n".join(parts)
 
     def _reconcile_after_restart(self) -> None:
         """启动期状态协调：清理上一进程遗留的运行期状态。

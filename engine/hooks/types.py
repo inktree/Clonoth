@@ -36,15 +36,6 @@ class HookContext:
     # 流程继续执行，只是后续 handler 被跳过。
     _chain_stopped: bool = field(default=False, repr=False)
 
-    def stop_chain(self) -> None:
-        """Stop the hook chain after the current handler returns.
-
-        Subsequent lower-priority handlers will not execute. The current
-        handler's HookResult is still processed normally. This does NOT
-        produce a TaskAction — the inference loop continues its flow.
-        """
-        self._chain_stopped = True
-
 
 @dataclass
 class HookResult:

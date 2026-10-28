@@ -65,22 +65,6 @@ def _cleanup_async_tracker() -> None:
         del _async_tool_tasks[k]
 
 
-def get_async_tool_tasks() -> list[dict]:
-    """导出当前所有异步工具跟踪条目，供外部查询。
-
-    返回列表，每项包含 async_id, tool_name, status, elapsed 等字段。
-    """
-    result = []
-    now = time.monotonic()
-    for aid, info in _async_tool_tasks.items():
-        entry = {"async_id": aid, **{k: v for k, v in info.items() if not k.startswith("_")}}
-        # 对 running 状态补算已经过的时间
-        if info.get("status") == "running" and "started_at" in info:
-            entry["elapsed"] = round(now - info["started_at"], 1)
-        result.append(entry)
-    return result
-
-
 # ---------------------------------------------------------------------------
 #  Supervisor 生命周期上报（2026-09-02）
 #  Why: 异步工具状态过去只存在 engine 进程内存，supervisor/前端完全不可见。
@@ -152,10 +136,6 @@ def mark_async_tool_cancelled(async_id: str) -> None:
 def is_async_tool_cancelled(async_id: str) -> bool:
     """查询某异步工具是否被请求取消。"""
     return (async_id or "") in _CANCELLED_ASYNC_IDS
-
-
-def _clear_cancel_mark(async_id: str) -> None:
-    _CANCELLED_ASYNC_IDS.discard(async_id)
 
 
 def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:

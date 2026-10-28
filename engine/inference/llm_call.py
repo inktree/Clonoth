@@ -19,7 +19,7 @@ from ..attachments import prepare_messages_for_llm
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
-from .tool_format import build_llm_messages, sanitize_control_tool_history
+from .tool_format import build_llm_messages, repair_tool_result_pairing
 from ..hooks import HookContext, hook_registry
 from .history_budget import bound_tool_history, get_history_tool_budget
 # Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
@@ -139,7 +139,7 @@ def _build_messages_for_provider(
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
     if provider_name in {"openai-responses", "gemini", "gemini-vertex", "gemini-aistudio"} and formatter_mode in {"native", "fake-native"}:
-        return [dict(msg) for msg in sanitize_control_tool_history(messages) if not msg.get("_ephemeral")]
+        return [dict(msg) for msg in repair_tool_result_pairing(messages) if not msg.get("_ephemeral")]
     return build_llm_messages(messages, formatter) if formatter else messages
 
 

@@ -305,7 +305,6 @@ class AdapterCallbacks(Protocol):
 
         SDK 已完成：
           - 创建 ChildTaskState（含 prefix, lines=[首条消息]）
-          - 超量清理（trim_child_states）
 
         适配器需要：
           - 确定展示频道：

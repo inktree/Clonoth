@@ -254,13 +254,6 @@ def load_yaml_dict(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def load_text_file(path: Path, default: str = "") -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return default
-
-
 def resolve_env_ref(text: str) -> str:
     s = str(text or "")
     if s.startswith("$ENV{") and s.endswith("}"):
@@ -376,19 +369,3 @@ def classify_path(
 
     # Relative path that escapes all roots — invalid
     return None, "path escapes workspace root", "external"
-
-
-def strip_tool_trace_blocks(text: str) -> str:
-    s = str(text or "")
-    start = "[CLONOTH_TOOL_TRACE v2]"
-    end = "[/CLONOTH_TOOL_TRACE]"
-    while True:
-        i = s.find(start)
-        if i < 0:
-            break
-        j = s.find(end, i)
-        if j < 0:
-            s = s[:i].rstrip()
-            break
-        s = (s[:i] + s[j + len(end):]).strip()
-    return s.strip()

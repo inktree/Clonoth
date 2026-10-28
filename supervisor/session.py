@@ -11,42 +11,9 @@ from .eventlog import SYSTEM_SESSION_ID
 from .types import ApprovalStatus, TaskStatus
 
 
-
 # ---------------------------------------------------------------------------
 #  多模态消息构建（内联版本，避免 supervisor → engine 依赖）
 # ---------------------------------------------------------------------------
-
-_ALLOWED_ATT_PREFIX = "data/attachments/"
-
-
-def _build_multimodal_content(
-    text: str, attachments: list[dict[str, Any]],
-) -> list[dict[str, Any]] | str:
-    """将文本和附件合并为多模态消息内容。
-
-    图片附件生成 file:// image_url 引用；
-    文本文件附件生成元数据文本引用（不读内容）。
-    """
-    parts: list[dict[str, Any]] = []
-    for att in attachments:
-        if not isinstance(att, dict):
-            continue
-        path = str(att.get("path") or "").strip()
-        if not path or not path.replace("\\", "/").lstrip("/").startswith(_ALLOWED_ATT_PREFIX):
-            continue
-        att_type = str(att.get("type") or "").strip()
-        if att_type == "file":
-            # Text file: metadata-only reference
-            from pathlib import Path as _Path
-            name = att.get("name") or _Path(path).name
-            mime = att.get("mime_type") or "text/plain"
-            parts.append({"type": "text", "text": f"[Attached file: {name} | type: {mime} | path: {path}]"})
-        else:
-            # Image: file:// reference
-            parts.append({"type": "image_url", "image_url": {"url": f"file://{path}"}})
-    if not parts:
-        return text
-    return [{"type": "text", "text": text}] + parts
 
 
 class SessionMixin:

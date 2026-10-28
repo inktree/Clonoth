@@ -24,8 +24,8 @@ def test_parallel_question_remains_until_reply_then_preserves_later_messages(mon
     member = SimpleNamespace(id=1)
     context._push_history(rt, 42, "A asks first")
     snapshot_a = rt.history_seq_counter - 1
-    # SDK acceptance has nothing registered to consume in the Discord adapter.
-    rt.session_state.accept_watermark(100)
+    # 尚未投递回复，频道历史水位不得推进。
+    assert rt.session_state.last_ctx_seq.get(42, -1) == -1
     context._push_history(rt, 42, "B asks concurrently")
     snapshot_b = rt.history_seq_counter - 1
     before = context._build_context_text(rt, 42, member, "B", exclude_last=True)
@@ -33,6 +33,7 @@ def test_parallel_question_remains_until_reply_then_preserves_later_messages(mon
     assert "【群聊上下文记录】" in before
 
     _record_bot_reply(rt, 42, "Answer A", context_watermark=snapshot_a)
+    assert rt.session_state.last_ctx_seq[42] == snapshot_a
     after = context._build_context_text(rt, 42, member, "C")
     assert "A asks first" not in after
     assert "B asks concurrently" in after
@@ -73,6 +74,6 @@ def test_only_successful_final_delivery_commits_snapshot(monkeypatch, outcome):
     cb = callbacks.DiscordCallbacks(rt)
     attachments = [{"path": "file"}] if outcome == "attachment" else []
     asyncio.run(cb.send_reply(trigger, "" if attachments else "Answer", attachments))
-    assert rt.session_state.get_high_watermark(42) == (-1 if outcome in {"failure", "empty"} else 7)
+    assert rt.session_state.last_ctx_seq.get(42, -1) == (-1 if outcome in {"failure", "empty"} else 7)
     if outcome == "voice":
         voice_sender.assert_awaited_once()

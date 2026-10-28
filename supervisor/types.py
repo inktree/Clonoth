@@ -171,9 +171,6 @@ class SessionEventIn(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-HandoffEventIn = SessionEventIn
-
-
 class ApprovalRequestIn(BaseModel):
     session_id: str
     operation: str

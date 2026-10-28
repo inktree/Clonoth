@@ -864,7 +864,6 @@ class DiscordCallbacks:
         # existing Clonoth session.
         for seq, _trigger in triggers:
             session_state.triggers.pop(seq, None)
-            session_state.pending_watermarks.pop(seq, None)
         for seq, _state in main_states:
             session_state.main_task_states.pop(seq, None)
         for task_key, _child_state in child_states:

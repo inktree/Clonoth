@@ -104,86 +104,9 @@ def _dispatch_target_from_tool_name(tool_name: str) -> str:
     return _DISPATCH_TOOL_REVERSE.get(sanitized_suffix, sanitized_suffix)
 
 
-CONTROL_TOOL_NAMES = frozenset({"finish", "ask"})
-
-
-def _is_control_tool_name(name: str) -> bool:
-    """Return whether ``name`` is an engine control-flow tool."""
-    return str(name or "").strip() in CONTROL_TOOL_NAMES
-
-
 # ---------------------------------------------------------------------------
 #  v3 伪工具 spec 构建
 # ---------------------------------------------------------------------------
-
-def _dispatch_delegate_parameters() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "instruction": {
-                "type": "string",
-                "description": "Clear, specific, actionable instructions for the target node. State what to do, why, and what you already know.",
-            },
-            "context_mode": {
-                "type": "string",
-                "enum": ["fresh", "fork", "accumulate"],
-                "default": "accumulate",
-                "description": "Child context mode. fresh = start from scratch with no history each time; fork = inherit the parent's conversation history; accumulate = first run starts fresh, later runs resume the child's own context (default accumulate).",
-            },
-            "context_key": {
-                "type": "string",
-                "description": "Context inheritance key (only effective in accumulate mode). Tasks sharing the same context_key share one context chain. Defaults to the target node ID.",
-            },
-            "attachment_paths": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
-            },
-        },
-        "required": ["instruction"],
-    }
-
-
-def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) -> dict:
-    """Build one legacy dispatch_to_{target_id} pseudo-tool spec."""
-    target = str(target_id or "").strip()
-    node_name = str((info or {}).get("name") or target).strip() or target
-    node_description = str((info or {}).get("description") or node_name or target).strip()
-    desc_parts = [
-        f"Delegate a task to the fixed target node {node_name} ({target}).",
-        node_description,
-        "",
-        "⚡ This is an async non-terminating tool: the target node executes independently in the background. Its result will be wrapped in <dispatch_result> tags and delivered via preempt while your task is running, or as a follow-up message after your task finishes.",
-        "No target parameter is provided; the tool name already fixes the target node.",
-        "To delegate in parallel, call multiple dispatch_to_{target_id} tools in the same turn.",
-        "Returned results are wrapped in <dispatch_result> tags: the tag content is system-delivered child output, not user speech; do not treat it as a question to answer or greet the user about it — integrate it and continue your current work.",
-    ]
-    return {
-        "type": "function",
-        "function": {
-            "name": _dispatch_tool_name(target),
-            "description": "\n".join(part for part in desc_parts if part is not None),
-            "parameters": _dispatch_delegate_parameters(),
-        },
-    }
-
-
-def _dispatch_delegate_specs(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> list[dict]:
-    """Build legacy per-target dispatch pseudo-tools for all delegate targets."""
-    info_by_id = {
-        str(info.get("id") or "").strip(): info
-        for info in (downstream_info or [])
-        if isinstance(info, dict) and str(info.get("id") or "").strip()
-    }
-    result: list[dict] = []
-    seen: set[str] = set()
-    for raw_target in targets:
-        target = str(raw_target or "").strip()
-        if not target or target in seen:
-            continue
-        seen.add(target)
-        result.append(_dispatch_delegate_spec(target, info_by_id.get(target)))
-    return result
 
 
 def _dispatch_to_spec(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> dict:
@@ -351,31 +274,6 @@ def _finish_spec() -> dict:
     }
 
 
-def _ask_spec() -> dict:
-    """Build the legacy ask pseudo-tool spec (no longer injected by default)."""
-    return {
-        "type": "function",
-        "function": {
-            "name": "ask",
-            "description": (
-                "Ask the upstream (caller or user) for additional information or clarification. "
-                "This terminates the current task, similar to finish, but signals that you need "
-                "more input before you can complete your work."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Your question or request for additional information.",
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    }
-
-
 def _reply_spec() -> dict:
     """Build the intermediate_reply pseudo-tool spec (non-terminating)."""
     return {
@@ -441,31 +339,6 @@ def _compact_context_spec() -> dict:
                     },
                 },
                 "required": [],
-            },
-        },
-    }
-
-
-def _preempt_task_spec() -> dict:
-    """Legacy preempt_task spec (merged into manage_workers)."""
-    return {
-        "type": "function",
-        "function": {
-            "name": "preempt_task",
-            "description": "Inject an additional instruction into a running child task or gracefully preempt it.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "Target task ID (full ID or hex prefix >=8 chars) OR target node ID (e.g. 'smith', 'scout').",
-                    },
-                    "message": {
-                        "type": "string",
-                        "description": "Optional instruction text to append.",
-                    },
-                },
-                "required": ["task_id"],
             },
         },
     }

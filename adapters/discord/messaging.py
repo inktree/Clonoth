@@ -196,12 +196,6 @@ def _current_message_media_text(message: discord.Message) -> str:
     return " ".join(parts).strip()
 
 
-def _truncate(text: str, limit: int = 2000) -> str:
-    if len(text) > limit:
-        return text[:limit - 4] + "..."
-    return text
-
-
 def _split_long_text(text: str, limit: int = 1900) -> list[str]:
     """按自然边界切分，保留缩进，并在跨消息时闭合、重开代码围栏。"""
     chunks: list[str] = []

@@ -113,15 +113,6 @@ class PromptSectionRegistry:
         """Attach the shared disposal ledger (see engine/registry_core.py)."""
         self._disposal_ledger = ledger
 
-    def list_sections(self, scope: str | None = None) -> list[dict[str, Any]]:
-        """List registered sections in render order (order asc, name asc)."""
-        entries = sorted(self._sections.values(), key=lambda s: (s.order, s.name))
-        if scope is not None:
-            entries = [s for s in entries if s.scope == scope]
-        return [
-            {"name": s.name, "order": s.order, "scope": s.scope, "meta": dict(s.meta)}
-            for s in entries
-        ]
 
     def render_scope(self, scope: str, ctx: PromptSectionContext) -> list[str]:
         """Render all sections of one scope in order as plain text parts.

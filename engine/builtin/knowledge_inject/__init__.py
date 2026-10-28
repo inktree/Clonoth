@@ -96,7 +96,6 @@ PLUGIN_META = {
 }
 
 
-
 # ---------------------------------------------------------------------------
 #  Keyword matching
 # ---------------------------------------------------------------------------
@@ -530,40 +529,8 @@ def save_skill_pins(workspace_root: Path, data: dict[str, list[str]]) -> None:
     _skill_pins_cache["mtime"] = -1.0
 
 
-def build_skill_messages(
-    workspace_root: Path,
-    *,
-    node_id: str = "",
-    instruction_text: str = "",
-    history: list[dict[str, Any]] | None = None,
-    skill_mode: str = "all",
-    skill_allow: list[str] | None = None,
-    max_budget_chars: int = 0,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Build system messages for skill injection through the unified pipeline."""
-    # Why: legacy callers need a compatible skill message builder after the old
-    # runtime module is removed. How: delegate to the unified knowledge pipeline
-    # with memory disabled. Purpose: preserve the public behavior while keeping
-    # one injection implementation.
-    skill_static, skill_dynamic, _memory_static, _memory_dynamic = build_knowledge_messages(
-        workspace_root,
-        normalize_skill_entries(load_skill_catalog(workspace_root)),
-        node_id=node_id,
-        instruction_text=instruction_text,
-        history=history,
-        skill_mode=skill_mode,
-        skill_allow=skill_allow,
-        memory_mode="none",
-        memory_allow=None,
-        skill_max_budget_chars=max_budget_chars,
-        memory_max_budget_chars=0,
-        knowledge_max_budget_chars=0,
-    )
-    return skill_static, skill_dynamic
-
-
 # ---------------------------------------------------------------------------
-#  Memory catalog loading, hit tracking, and legacy memory builder
+#  Memory catalog loading and hit tracking
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -805,57 +772,6 @@ def load_memory_catalog(
 # [2026-05-24] _update_last_hit_bg REMOVED.
 # Was: full yaml.safe_load + safe_dump of 660KB+ files per LLM call.
 # Replaced by: _record_hits() → in-memory dict → periodic JSON flush.
-
-
-def invalidate_memory_cache(workspace_root: Path, *, memory_book: str = "") -> None:
-    """Public cache invalidation for external callers such as memory_extract.
-
-    Why: memory_extract previously reached into the private _MemoryCache class
-    across the plugin boundary. How: expose one module-level function.
-    Purpose: extracted memories are visible to the next prompt build without
-    leaking the cache class.
-    """
-    _MemoryCache.invalidate(workspace_root, memory_book=memory_book)
-
-
-def build_memory_messages(
-    workspace_root: Path,
-    *,
-    node_id: str = "",
-    instruction_text: str = "",
-    history: list[dict[str, Any]] | None = None,
-    max_budget_chars: int = 0,
-    memory_mode: str = "all",
-    memory_allow: list[str] | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Build system messages for memory injection through the unified pipeline."""
-    # Why: legacy callers still need build_memory_messages after the old memory
-    # module is deleted. How: delegate to the unified knowledge pipeline with skills
-    # disabled. Purpose: keep public memory message behavior compatible.
-    _skill_static, _skill_dynamic, memory_static, memory_dynamic = build_knowledge_messages(
-        workspace_root,
-        normalize_memory_entries(load_memory_catalog(workspace_root)),
-        node_id=node_id,
-        instruction_text=instruction_text,
-        history=history,
-        skill_mode="none",
-        skill_allow=None,
-        memory_mode=memory_mode,
-        memory_allow=memory_allow,
-        skill_max_budget_chars=0,
-        memory_max_budget_chars=max_budget_chars,
-        knowledge_max_budget_chars=0,
-    )
-    return memory_static, memory_dynamic
-
-def _short_text(s: str, max_chars: int = 240) -> str:
-    """Return the same short skill description used by the legacy index."""
-    # Why: skill INDEX rendering moved into this module. How: keep the old
-    # truncation helper byte-compatible. Purpose: avoid changing INDEX text.
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars] + "…"
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -1508,7 +1424,6 @@ def build_knowledge_context(
         skill_inline_max_chars=get_int(safe_runtime_cfg, "skills.inline_max_chars", skill_inline_max_chars, min_value=0),
         memory_inline_max_chars=get_int(safe_runtime_cfg, "memory.inline_max_chars", memory_inline_max_chars, min_value=0),
     )
-
 
 
 # ---------------------------------------------------------------------------
@@ -2247,7 +2162,7 @@ def _http_exc(status: int, detail: str) -> Any:
     return HTTPException(status_code=status, detail=detail)
 
 
-def _list_skills_endpoint(request: Any) -> list[dict[str, Any]]:
+def _list_skills_endpoint(request: Request) -> list[dict[str, Any]]:
     # Why: admin listing shares the injection-side catalog parser. How: call
     # load_skill_catalog with the cache disabled so writes are immediately
     # visible. Purpose: one frontmatter parser instead of an admin_api copy.
@@ -2266,14 +2181,14 @@ def _list_skills_endpoint(request: Any) -> list[dict[str, Any]]:
     return res
 
 
-def _get_skill_raw_endpoint(name: str, request: Any) -> dict[str, str]:
+def _get_skill_raw_endpoint(name: str, request: Request) -> dict[str, str]:
     p = _skill_md_path(_ws_root(request), name)
     if not p.exists():
         raise _http_exc(404, "File not found")
     return {"content": p.read_text(encoding="utf-8")}
 
 
-def _update_skill_raw_endpoint(name: str, request: Any, payload: Any) -> dict[str, Any]:
+def _update_skill_raw_endpoint(name: str, request: Request, payload: RawContent) -> dict[str, Any]:
     ws = _ws_root(request)
     p = _skill_md_path(ws, name)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -2282,7 +2197,7 @@ def _update_skill_raw_endpoint(name: str, request: Any, payload: Any) -> dict[st
     return {"ok": True}
 
 
-def _create_skill_endpoint(request: Any, payload: Any) -> dict[str, Any]:
+def _create_skill_endpoint(request: Request, payload: CreatePayload) -> dict[str, Any]:
     from toolbox.builtins import SKILL_NAME_RE as _re
     ident = str(getattr(payload, "id", "")).strip()
     if not _re.match(ident):
@@ -2297,7 +2212,7 @@ def _create_skill_endpoint(request: Any, payload: Any) -> dict[str, Any]:
     return {"ok": True}
 
 
-def _delete_skill_endpoint(name: str, request: Any) -> dict[str, Any]:
+def _delete_skill_endpoint(name: str, request: Request) -> dict[str, Any]:
     import shutil as _shutil
     ws = _ws_root(request)
     p = _skill_md_path(ws, name)
@@ -2326,7 +2241,7 @@ def _session_workspace_name(request: Any, session_id: str) -> str:
     return ""
 
 
-def _get_skill_pins_endpoint(session_id: str, request: Any) -> dict[str, Any]:
+def _get_skill_pins_endpoint(request: Request, session_id: str = "") -> dict[str, Any]:
     ws_root = _ws_root(request)
     ws_name = _session_workspace_name(request, session_id)
     pinned = list(load_skill_pins(ws_root).get(ws_name) or []) if ws_name else []
@@ -2352,7 +2267,7 @@ def _get_skill_pins_endpoint(session_id: str, request: Any) -> dict[str, Any]:
     }
 
 
-def _put_skill_pins_endpoint(request: Any, payload: Any) -> dict[str, Any]:
+def _put_skill_pins_endpoint(request: Request, payload: SkillPinsPayload) -> dict[str, Any]:
     ws_root = _ws_root(request)
     ws_name = _session_workspace_name(request, str(getattr(payload, "session_id", "") or ""))
     if not ws_name:
@@ -2374,14 +2289,6 @@ def _put_skill_pins_endpoint(request: Any, payload: Any) -> dict[str, Any]:
         data.pop(ws_name, None)
     save_skill_pins(ws_root, data)
     return {"ok": True, "workspace": ws_name, "pinned": pinned}
-
-
-def _skill_pins_get_route(request: Request, session_id: str = "") -> dict[str, Any]:
-    return _get_skill_pins_endpoint(session_id, request)
-
-
-def _skill_pins_put_route(request: Request, payload: SkillPinsPayload) -> dict[str, Any]:
-    return _put_skill_pins_endpoint(request, payload)
 
 
 def _memory_book_path(workspace_root: Path, ns: str, book: str) -> Path:
@@ -2518,7 +2425,6 @@ def _memory_search(base: Path, needle: str) -> dict[str, Any]:
     }
 
 
-
 def _book_listing(yf: Path) -> dict[str, Any]:
     """单个 book 的列表数据（名称/计数/条目摘要），带 mtime+size 缓存。"""
     try:
@@ -2541,7 +2447,7 @@ def _book_listing(yf: Path) -> dict[str, Any]:
     return listing
 
 
-def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
+def _memory_list_endpoint(request: Request) -> Any:
     """列出 namespace/book 及条目摘要，供管理面板拉取。
 
     [AutoC 2026-08-28] 两级性能路径：
@@ -2633,14 +2539,16 @@ def _memory_list_endpoint(request: Any) -> list[dict[str, Any]]:
     }
 
 
-def _memory_raw_get_endpoint(ns: str, book: str, request: Any) -> dict[str, str]:
+def _memory_raw_get_endpoint(request: Request, ns: str = "", book: str = "") -> dict[str, str]:
     p = _memory_book_path(_ws_root(request), ns, book)
     if not p.exists():
         raise _http_exc(404, "Book not found")
     return {"content": p.read_text(encoding="utf-8")}
 
 
-def _memory_raw_put_endpoint(ns: str, book: str, payload: Any, request: Any) -> dict[str, Any]:
+def _memory_raw_put_endpoint(
+    request: Request, ns: str = "", book: str = "", payload: RawContent = None,
+) -> dict[str, Any]:
     ws = _ws_root(request)
     p = _memory_book_path(ws, ns, book)
     try:
@@ -2658,7 +2566,7 @@ def _memory_raw_put_endpoint(ns: str, book: str, payload: Any, request: Any) -> 
     return {"ok": True}
 
 
-def _memory_delete_entry_endpoint(ns: str, book: str, id: str, request: Any) -> dict[str, Any]:
+def _memory_delete_entry_endpoint(request: Request, ns: str = "", book: str = "", id: str = "") -> dict[str, Any]:
     ws = _ws_root(request)
     p = _memory_book_path(ws, ns, book)
     if not p.exists():
@@ -2681,43 +2589,7 @@ def _memory_delete_entry_endpoint(ns: str, book: str, id: str, request: Any) -> 
     return {"ok": True, "deleted": id}
 
 
-# [AutoC 2026-08-28] 路由函数定义在模块层：PEP 563 字符串注解需要在模块
-# globals 解析 Request / RawContent / CreatePayload。旧形态在函数体内定义
-# 包装，注解解析失败导致 422。
-def _skills_list_route(request: Request) -> list[dict[str, Any]]:
-    return _list_skills_endpoint(request)
-
-
-def _skills_raw_route(name: str, request: Request) -> dict[str, str]:
-    return _get_skill_raw_endpoint(name, request)
-
-
-def _skills_update_route(name: str, request: Request, payload: RawContent) -> dict[str, Any]:
-    return _update_skill_raw_endpoint(name, request, payload)
-
-
-def _skills_create_route(request: Request, payload: CreatePayload) -> dict[str, Any]:
-    return _create_skill_endpoint(request, payload)
-
-
-def _skills_delete_route(name: str, request: Request) -> dict[str, Any]:
-    return _delete_skill_endpoint(name, request)
-
-
-def _memory_list_route(request: Request) -> Any:
-    return _memory_list_endpoint(request)
-
-
-def _memory_raw_route(ns: str = "", book: str = "", request: Request = None) -> dict[str, str]:  # noqa: RUF013
-    return _memory_raw_get_endpoint(ns, book, request)
-
-
-def _memory_raw_put_route(ns: str = "", book: str = "", request: Request = None, payload: RawContent = None) -> dict[str, Any]:  # noqa: RUF013
-    return _memory_raw_put_endpoint(ns, book, payload, request)
-
-
-def _memory_delete_route(ns: str = "", book: str = "", id: str = "", request: Request = None) -> dict[str, Any]:  # noqa: RUF013
-    return _memory_delete_entry_endpoint(ns, book, id, request)
+# Endpoints stay at module scope so FastAPI can resolve postponed annotations.
 
 
 def _register_admin_routes(routes: Any) -> None:
@@ -2725,20 +2597,20 @@ def _register_admin_routes(routes: Any) -> None:
     from engine.faces.routes import static_router
 
     router = APIRouter()
-    router.add_api_route("/skills", _skills_list_route, methods=["GET"])
-    router.add_api_route("/skills/{name}/raw", _skills_raw_route, methods=["GET"])
-    router.add_api_route("/skills/{name}/raw", _skills_update_route, methods=["PUT"])
-    router.add_api_route("/skills", _skills_create_route, methods=["POST"])
-    router.add_api_route("/skills/{name}", _skills_delete_route, methods=["DELETE"])
-    router.add_api_route("/skill_pins", _skill_pins_get_route, methods=["GET"])
-    router.add_api_route("/skill_pins", _skill_pins_put_route, methods=["PUT"])
+    router.add_api_route("/skills", _list_skills_endpoint, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _get_skill_raw_endpoint, methods=["GET"])
+    router.add_api_route("/skills/{name}/raw", _update_skill_raw_endpoint, methods=["PUT"])
+    router.add_api_route("/skills", _create_skill_endpoint, methods=["POST"])
+    router.add_api_route("/skills/{name}", _delete_skill_endpoint, methods=["DELETE"])
+    router.add_api_route("/skill_pins", _get_skill_pins_endpoint, methods=["GET"])
+    router.add_api_route("/skill_pins", _put_skill_pins_endpoint, methods=["PUT"])
     routes.register(router, mount="admin/config", description="skills 配置端点")
 
     mem_router = APIRouter()
-    mem_router.add_api_route("/memory", _memory_list_route, methods=["GET"])
-    mem_router.add_api_route("/memory/raw", _memory_raw_route, methods=["GET"])
-    mem_router.add_api_route("/memory/raw", _memory_raw_put_route, methods=["PUT"])
-    mem_router.add_api_route("/memory/entry", _memory_delete_route, methods=["DELETE"])
+    mem_router.add_api_route("/memory", _memory_list_endpoint, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _memory_raw_get_endpoint, methods=["GET"])
+    mem_router.add_api_route("/memory/raw", _memory_raw_put_endpoint, methods=["PUT"])
+    mem_router.add_api_route("/memory/entry", _memory_delete_entry_endpoint, methods=["DELETE"])
     routes.register(mem_router, mount="admin/config", description="memory 配置端点")
 
     # 面板与依赖资源需要鉴权；宿主用 Bearer 换取短期静态资源 Cookie。

@@ -43,12 +43,6 @@ def declared_node(node_id: str) -> dict[str, Any] | None:
     return entry["data"] if entry is not None else None
 
 
-def declared_node_owner(node_id: str) -> str:
-    """Return the owning plugin name for one declared id, or empty string."""
-    entry = _DECLS.get((node_id or "").strip())
-    return str(entry["owner"]) if entry is not None else ""
-
-
 def declared_node_path(node_id: str) -> str:
     """Return the declaration source file path for one id, or empty string.
 

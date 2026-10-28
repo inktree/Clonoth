@@ -57,7 +57,6 @@ from .tool_format import (
     ParsedToolCall,
     create_tool_formatter,
     build_llm_messages,
-    sanitize_control_tool_history,
 )
 from .message_model import MessageMeta, set_message_meta
 from providers.base import BaseProvider, ToolCall, ProviderResponse
@@ -305,7 +304,7 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
     # Phase 1: 影子写入 assistant 消息到 ConversationStore
     # [2026-05-07] 含 finish 的 assistant 消息也直接持久化。
     # 原因：finish 是真实 API tool_call，删除或拆分它会使后续 tool_result 失去配对来源。
-    # 做法：不再调用 sanitize_assistant_control_tools，而是保存原始 assistant.tool_calls。
+    # 做法：保存原始 assistant.tool_calls，保留工具配对结构。
     # 目的：ConversationStore、snapshot 与 provider replay 的工具轮结构一致。
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 

@@ -572,14 +572,14 @@ def _format_messages_for_summary(
     Inserts ``=== TASK [task_id] ===`` markers when source_task_id changes,
     so the compactor LLM can see task boundaries.
     """
-    from engine.inference.tool_format import sanitize_control_tool_history
+    from engine.inference.tool_format import repair_tool_result_pairing
 
     # [2026-05-07] 摘要输入也要先清洗 finish 控制流历史。
     # 原因：system.compactor 可能读取旧 child session 中已经持久化的 finish tool_call/tool_result；
     # 若直接拼接，污染文本会被写进压缩摘要并回流父会话。
     # 做法：复用 L2 的控制流清洗，只移除 finish 伪工具配对，普通业务工具结果保持原样。
     # 目的：压缩摘要记录真实交付内容，不记录运行期协议占位结果。
-    messages = sanitize_control_tool_history(messages)
+    messages = repair_tool_result_pairing(messages)
 
     parts: list[str] = []
     _prev_tid: str = ""

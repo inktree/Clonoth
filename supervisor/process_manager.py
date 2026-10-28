@@ -341,9 +341,6 @@ class ProcessManager:
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._log(f"[process_manager] napcat stop failed: {exc}")
 
-    def restart_engine(self) -> None:
-        self.stop_engine()
-        self.start_engine()
 
     def stop_all(self) -> None:
         self.stop_discord_adapter()
