@@ -26,10 +26,8 @@ class CompactPlan:
 async def prepare_compaction(
     messages: list[dict[str, Any]],
     target_session_id: str,
-    node_id: str,
     keep_recent: int = 6,
     threshold_tokens: int = 0,
-    max_summary_chars: int = 300_000,
 ) -> CompactPlan:
     """从消息列表准备 compact 计划。不依赖 LoopState。
 
@@ -46,10 +44,6 @@ async def prepare_compaction(
         safe_threshold_tokens = max(int(threshold_tokens), 0)
     except (TypeError, ValueError):
         safe_threshold_tokens = 0
-    try:
-        safe_max_summary_chars = max(int(max_summary_chars), 0)
-    except (TypeError, ValueError):
-        safe_max_summary_chars = 300_000
 
     target_sid = str(target_session_id or "").strip()
     try:
@@ -100,13 +94,13 @@ async def prepare_compaction(
         conversation_text = _format_messages_for_summary(compressible_messages)
         reason = ""
 
-        if safe_max_summary_chars > 0 and len(conversation_text) > safe_max_summary_chars:
+        if len(conversation_text) > 300_000:
             original_len = len(conversation_text)
             # [2026-06-06] Why: the compactor model can reject an oversized
             # summarization prompt. How: retain the newest text and then align the
             # cut to the next message separator when possible. Purpose: avoid
             # dispatching a request that is too large while keeping recent context.
-            conversation_text = conversation_text[-safe_max_summary_chars:]
+            conversation_text = conversation_text[-300_000:]
             first_sep = conversation_text.find("\n\n---\n\n")
             if first_sep > 0:
                 conversation_text = conversation_text[first_sep + len("\n\n---\n\n"):]

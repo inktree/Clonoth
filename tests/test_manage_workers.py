@@ -147,18 +147,12 @@ def test_manage_workers_is_permanently_injected_and_replaces_preempt_and_ask() -
     """manage_workers is permanently injected when allowed (no cache churn), while ask and preempt_task specs are not injected."""
     node = Node(id="parent", type="ai")
 
-    no_children = build_node_tool_specs(
-        registry=_EmptyRegistry(), node=node, has_active_children=False,
-    )[1]
-    with_children = build_node_tool_specs(
-        registry=_EmptyRegistry(), node=node, has_active_children=True,
-    )[1]
+    specs = build_node_tool_specs(registry=_EmptyRegistry(), node=node)[1]
 
     assert _is_pseudo_tool_name("manage_workers") is True
-    assert "manage_workers" in _tool_names(no_children)
-    assert "manage_workers" in _tool_names(with_children)
-    assert "ask" not in _tool_names(no_children)
-    assert "preempt_task" not in _tool_names(no_children)
+    assert "manage_workers" in _tool_names(specs)
+    assert "ask" not in _tool_names(specs)
+    assert "preempt_task" not in _tool_names(specs)
 
 
 def test_manage_workers_respects_control_tool_allowlist() -> None:
@@ -167,10 +161,10 @@ def test_manage_workers_respects_control_tool_allowlist() -> None:
     included = Node(id="included", type="ai", control_tools=["manage_workers"])
 
     assert "manage_workers" not in _tool_names(build_node_tool_specs(
-        registry=_EmptyRegistry(), node=excluded, has_active_children=True,
+        registry=_EmptyRegistry(), node=excluded,
     )[1])
     assert "manage_workers" in _tool_names(build_node_tool_specs(
-        registry=_EmptyRegistry(), node=included, has_active_children=True,
+        registry=_EmptyRegistry(), node=included,
     )[1])
 
 

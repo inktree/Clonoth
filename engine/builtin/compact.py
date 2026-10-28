@@ -348,7 +348,6 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
         plan = await prepare_compaction(
             messages=ls.messages,
             target_session_id=compact_sid,
-            node_id=ls.node.id,
             keep_recent=ls.compact_keep_recent,
             threshold_tokens=ls.compact_threshold,
         )

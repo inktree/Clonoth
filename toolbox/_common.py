@@ -198,20 +198,8 @@ async def guard_external_read(
     rel_path: str,
     tool_name: str,
     reason: str = "",
-    *,
-    trust_level: str = "",
 ) -> dict[str, Any] | None:
-    """Request approval for non-workspace paths. Returns error dict or None (proceed).
-
-    If trust_level is provided, uses it directly. Otherwise falls back to is_external bool.
-    """
-    # workspace-level paths are fully trusted, skip approval
-    if trust_level == "workspace":
-        return None
-    if trust_level and trust_level != "external":
-        # trusted-level: still allow but could be gated by policy in the future
-        if not is_external:
-            return None
+    """Request approval for non-workspace paths. Returns error dict or None (proceed)."""
     if not is_external:
         return None
     _op, err = await request_guard(

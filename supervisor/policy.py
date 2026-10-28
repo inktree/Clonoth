@@ -356,7 +356,7 @@ class PolicyEngine:
             return PolicyDecision(SafetyLevel.deny, f"restart {target} denied")
         return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval")
 
-    def evaluate_tool(self, *, name: str, arguments: dict[str, Any] | None = None) -> PolicyDecision:
+    def evaluate_tool(self, *, name: str) -> PolicyDecision:
         """工具级审批：按工具名匹配 tools 配置段规则。"""
         self._reload_if_needed()
         name = str(name or "").strip()
@@ -377,8 +377,5 @@ class PolicyEngine:
         if op == "restart":
             return self.evaluate_restart(target=str(parameters.get("target", "")))
         if op == "tool_call":
-            return self.evaluate_tool(
-                name=str(parameters.get("tool_name", "")),
-                arguments=parameters.get("arguments") if isinstance(parameters.get("arguments"), dict) else None,
-            )
+            return self.evaluate_tool(name=str(parameters.get("tool_name", "")))
         return PolicyDecision(SafetyLevel.deny, f"unknown op: {op}")

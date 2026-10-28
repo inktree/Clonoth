@@ -83,7 +83,6 @@ def test_apply_resume_messages_handles_child_result_and_ask() -> None:
                 "child_node_id": "coder",
                 "result": {"text": "done"},
             },
-            formatter=None,
             node=SimpleNamespace(id="main"),
             rctx=SimpleNamespace(parent_session_id="", session_id="s-1"),
         )

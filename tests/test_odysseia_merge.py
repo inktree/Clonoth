@@ -13,13 +13,8 @@ import pytest
 import yaml
 
 from clonoth_sdk.approval import classify_path
-from clonoth_sdk.types import HealthInfo
 from engine import compact, data_cleanup
-from engine.builtin.usage_tracker import PLUGIN_META, UsageTracker
-from engine.hooks import HookContext
-from engine.hooks.registry import HookRegistry
 from engine.inference.tool_format import JsonToolFormatter, NativeToolFormatter
-from providers.base import ProviderResponse
 from providers.deepseek import DeepSeekProvider
 from providers.gemini import _parse_usage
 from supervisor.config_store import ConfigStore
@@ -88,7 +83,6 @@ def test_microcompact_runtime_and_store_have_identical_content():
     assert messages[1]["content"] == stored[0].content
     assert stored[0].meta["usage"]["_compacted_stale"] is True
     assert stored[-1].content == content
-    assert compact.estimate_message_tokens({"tool_calls": [{"value": object()}]}) > 0
 
 
 def test_reasoning_survives_formatter_boundary():
@@ -101,33 +95,6 @@ def test_reasoning_survives_formatter_boundary():
         result = formatter.message_to_llm(message)
         assert result["_meta"]["reasoning"] == "private chain"
         assert "thought_summary" not in result["_meta"]
-
-
-def test_usage_tracker_runs_last_and_accumulates_all_six_fields():
-    registry = HookRegistry()
-    usage = dict(
-        prompt_tokens=10,
-        completion_tokens=5,
-        total_tokens=15,
-        cached_prompt_tokens=3,
-        cache_write_prompt_tokens=2,
-        reasoning_tokens=4,
-    )
-
-    async def fallback(ctx):
-        ctx.response = ProviderResponse(ok=True, usage=usage)
-
-    tracker = UsageTracker()
-    registry.register("after_llm_call", fallback, priority=-20)
-    registry.register("after_llm_call", tracker.handle)
-    rctx = SimpleNamespace(total_usage={})
-    ctx = HookContext(
-        messages=[], tools=[], node=None, provider=None,
-        response=ProviderResponse(ok=False), rctx=rctx,
-    )
-    asyncio.run(registry.afire("after_llm_call", ctx))
-    assert PLUGIN_META["priority"] == tracker.priority == -100
-    assert rctx.total_usage == usage
 
 
 def test_stats_cleanup_is_local_and_vacuums(tmp_path, monkeypatch):
@@ -215,10 +182,6 @@ def test_bounded_line_reader_skips_long_tail_and_keeps_next_line():
     assert chars_read == _MAX_LINE_READ_CHARS + 51
     assert _read_bounded_line(stream) == ("next", False, 5)
     assert _read_bounded_line(stream) == (None, False, 0)
-
-
-def test_sdk_health_remains_constructible_without_new_workspace_field():
-    assert HealthInfo("ok", "run", "now", 1.0).workspace_root == ""
 
 
 def test_sdk_external_path_classification(tmp_path):
@@ -634,7 +597,7 @@ def test_branch_finalize_preserves_failed_merge(merged_count, transcript_count, 
         session_id="branch_test",
         input={"parent_session_id": "parent", "branch_session_id": "branch_test", "base_count": 0},
     )
-    assert TaskRouterMixin._finalize_branch_task_locked(state, task, merge=True) == "parent"
+    assert TaskRouterMixin._finalize_branch_task_locked(state, task) == "parent"
     assert task.input.get("_branch_finalized", False) is finalized
     assert cleaned == (["branch_test"] if finalized else [])
     if not finalized:

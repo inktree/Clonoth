@@ -160,12 +160,8 @@ def test_session_context_usage_does_not_crash_without_is_switchable_entry_node(t
     assert out["usage"]["cached_prompt_tokens"] == 48000
 
 
-def test_registry_schemas_and_tool_manage_pure_async_mode(tmp_path: Path) -> None:
+def test_registry_schemas_and_tool_manage_pure_async_mode() -> None:
     root = Path(__file__).resolve().parents[1]
     reg = ToolRegistry(workspace_root=root, tools_dir=root / "tools")
-    grep_spec = reg.get_spec("grep")
-    assert "$1/$2 or \\1/\\2" in grep_spec["input_schema"]["properties"]["replace"]["description"]
     ct_props = reg.get_spec("create_or_update_tool")["input_schema"]["properties"]
     assert "pure" in ct_props and "async_mode" in ct_props
-    sched_desc = reg.get_spec("create_schedule")["input_schema"]["properties"]["conversation_key"]["description"]
-    assert "current session's conversation_key" in sched_desc

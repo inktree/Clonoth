@@ -299,7 +299,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 })
         return entries
 
-    def _plugin_event_sink(self, entry: str):
+    def _plugin_event_sink(self):
         def _sink(event_type: str, payload: dict[str, Any]) -> None:
             self._emit_plugin_event(event_type, payload)
 
@@ -346,7 +346,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             self.plugins_dir,
             entry.stem if entry.is_dir() else entry.name,
             context=self._supervisor_ctx,
-            event_sink=self._plugin_event_sink(entry.stem),
+            event_sink=self._plugin_event_sink(),
         )
         return {"ok": True, "plugin": meta.get("name"), "entry": entry_name}
 

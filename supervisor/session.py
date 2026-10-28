@@ -277,17 +277,8 @@ class SessionMixin:
                 return True
         return False
 
-    def _cleanup_branch_locked(
-        self,
-        branch_session_id: str,
-        *,
-        exclude_task_id: str = "",
-    ) -> None:
-        """Delete one entry branch session and its derived child sessions.
-
-        [2026-10-19] exclude_task_id: the task that triggered this cleanup is
-        allowed to keep running so it can finish its own turn normally.
-        """
+    def _cleanup_branch_locked(self, branch_session_id: str) -> None:
+        """Delete one entry branch session and its derived child sessions."""
         branch = str(branch_session_id or "").strip()
         if not branch:
             return
@@ -321,11 +312,8 @@ class SessionMixin:
         # 做法：把这些任务标记为 cancelled 并写快照，不递归 finalize。目的：避免任务继续
         # 写入已清理的 branch session。
         now = _now()
-        _exclude_task = str(exclude_task_id or "").strip()
         _branch_sids = {branch, *(c for c in derived_children if not self._is_entry_branch_session_locked(c, parent_session_id=branch))}
         for task in self.tasks.values():
-            if _exclude_task and task.task_id == _exclude_task:
-                continue
             _t_csid = str(task.input.get("child_session_id") or "").strip()
             if (task.session_id not in _branch_sids and _t_csid not in _branch_sids) or self._task_terminal(task):
                 continue
@@ -1033,7 +1021,7 @@ class SessionMixin:
 
     # ---- 结构化历史 (ConversationStore) ----
 
-    def session_history_structured(self, *, session_id: str, limit: int = 200, task_id: str | None = None) -> list[dict[str, Any]]:
+    def session_history_structured(self, *, session_id: str, task_id: str | None = None) -> list[dict[str, Any]]:
         """Read structured messages from ConversationStore for web frontend.
 
         Returns Message objects with thinking, tool_calls, and tool results
@@ -1352,11 +1340,7 @@ class SessionMixin:
                     entry["tool_result_structured"] = _trs
             result.append(entry)
 
-        # [2026-06-07] Why: limit truncation drops compact_summary and turn
-        # summaries sitting at the top of the JSONL. How: remove server-side
-        # limit entirely; frontend handles rendering performance via virtual
-        # scrolling. Purpose: all messages including summaries are always
-        # returned.
+        # Return the complete processed history; the API applies pagination.
         return result
 
     # ---- 上下文窗口用量 ----

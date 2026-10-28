@@ -6,19 +6,15 @@ import importlib
 import logging
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..hooks.loader import (
-    iter_hook_points,
     register_meta_handler,
     register_declared_nodes,
     clear_load_error,
     record_load_error,
     _resolve_client_assets,
 )
-
-if TYPE_CHECKING:
-    from toolbox.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +24,7 @@ _SKIP_MODULES = {"__init__", "loader", "result"}
 def auto_discover_and_register(
     registry: Any,
     *,
-    package: str = "engine.builtin",
-    directory: Path | None = None,
-    tool_registry: "ToolRegistry | None" = None,
-    context: Any = None,
+    context: Any,
 ) -> dict[str, Any]:
     """Scan built-in handler modules and register PLUGIN_META declarations.
 
@@ -52,10 +45,9 @@ def auto_discover_and_register(
     __init__.py is one plugin; internal modules stay private to the package.
     Purpose: keep one-plugin-one-entry for both shapes.
     """
-    base_dir = Path(directory) if directory is not None else Path(__file__).parent
+    base_dir = Path(__file__).parent
+    tool_registry = context.contributions.get("tools")
     handlers: dict[str, Any] = {}
-    if not base_dir.is_dir():
-        return handlers
 
     # Phase 1: import all modules, collect metadata
     # Why: we need the full set of plugin names before resolving dependencies.
@@ -71,7 +63,7 @@ def auto_discover_and_register(
             if _should_skip(entry):
                 continue
             entry_name = entry.stem
-        module_name = f"{package}.{entry_name}"
+        module_name = f"engine.builtin.{entry_name}"
         try:
             module = importlib.import_module(module_name)
             meta = getattr(module, "PLUGIN_META", None)
@@ -111,7 +103,7 @@ def auto_discover_and_register(
     load_order = _resolve_load_order(pending)
     for handler_name in load_order:
         module, meta, py_file = pending[handler_name]
-        module_name = f"{package}.{py_file.stem}"
+        module_name = f"engine.builtin.{py_file.stem}"
         # Check requires
         requires = meta.get("requires")
         if isinstance(requires, list):
@@ -245,9 +237,9 @@ def _register_meta(registry: Any, py_file: Path, meta: dict[str, Any], handler_n
 #  Single-entry runtime reload for built-in plugins
 # ---------------------------------------------------------------------------
 
-def builtin_entry_path(entry_name: str, *, directory: Path | None = None) -> Path | None:
+def builtin_entry_path(entry_name: str) -> Path | None:
     """Resolve one built-in plugin entry (file or package) under base_dir."""
-    base_dir = Path(directory) if directory is not None else Path(__file__).parent
+    base_dir = Path(__file__).parent
     pkg = base_dir / entry_name
     if pkg.is_dir() and (pkg / "__init__.py").is_file() and not _should_skip_package(pkg):
         return pkg
@@ -257,7 +249,7 @@ def builtin_entry_path(entry_name: str, *, directory: Path | None = None) -> Pat
     return None
 
 
-def drop_builtin_module(entry_name: str, *, package: str = "engine.builtin") -> None:
+def drop_builtin_module(entry_name: str) -> None:
     """Remove one built-in plugin module and its submodules from sys.modules.
 
     Why: reload must re-execute the entry's module code. How: delete the exact
@@ -265,7 +257,7 @@ def drop_builtin_module(entry_name: str, *, package: str = "engine.builtin") -> 
     modules like a vendored runtime). Purpose: import_module after this picks
     up the on-disk code instead of the cached first import.
     """
-    full = f"{package}.{entry_name}"
+    full = f"engine.builtin.{entry_name}"
     prefix = full + "."
     for name in [n for n in list(sys.modules) if n == full or n.startswith(prefix)]:
         del sys.modules[name]
@@ -275,10 +267,7 @@ def load_single_builtin(
     registry: Any,
     entry_name: str,
     *,
-    package: str = "engine.builtin",
-    directory: Path | None = None,
-    context: Any = None,
-    tool_registry: "ToolRegistry | None" = None,
+    context: Any,
 ) -> dict:
     """(Re)load one built-in plugin entry at runtime and register its PLUGIN_META.
 
@@ -290,12 +279,13 @@ def load_single_builtin(
     shared disposal ledger attributing every registration. Purpose: built-in
     plugins become reloadable through the same admin surface as external ones.
     """
-    entry = builtin_entry_path(entry_name, directory=directory)
+    tool_registry = context.contributions.get("tools")
+    entry = builtin_entry_path(entry_name)
     if entry is None:
         raise ValueError(f"no built-in plugin entry named {entry_name!r}")
 
-    drop_builtin_module(entry_name, package=package)
-    module_name = f"{package}.{entry_name}"
+    drop_builtin_module(entry_name)
+    module_name = f"engine.builtin.{entry_name}"
     try:
         module = importlib.import_module(module_name)
         meta = getattr(module, "PLUGIN_META", None)

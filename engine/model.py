@@ -145,7 +145,6 @@ class ResolvedProvider:
 
 
 def resolve_provider(
-    workspace_root: Path,
     node: Node,
     provider_default: str,
     session_override: dict[str, Any] | None = None,

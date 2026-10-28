@@ -58,7 +58,7 @@ PLUGIN_META = {
 # Why: DreamHandler cannot depend on the scheduler module for cron matching.
 # How: keep a local copy of the small 5-field matcher. Purpose: move dream logic
 # into engine.builtin without creating an engine/supervisor import cycle.
-def _match_field(field: str, value: int, max_val: int) -> bool:
+def _match_field(field: str, value: int) -> bool:
     """Return whether one cron field matches the provided integer value."""
     field = field.strip()
     if field == "*":
@@ -98,11 +98,11 @@ def _cron_match(expr: str, dt: datetime) -> bool:
 
     minute, hour, day, month, weekday = parts
     return (
-        _match_field(minute, dt.minute, 59)
-        and _match_field(hour, dt.hour, 23)
-        and _match_field(day, dt.day, 31)
-        and _match_field(month, dt.month, 12)
-        and _match_field(weekday, dt.weekday(), 6)
+        _match_field(minute, dt.minute)
+        and _match_field(hour, dt.hour)
+        and _match_field(day, dt.day)
+        and _match_field(month, dt.month)
+        and _match_field(weekday, dt.weekday())
     )
 
 
@@ -366,7 +366,6 @@ class DreamHandler:
         dream_task_id = self._create_final_dream_task(
             ctx=ctx,
             runtime_cfg=runtime_cfg,
-            now=now,
             instruction=instruction,
             memory_route=memory_route,
         )
@@ -389,7 +388,6 @@ class DreamHandler:
         *,
         ctx: dict[str, Any],
         runtime_cfg: dict[str, Any],
-        now: datetime,
         instruction: str,
         memory_route: dict[str, dict[str, str]] | None = None,
     ) -> str:

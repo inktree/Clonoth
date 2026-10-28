@@ -456,7 +456,7 @@ def _manage_workers_spec() -> dict:
     }
 
 
-def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None, *, current_node_id: str = "", current_node_name: str = "") -> dict:
+def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None) -> dict:
     """构建 switch_node 伪工具定义——切换 session 的对话节点。"""
     desc_parts = [
         "Switch the conversation's dialogue node. The current node finishes on call; the user's next message is handled by the target node.",
@@ -595,7 +595,6 @@ def build_node_tool_specs(
     downstream_info: list[dict[str, str]] | None = None,
     switch_info: list[dict[str, str]] | None = None,
     task_context: dict[str, Any] | None = None,
-    has_active_children: bool = False,
 ) -> tuple[set[str], list[dict]]:
     """Build the model-visible tool list and the allowed real-tool name set."""
     tool_specs = _filter_tool_specs(node, registry.list_specs())
@@ -633,7 +632,6 @@ def build_node_tool_specs(
         _sw_targets = [info["id"] for info in (switch_info or [])]
         openai_tools.append(_switch_node_spec(
             _sw_targets, switch_info,
-            current_node_id=node.id, current_node_name=node.name,
         ))
 
     # hybrid 模式下不注入 finish 工具：free prose 即隐式 finish。tool_only 模式下保留。

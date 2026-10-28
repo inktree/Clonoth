@@ -174,10 +174,8 @@ def truncate_tool_result(
     raw_text: str,
     max_chars: int,
     ref_path: str,
-    head_tail: bool = False,
-    tail_ratio: float = 0.25,
     *,
-    config: Mapping[str, Any] | None = None,
+    config: Mapping[str, Any],
 ) -> tuple[str, bool]:
     """Return an inline-safe tool result plus whether truncation occurred."""
     # [AutoC 2026-06-08] Why: large tool outputs should keep useful inline context and
@@ -194,27 +192,11 @@ def truncate_tool_result(
     original_len = len(text)
     ref = str(ref_path or "").strip() or "data/artifacts/tool_results/<missing>.txt"
     lowered = (tool_name or "").strip().lower()
-    if config is not None:
-        # [AutoC 2026-06-08] Allow runtime.yaml to decide head+tail behavior while
-        # preserving the explicit head_tail/tail_ratio parameters requested for the
-        # helper. Why: synchronous and async callers already carry runtime config.
-        # How: config values override the default False flag only for listed tools.
-        # Purpose: execute_command keeps tail context without every caller duplicating
-        # config parsing logic.
-        head_tail = head_tail or lowered in _head_tail_tools(config)
-        tail_ratio = _tail_ratio(config)
-    else:
-        # [AutoC 2026-06-08] Keep execute_command head+tail by default when tests or
-        # legacy callers invoke the helper without runtime config. Why: the requested
-        # design names execute_command as a head_tail tool. How: consult the built-in
-        # default set when no config is supplied. Purpose: direct helper behavior
-        # matches production defaults.
-        head_tail = head_tail or lowered in _HEAD_TAIL_TOOLS
+    head_tail = lowered in _head_tail_tools(config)
     if head_tail:
-        tail_chars = max(1, int(limit * min(0.9, max(0.05, float(tail_ratio)))))
+        tail_ratio = _tail_ratio(config)
+        tail_chars = max(1, int(limit * tail_ratio))
         head_chars = max(1, limit - tail_chars)
-        if head_chars + tail_chars > limit:
-            head_chars = max(1, limit - tail_chars)
         guidance = (
             f"...[middle omitted, showing first {head_chars:,} and last {tail_chars:,} "
             f"of {original_len:,} chars. Full output: {ref} — use read_file or grep to inspect.]"

@@ -9,7 +9,6 @@ import logging
 import mimetypes
 import os
 import shutil
-import sys
 import tempfile
 import threading
 import time
@@ -129,7 +128,6 @@ def _resolve_session_active_node_effective(
     route_session_id = str(result.get("session_id") or session_id or "").strip()
     override = st.get_session_provider_override(route_session_id) or {}
     rp = resolve_provider(
-        Path(st.workspace_root),
         node,
         default_model,
         session_override=override,
@@ -1780,7 +1778,6 @@ def create_app(
 
     @app.post("/v1/sessions/get_or_create")
     async def get_or_create_session(
-        request: Request,
         body: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
         """Get or create a session by channel + conversation_key. No task created."""
@@ -1823,7 +1820,7 @@ def create_app(
         starting from `offset` from the end.
         """
         st: SupervisorState = app.state.state
-        all_messages = st.session_history_structured(session_id=session_id, limit=0, task_id=task_id.strip() or None)
+        all_messages = st.session_history_structured(session_id=session_id, task_id=task_id.strip() or None)
         total = len(all_messages)
         if limit > 0:
             # offset=0, limit=50 → last 50 messages (all_messages[-50:])
@@ -2142,7 +2139,6 @@ def create_app(
         plan = await prepare_compaction(
             messages=messages,
             target_session_id=route_session_id,
-            node_id="api",
             keep_recent=keep_recent,
         )
         if plan.status != "dispatch":

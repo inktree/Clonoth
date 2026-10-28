@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from clonoth_runtime import get_entry_node_id, get_str, load_runtime_config
+from clonoth_runtime import get_entry_node_id, load_runtime_config
 from engine.tool_step import cleanup_tool_result_artifacts
 
 from ._helpers import _now
@@ -188,7 +188,7 @@ class TaskStoreMixin:
                 # [Fork/Merge 2026-05-12] pending 入口分支被 session cancel 直接终结时也要清理。
                 # 原因：此路径不会经过 complete_task/task_router。做法：调用幂等 finalize。
                 # 目的：避免未启动分支在主 session 取消后遗留 JSONL 与映射。
-                self._finalize_branch_task_locked(task, merge=True)
+                self._finalize_branch_task_locked(task)
                 self._cleanup_tool_result_artifacts_for_task(task.task_id)
                 self._event_task_snapshot("task_cancelled", task)
             elif task.status == TaskStatus.suspended:
@@ -196,7 +196,7 @@ class TaskStoreMixin:
                 task.status = TaskStatus.cancelled
                 task.waiting_for_task_id = None
                 task.updated_at = now
-                self._finalize_branch_task_locked(task, merge=True)
+                self._finalize_branch_task_locked(task)
                 self._cleanup_tool_result_artifacts_for_task(task.task_id)
                 self._event_task_snapshot("task_cancelled", task)
             elif task.status == TaskStatus.running and not task.cancel_requested:
@@ -204,16 +204,10 @@ class TaskStoreMixin:
                 task.updated_at = now
                 self._event_task_snapshot("task_cancel_requested", task)
 
-    def _find_last_context_ref_locked(self, session_id: str, node_id: str, *, context_key: str | None = None) -> str:
-        """查找同一 session 中指定 node_id 最近一次完成的 task 的 context_ref。
+    def _find_last_context_ref_locked(self, session_id: str, node_id: str) -> str:
+        """Find the latest completed context_ref for one session and node.
 
-        如果提供了 context_key，则按 (session_id, node_id, context_key) 精确匹配，
-        用于区分同一 node_id 的多个并发实例。否则按 (session_id, node_id) 匹配（默认行为）。
-
-        DEPRECATED — Child Session 隔离（Phase D）
-        新 dispatch 路径使用 get_or_create_child_session() 替代本方法。
-        当前仍被 task_router 的兼容期 fallback 代码调用，待 child session
-        稳定运行后可删除。
+        Used by inbound entry creation when main_session_enabled is false.
         """
         for tid in reversed(self._task_order):
             t = self.tasks.get(tid)
@@ -222,11 +216,7 @@ class TaskStoreMixin:
                 and t.node_id == node_id
                 and t.status == TaskStatus.completed
                 and t.result.get("context_ref")):
-                if context_key:
-                    if t.input.get("_context_key") == context_key:
-                        return str(t.result["context_ref"])
-                else:
-                    return str(t.result["context_ref"])
+                return str(t.result["context_ref"])
         return ""
 
     def _create_entry_task_for_inbound_locked(self, *, inbound_seq: int, session_id: str, payload: dict[str, Any]) -> Task | None:
@@ -539,7 +529,7 @@ class TaskStoreMixin:
                     # [Fork/Merge 2026-05-12] 本地取消直接置终态时同步收束入口分支。
                     # 原因：pending 任务不会再由 engine 上报完成。做法：调用幂等 finalize。
                     # 目的：让 cancel_active_tasks 与 finish/fail 路径一样清理分支。
-                    self._finalize_branch_task_locked(task, merge=True)
+                    self._finalize_branch_task_locked(task)
                     self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
@@ -548,7 +538,7 @@ class TaskStoreMixin:
                     task.status = TaskStatus.cancelled
                     task.waiting_for_task_id = None
                     task.updated_at = now
-                    self._finalize_branch_task_locked(task, merge=True)
+                    self._finalize_branch_task_locked(task)
                     self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
@@ -559,7 +549,7 @@ class TaskStoreMixin:
                             task.status = TaskStatus.cancelled
                             task.lease_expires_at = None
                             task.updated_at = now
-                            self._finalize_branch_task_locked(task, merge=True)
+                            self._finalize_branch_task_locked(task)
                             self._cleanup_tool_result_artifacts_for_task(task.task_id)
                             self._event_task_snapshot("task_cancelled", task)
                             count += 1
@@ -570,7 +560,7 @@ class TaskStoreMixin:
                         if task.lease_expires_at and task.lease_expires_at < now:
                             task.status = TaskStatus.cancelled
                             task.lease_expires_at = None
-                            self._finalize_branch_task_locked(task, merge=True)
+                            self._finalize_branch_task_locked(task)
                             self._cleanup_tool_result_artifacts_for_task(task.task_id)
                             self._event_task_snapshot("task_cancelled", task)
                         else:
@@ -614,7 +604,7 @@ class TaskStoreMixin:
                     # [Fork/Merge 2026-05-12] 单任务取消可能直接终结入口分支。
                     # 原因：pending 分支不会再进入完成路由。做法：在记录取消事件前 finalize。
                     # 目的：保证显式 task cancel 与自然完成一样回收 branch。
-                    self._finalize_branch_task_locked(t, merge=True)
+                    self._finalize_branch_task_locked(t)
                     self._cleanup_tool_result_artifacts_for_task(t.task_id)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
@@ -623,7 +613,7 @@ class TaskStoreMixin:
                     t.status = TaskStatus.cancelled
                     t.waiting_for_task_id = None
                     t.updated_at = now
-                    self._finalize_branch_task_locked(t, merge=True)
+                    self._finalize_branch_task_locked(t)
                     self._cleanup_tool_result_artifacts_for_task(t.task_id)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
@@ -635,7 +625,7 @@ class TaskStoreMixin:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
                             t.updated_at = now
-                            self._finalize_branch_task_locked(t, merge=True)
+                            self._finalize_branch_task_locked(t)
                             self._cleanup_tool_result_artifacts_for_task(t.task_id)
                             self._event_task_snapshot("task_cancelled", t)
                             count += 1
@@ -647,7 +637,7 @@ class TaskStoreMixin:
                         if not t.lease_expires_at or t.lease_expires_at < now:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
-                            self._finalize_branch_task_locked(t, merge=True)
+                            self._finalize_branch_task_locked(t)
                             self._cleanup_tool_result_artifacts_for_task(t.task_id)
                             self._event_task_snapshot("task_cancelled", t)
                         else:
@@ -930,7 +920,7 @@ class TaskStoreMixin:
                 # 原因：cancel_requested 分支原先直接 return，不会进入 task_router 的终态路由。
                 # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
                 # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
-                self._finalize_branch_task_locked(task, merge=True)
+                self._finalize_branch_task_locked(task)
                 self._mark_child_session_terminal(task)
                 self._event_task_snapshot("task_cancelled", task, component="engine")
                 return task

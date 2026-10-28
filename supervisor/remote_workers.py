@@ -666,7 +666,7 @@ class RemoteWorkerManager:
         try:
             await self._send_json(worker.websocket, message)
         except Exception as exc:
-            await self._fail_call(call.call_id, status="failed", error=f"worker send failed: {exc}")
+            await self._fail_call(call.call_id, error=f"worker send failed: {exc}")
             await self.unregister_worker(worker.connection_id, reason="send_failed")
             raise RemoteWorkerUnavailable(f"worker send failed: {exc}") from exc
 
@@ -766,7 +766,7 @@ class RemoteWorkerManager:
         try:
             await self._send_json(worker.websocket, message)
         except Exception as exc:
-            await self._fail_call(call_id, status="failed", error=f"worker cancel send failed: {exc}")
+            await self._fail_call(call_id, error=f"worker cancel send failed: {exc}")
             await self.unregister_worker(worker.connection_id, reason="cancel_send_failed")
             raise RemoteWorkerUnavailable(f"worker cancel send failed: {exc}") from exc
         return True
@@ -942,11 +942,11 @@ class RemoteWorkerManager:
         safe = _SAFE_FILENAME_RE.sub("_", name).strip("._")
         return safe or "attachment"
 
-    async def _fail_call(self, call_id: str, *, status: str, error: str) -> None:
+    async def _fail_call(self, call_id: str, *, error: str) -> None:
         async with self._condition:
             call = self.calls.get(call_id)
             if call is not None and call.status in {"running", "cancel_requested"}:
-                self._finish_call_locked(call, ok=False, status=status, error=error)
+                self._finish_call_locked(call, ok=False, status="failed", error=error)
                 self._condition.notify_all()
 
     def _finish_call_locked(

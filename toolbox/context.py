@@ -114,9 +114,9 @@ class ToolContext:
             pass
         return False
 
-    async def wait_for_approval(self, approval_id: str, poll_interval: float | None = None) -> dict[str, Any]:
+    async def wait_for_approval(self, approval_id: str) -> dict[str, Any]:
         import time as _time
-        interval = float(poll_interval) if poll_interval is not None else float(self.approval_poll_interval_sec or 0.5)
+        interval = float(self.approval_poll_interval_sec or 0.5)
         if interval <= 0:
             interval = 0.5
         _last_renew = 0.0  # monotonic timestamp of last lease renewal

@@ -27,7 +27,7 @@ _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
 # ---------------------------------------------------------------------------
 
 
-def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
+def _find_match_lines(content: str, search: str) -> list[int]:
     """找出 search 在 content 中所有匹配位置的起始行号(1-based)。
 
     改进2辅助函数：在多匹配场景下，提供每个匹配的行号候选列表，
@@ -35,7 +35,7 @@ def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
     """
     lines: list[int] = []
     start = 0
-    while len(lines) < limit:
+    while len(lines) < 20:
         idx = content.find(search, start)
         if idx == -1:
             break
@@ -45,11 +45,11 @@ def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
     return lines
 
 
-def _find_match_positions(content: str, search: str, limit: int = 200) -> list[tuple[int, int]]:
+def _find_match_positions(content: str, search: str) -> list[tuple[int, int]]:
     """Return list of (char_offset, 1-based_line_no) for all occurrences of search in content."""
     positions: list[tuple[int, int]] = []
     start = 0
-    while len(positions) < limit:
+    while len(positions) < 200:
         idx = content.find(search, start)
         if idx == -1:
             break

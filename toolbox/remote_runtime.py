@@ -12,11 +12,11 @@ from .context import ToolContext
 _http_client: httpx.AsyncClient | None = None
 
 
-def _get_http_client(timeout: float = 360.0) -> httpx.AsyncClient:
+def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
-            timeout=timeout, trust_env=False, headers={"User-Agent": "Clonoth"},
+            timeout=360.0, trust_env=False, headers={"User-Agent": "Clonoth"},
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=5),
         )
     return _http_client

@@ -5,17 +5,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from ..attachments import build_multimodal_content
 from ..compact import record_compact_success
-from ..conversation_store import Message
 from ..signals import Signal, get_bus
-from .message_model import MessageMeta, set_message_meta
-from .tool_format import ParsedToolCall
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +309,6 @@ async def apply_resume_messages(
     *,
     messages: list[dict[str, Any]],
     resume_data: dict[str, Any],
-    formatter: Any,
     node: Any,
     rctx: Any,
 ) -> None:

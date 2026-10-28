@@ -181,7 +181,7 @@ class TaskRouterMixin:
             )
         return merged_count
 
-    def _finalize_branch_task_locked(self, task: Task, *, merge: bool) -> str:
+    def _finalize_branch_task_locked(self, task: Task) -> str:
         """Merge and clean an entry branch task once; return the routing session id."""
         parent_session_id = str(task.input.get("parent_session_id") or "").strip()
         branch_session_id = str(task.input.get("branch_session_id") or "").strip()
@@ -196,7 +196,7 @@ class TaskRouterMixin:
         self._skip_merge_sessions.discard(branch_session_id)
         if _no_merge:
             task.input["_branch_skipped_merge"] = True
-        if merge and not _no_merge:
+        if not _no_merge:
             base_count = int(task.input.get("base_count") or 0)
             merged_count = self._merge_branch_locked(parent_session_id, branch_session_id, base_count)
             if merged_count is None:
@@ -215,8 +215,7 @@ class TaskRouterMixin:
         # 目的：避免重复 merge 或重复删除 branch session。
         task.input["_branch_finalized"] = True
         task.input["_branch_merged_count"] = merged_count
-        if merge:
-            self._cleanup_branch_locked(branch_session_id)
+        self._cleanup_branch_locked(branch_session_id)
         return parent_session_id
 
     def _route_completed_task_locked(self, task: Task) -> None:
@@ -299,13 +298,13 @@ class TaskRouterMixin:
             # [Fork/Merge 2026-05-12] fail 也会结束入口分支。
             # 原因：错误回复应进入主 session，同时保留分支中已产生的上下文。
             # 做法：先 merge/cleanup，再走原 fail 输出。目的：失败路径与成功路径一致。
-            route_session_id = self._finalize_branch_task_locked(task, merge=True)
+            route_session_id = self._finalize_branch_task_locked(task)
             self._route_fail_locked(task, action)
         elif act == "cancelled":
             # [Fork/Merge 2026-05-12] engine 主动返回 cancelled 时不输出，但仍收束分支。
             # 原因：cancel 是终态，不应遗留 branch session。做法：只 finalize，不调用输出路由。
             # 目的：符合 finish/cancel 时 merge 回主 session 的架构约束。
-            route_session_id = self._finalize_branch_task_locked(task, merge=True)
+            route_session_id = self._finalize_branch_task_locked(task)
         # cancelled → 不做用户输出
 
         # 若该分支因执行了 reset_conversation 而跳过 merge，则不再对已重置的旧父会话触发记忆提取与轮摘要
@@ -615,7 +614,7 @@ class TaskRouterMixin:
 
     def _route_ask_to_caller_locked(self, task: Task, result: dict[str, Any]) -> None:
         """Route ask directly to the immediate caller."""
-        self._finalize_branch_task_locked(task, merge=True)
+        self._finalize_branch_task_locked(task)
         self._resume_caller_or_output_locked(task, {
             "type": "child_ask",
             "child_node_id": str(task.node_id or task.tool_name or ""),
@@ -625,7 +624,7 @@ class TaskRouterMixin:
 
     def _route_finish_to_caller_or_user_locked(self, task: Task, result: dict[str, Any]) -> None:
         """Finalize branch and deliver finish result to caller or user."""
-        self._finalize_branch_task_locked(task, merge=True)
+        self._finalize_branch_task_locked(task)
         self._resume_caller_or_output_locked(
             task,
             self._build_child_result_resume_data(task, result),
@@ -639,14 +638,14 @@ class TaskRouterMixin:
         # 此前错误只进 event log（outbound_message），刷新后历史加载时失败轮凭空
         # 消失，schedule 会话更是完全无人可见。写入与 outbound 同一路由 session，
         # 前端历史渲染为错误卡片。
-        self._persist_fail_message_locked(task, action, error)
+        self._persist_fail_message_locked(task, error)
         self._resume_caller_or_output_locked(task, {
             "type": "child_failed",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": error,
         }, {"text": f"[error] {error}"}, action_type="fail")
 
-    def _persist_fail_message_locked(self, task: Task, action: dict[str, Any], error: str) -> None:
+    def _persist_fail_message_locked(self, task: Task, error: str) -> None:
         """Append one system/error message to the route session's JSONL.
 
         崩溃安全：落盘失败只记日志，绝不阻断后续 fail 路由（outbound 输出）。
@@ -1964,7 +1963,7 @@ class TaskRouterMixin:
 
         # 回写 TaskRecord：追加一条 updated record
         try:
-            from engine.task_record import TaskRecord, write_task_record, load_task_records
+            from engine.task_record import write_task_record, load_task_records
             from pathlib import Path
             records = load_task_records(Path(self.workspace_root), target_session_id)
             for r in reversed(records):

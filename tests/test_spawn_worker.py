@@ -114,15 +114,35 @@ def test_spawn_worker_rejects_empty_instruction(monkeypatch) -> None:
     assert emitted == [{"success": False, "error": "instruction is required"}]
 
 
-def test_builtin_worker_template_is_ephemeral() -> None:
-    """The built-in worker should be ephemeral and accept an instruction."""
-    workspace_root = Path(__file__).resolve().parents[1]
-    worker = load_node(workspace_root, "_worker")
+def test_builtin_worker_template_is_ephemeral(tmp_path: Path) -> None:
+    """Materialize a usable worker without overwriting later user edits."""
+    from engine.builtin.agent_manage import ensure_worker_node_yaml
+
+    path = ensure_worker_node_yaml(tmp_path)
+    assert path == tmp_path / "config" / "nodes" / "_worker.yaml"
+    worker = load_node(tmp_path, "_worker")
 
     assert worker is not None
+    assert worker.id == "_worker"
+    assert worker.type == "ai"
     assert worker.persistent is False
+    assert worker.provider == "" and worker.model == ""
     assert worker.tool_access.mode == "all"
-    assert "{{instruction}}" in str(worker.prompt)
+    assert "{{instruction}}" in worker.prompt
+    assert worker.control_tools == [
+        "finish", "intermediate_reply", "compact_context", "manage_workers",
+    ]
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data.update(provider="deepseek", model="user-model")
+    path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+    edited = path.read_bytes()
+
+    assert ensure_worker_node_yaml(tmp_path) == path
+    assert path.read_bytes() == edited
+    edited_worker = load_node(tmp_path, "_worker")
+    assert edited_worker is not None
+    assert (edited_worker.provider, edited_worker.model) == ("deepseek", "user-model")
 
 
 def test_unified_dispatch_to_spec_and_dynamic_refresh(tmp_path: Path) -> None:

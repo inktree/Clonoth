@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import ast
 import os
-import shutil
 import secrets
 from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 class RawContent(BaseModel):

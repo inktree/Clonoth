@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .result import hook_result
 
 logger = logging.getLogger(__name__)
 

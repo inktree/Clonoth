@@ -541,7 +541,6 @@ def save_skill_pins(workspace_root: Path, data: dict[str, list[str]]) -> None:
 # flush to a lightweight JSON sidecar every 10 min or at shutdown.
 # Purpose: zero-IO hot path, dream reads the JSON when it runs.
 
-import atexit as _atexit
 import json as _json
 
 _hit_cache: dict[str, str] = {}          # {entry_id: iso_timestamp}
@@ -670,7 +669,6 @@ def load_memory_catalog(
     workspace_root: Path,
     *,
     memory_book: str = "",
-    _use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     """Scan memory yaml files and return parsed entries.
 
@@ -680,10 +678,9 @@ def load_memory_catalog(
     否则扫 data/memory/*.yaml（现有行为，不递归）。
     缓存 key 用 (workspace_root, memory_book) 元组区分。
     """
-    if _use_cache:
-        cached = _MemoryCache.get(workspace_root, memory_book=memory_book)
-        if cached is not None:
-            return cached
+    cached = _MemoryCache.get(workspace_root, memory_book=memory_book)
+    if cached is not None:
+        return cached
 
     mem_dir = memory_dir(workspace_root, memory_book)
     if not mem_dir.exists() or not mem_dir.is_dir():
@@ -786,14 +783,14 @@ def _as_string_list(value: Any) -> list[str]:
     return []
 
 
-def _as_int(value: Any, default: int = 0) -> int:
+def _as_int(value: Any) -> int:
     """Return integer metadata while preserving legacy numeric-only coercion."""
     # Why: priority, order, and scan_depth were accepted only when YAML parsed
     # them as numbers. How: keep that rule here instead of parsing arbitrary
     # strings. Purpose: prevent a subtle behavior change during normalization.
     if isinstance(value, (int, float)):
         return int(value)
-    return default
+    return 0
 
 
 def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -834,9 +831,9 @@ def normalize_skill_entries(catalog: list[dict[str, Any]]) -> list[dict[str, Any
             "strategy": strategy,
             "keywords": keywords,
             "compiled_keywords": list(compiled_kw),
-            "priority": _as_int(raw.get("priority"), 0),
-            "order": _as_int(raw.get("order"), 0),
-            "scan_depth": max(0, _as_int(raw.get("scan_depth"), 0)),
+            "priority": _as_int(raw.get("priority")),
+            "order": _as_int(raw.get("order")),
+            "scan_depth": max(0, _as_int(raw.get("scan_depth"))),
             "node_ids": _as_string_list(raw.get("node_ids")),
             "description": str(raw.get("description") or ""),
             "path": str(raw.get("path") or ""),
@@ -886,9 +883,9 @@ def normalize_memory_entries(catalog: list[dict[str, Any]]) -> list[dict[str, An
             "strategy": strategy,
             "keywords": keywords,
             "compiled_keywords": list(compiled_kw),
-            "priority": _as_int(raw.get("priority"), 0),
+            "priority": _as_int(raw.get("priority")),
             "order": 0,
-            "scan_depth": max(0, _as_int(raw.get("scan_depth"), 0)),
+            "scan_depth": max(0, _as_int(raw.get("scan_depth"))),
             "node_ids": _as_string_list(raw.get("node_ids")),
             "description": "",
             "path": "",

@@ -5,7 +5,6 @@ Used by the web frontend sidebar and system prompt injection.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 

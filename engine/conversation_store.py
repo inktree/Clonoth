@@ -242,37 +242,6 @@ class ConversationStore:
         if messages:
             self.append_batch(session_id, messages)
 
-    def update_message(self, session_id: str, msg_id: str, new_data: dict) -> bool:
-        """按 id 替换 session 中的一条消息。
-
-        [AutoC 2026-06-18] Why: output chain reject 需要把原 finish "ok" result
-        更新为 reject reason。How: load → 找到 msg_id → 替换 → replace_all 写回。
-        Purpose: JSONL 中的 finish result 能正确反映 reject 状态。
-        返回 True 表示替换成功，False 表示未找到。
-        """
-        stored = self.load(session_id)
-        for i, m in enumerate(stored):
-            if m.id == msg_id:
-                if isinstance(new_data, dict):
-                    # Merge old message's durable fields into new_data so
-                    # the replacement doesn't lose id/timestamps/source info.
-                    merged = dict(new_data)
-                    merged.setdefault("id", m.id)
-                    merged.setdefault("created_at", m.created_at)
-                    merged.setdefault("source_node_id", m.source_node_id)
-                    merged.setdefault("source_task_id", m.source_task_id)
-                    merged.setdefault("message_type", m.message_type)
-                    merged.setdefault("response_info", m.response_info)
-                    # Runtime _meta → storage meta
-                    if "_meta" in merged and "meta" not in merged:
-                        merged["meta"] = merged.pop("_meta")
-                    stored[i] = Message.from_dict(merged)
-                else:
-                    stored[i] = new_data
-                self.replace_all(session_id, stored)
-                return True
-        return False
-
     # ── 查询 ──
 
     def message_count(self, session_id: str) -> int:

@@ -16,7 +16,7 @@ from typing import Any
 from .resume_builder import _select_attachments
 from ..compact_flow import prepare_compaction
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
-from .loop_state import _LoopState, _short
+from .loop_state import _LoopState
 from .tool_format import ParsedToolCall
 from .pseudo_tools import _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
@@ -275,7 +275,6 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
         plan = await prepare_compaction(
             messages=ls.messages,
             target_session_id=target_session_id,
-            node_id=ls.node.id,
             keep_recent=_manual_keep,
         )
         if plan.reason.startswith("truncated:"):

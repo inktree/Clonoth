@@ -186,7 +186,6 @@ class AsyncScheduler:
                     task_id=rctx.task_id,
                     session_id=rctx.parent_session_id or rctx.session_id,
                     tool_name=tool_name,
-                    tool_args=tool_args,
                     tool_ctx=exec_ctx,
                     async_tool_id=async_id,
                     started_at=t0,

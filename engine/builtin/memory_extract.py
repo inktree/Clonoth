@@ -221,7 +221,6 @@ class MemoryExtractHandler:
                 pending_task_count,
             )
             pending_extract = self._prepare_memory_extract_pending_locked(
-                ctx=ctx,
                 task=task,
                 workspace_root=workspace_root,
                 runtime_cfg=runtime_cfg,
@@ -238,7 +237,6 @@ class MemoryExtractHandler:
                 )
             return
         pending_extract = self._prepare_memory_extract_pending_locked(
-            ctx=ctx,
             task=task,
             workspace_root=workspace_root,
             runtime_cfg=runtime_cfg,
@@ -270,7 +268,6 @@ class MemoryExtractHandler:
     def _prepare_memory_extract_pending_locked(
         self,
         *,
-        ctx: dict[str, Any],
         task: Any,
         workspace_root: Path,
         runtime_cfg: dict[str, Any],

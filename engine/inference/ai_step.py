@@ -12,15 +12,8 @@ from toolbox.registry import ToolRegistry
 
 from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec
 from .resume_builder import apply_resume_messages, collect_resume_attachments
-from .loop_state import _LoopState, _build_loop_state, _persist_ctx as _persist_ctx_base, _short
-from .llm_call import (
-    _build_messages_for_provider,
-    _call_llm_with_retry,
-    _build_failure_action,
-    _is_retryable_error,
-    _RETRYABLE_STATUS_CODES,
-    call_provider_once,
-)
+from .loop_state import _LoopState, _build_loop_state, _persist_ctx as _persist_ctx_base
+from .llm_call import _call_llm_with_retry, _build_failure_action, call_provider_once
 from .pseudo_handlers import _handle_pseudo_tool
 # [AutoC 2026-08-19] 执行策略（async_mode 分流、execute_command 自适应升级）已迁入
 # engine/builtin/async_scheduler.py；循环仅保留默认同步执行入口与 execute_tool 触发。
@@ -33,15 +26,7 @@ from ..attachments import build_multimodal_content
 from ..conversation_store import Message, MessageType
 from ..node import Node
 from .message_assembly import assemble_initial_messages
-from ..protocol import (
-    TaskAction,
-    ACTION_DISPATCH,
-    ACTION_FINISH,
-    ACTION_ASK,
-    ACTION_FAIL,
-    ACTION_CANCELLED,
-    ACTION_PREEMPTED,
-)
+from ..protocol import TaskAction, ACTION_FINISH, ACTION_ASK, ACTION_FAIL, ACTION_PREEMPTED
 from ..tool_step import (
     # [AutoC 2026-08-19] artifact_enabled / get_tool_step_inline_budget / write_artifact
     # 随 spill 策略迁入 engine/builtin/spill_policy.py；此处仅保留结构化
@@ -53,11 +38,7 @@ from ..tool_step import (
 from clonoth_runtime import get_int, load_runtime_config
 from toolbox.context import ToolContext
 # Provider 请求视图在此完成动态上下文重排及反序列化格式转换。
-from .tool_format import (
-    ParsedToolCall,
-    create_tool_formatter,
-    build_llm_messages,
-)
+from .tool_format import ParsedToolCall, create_tool_formatter
 from .message_model import MessageMeta, set_message_meta
 from providers.base import BaseProvider, ToolCall, ProviderResponse
 # Phase 3 Hook System：引入 hook registry 与上下文对象。
@@ -1041,7 +1022,7 @@ async def run_ai_node(
     # fresh thin face per ai_step call shares the same declarations.
     from engine.faces.nodes import PluginNodesFace
     _engine_ctx.contributions.mount("nodes", PluginNodesFace())
-    auto_discover_and_register(hook_registry, tool_registry=registry, context=_engine_ctx)
+    auto_discover_and_register(hook_registry, context=_engine_ctx)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
     # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
@@ -1142,7 +1123,7 @@ async def run_ai_node(
     if resume_data:
         await apply_resume_messages(
             messages=messages, resume_data=resume_data,
-            formatter=formatter, node=node, rctx=rctx,
+            node=node, rctx=rctx,
         )
 
     # ---- 构建工具列表 ----
@@ -1150,7 +1131,6 @@ async def run_ai_node(
         registry=registry, node=node,
         downstream_info=downstream_info, switch_info=switch_info,
         task_context=rctx.task_context,
-        has_active_children=False,
     )
     if _cache_warm_fork_tools is not None:
         # Keep the exact same tools array in the API payload to preserve 100% of parent's Prefix KV Cache,

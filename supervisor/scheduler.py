@@ -64,7 +64,7 @@ def save_schedules(workspace_root: Path, schedules: list[dict[str, Any]]) -> Non
 #  Cron 匹配（5 字段：minute hour day month weekday）
 # ---------------------------------------------------------------------------
 
-def _match_field(field: str, value: int, max_val: int) -> bool:
+def _match_field(field: str, value: int) -> bool:
     """判断 cron 单个字段是否匹配。支持 * / , - 和 */step。"""
     field = field.strip()
     if field == "*":
@@ -106,11 +106,11 @@ def cron_match(expr: str, dt: datetime) -> bool:
 
     minute, hour, day, month, weekday = parts
     return (
-        _match_field(minute, dt.minute, 59)
-        and _match_field(hour, dt.hour, 23)
-        and _match_field(day, dt.day, 31)
-        and _match_field(month, dt.month, 12)
-        and _match_field(weekday, (dt.weekday() + 1) % 7, 6)  # cron: 0=Sun, Python: 0=Mon
+        _match_field(minute, dt.minute)
+        and _match_field(hour, dt.hour)
+        and _match_field(day, dt.day)
+        and _match_field(month, dt.month)
+        and _match_field(weekday, (dt.weekday() + 1) % 7)  # cron: 0=Sun, Python: 0=Mon
     )
 
 

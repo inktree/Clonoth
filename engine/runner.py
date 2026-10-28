@@ -18,7 +18,6 @@ from clonoth_runtime import (
     get_entry_node_id,
     get_float,
     get_int,
-    get_str,
     load_runtime_config,
     load_yaml_dict,
     normalize_llm_secret,
@@ -30,13 +29,12 @@ from toolbox.registry import ToolRegistry
 from .inference import run_ai_node
 from .attachments import build_multimodal_content
 from .context import RunContext
-from .model import ResolvedProvider, _current_sticky_sid_var, resolve_provider, wrap_http_with_sticky_session
+from .model import _current_sticky_sid_var, resolve_provider, wrap_http_with_sticky_session
 from .context_store import load_context_snapshot
 from .inference.tool_format import repair_tool_result_pairing
 
-from .node import Node, load_node
+from .node import load_node
 from engine.faces import nodes as _plugin_nodes
-from .protocol import TaskAction
 # [2026-04-17] write_artifact 移除：截断机制已废弃
 from .tool_step import result_to_raw
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
@@ -377,28 +375,16 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
     return tail[:separator_pos], pos
 
 
-def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict[str, Any]:
+def _message_to_history_dict(msg: Message) -> dict[str, Any]:
     """将 ConversationStore 的 Message 转为 runner 期望的 history dict 格式。
 
     Child Session 隔离（Phase B）：从 child session JSONL 加载的 Message 对象
     需要转为与 snapshot messages 相同的 dict 格式，供 ai_step 的消息组装使用。
     """
-    # [AutoC 2026-06-18] Why: output_rejected needs msg.id to call
-    # ConversationStore.update_message and persist the reject result.
-    # How: carry id through the history dict. Purpose: ai_step can
-    # locate and update the original finish "ok" row in JSONL.
     d: dict[str, Any] = {"role": msg.role, "content": msg.content}
     if msg.id:
         d["id"] = msg.id
-    # [AutoC 2026-06-01] Why: stripping every historical image made later LLM
-    # steps in the same task lose the user's image input. How: keep multimodal
-    # list content when source_task_id matches the active task, but preserve the
-    # old all-strip behavior for callers that do not pass current_task_id. Purpose:
-    # task-local history keeps locked user input while cross-task history stays
-    # compact and safe against stale file:// attachment references.
-    # [2026-10-26] Disabled cross-task historical image stripping (_strip_images_from_content):
-    # stripping image_url parts from previous turns mutates the historical message prefix on the next turn
-    # and invalidates the entire Prefix KV Cache from that message onward.
+    # Preserve historical image blocks so later turns retain the same prefix KV cache.
     _meta = dict(msg.meta) if msg.meta else {}
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
@@ -1000,7 +986,7 @@ async def _run_node_task(
         if not is_resume:
             # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
             stored = _conv_store.load(child_session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+            history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
             # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
             # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
             # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
@@ -1019,7 +1005,7 @@ async def _run_node_task(
         # 此时 context_ref 为空，ai_step 会走 assemble_initial_messages，需要 history 不为空。
         if use_context:
             stored = _conv_store.load(session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+            history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
             # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
             # 原因：旧 _strip_trailing_pseudo_call 只能处理 fake-native 文本 marker。
@@ -1098,7 +1084,6 @@ async def _run_node_task(
         # ACTIVE to deepseek/openai-responses changes ordinary AI task routing.
         _active_provider = str((_config_data or {}).get("provider") or "openai").strip() if isinstance(_config_data, dict) else "openai"
         rp = resolve_provider(
-            ws_root,
             node,
             default_model,
             session_override=session_provider_override,

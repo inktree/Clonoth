@@ -37,7 +37,7 @@ def _make_child_preexec():
 class ManagedProcess:
     name: str
     popen: subprocess.Popen
-    log_path: Path | None
+    log_path: Path
 
 
 class ProcessManager:
@@ -122,7 +122,6 @@ class ProcessManager:
             prev_handler = signal.getsignal(sig)
 
             def _handler(signum, frame, _prev=prev_handler):
-                import traceback as _tb
                 try:
                     _sname = signal.Signals(signum).name
                 except (ValueError, AttributeError):
@@ -156,42 +155,26 @@ class ProcessManager:
         self,
         *,
         name: str,
-        module: str | None = None,
-        script_path: Path | None = None,
+        module: str,
         extra_args: list[str] | None = None,
-        capture_output: bool = True,
-        new_console: bool = False,
         extra_env: dict[str, str] | None = None,
         pass_supervisor_arg: bool = True,
     ) -> ManagedProcess:
-        log_path = self.log_dir / f"{name}-{_timestamp()}.log" if capture_output else None
-        stdout = None
-        stderr = None
-        if capture_output and log_path:
-            log_f = log_path.open("a", encoding="utf-8")
-            stdout = log_f
-            stderr = subprocess.STDOUT
+        log_path = self.log_dir / f"{name}-{_timestamp()}.log"
+        log_f = log_path.open("a", encoding="utf-8")
 
         env = {**os.environ, "CLONOTH_SUPERVISOR_URL": self.supervisor_url}
         if extra_env:
             env.update(extra_env)
 
-        if script_path is not None:
-            cmd = [sys.executable, str(script_path)]
-        elif module:
-            cmd = [sys.executable, "-m", module]
-        else:
-            raise ValueError("module or script_path is required")
+        cmd = [sys.executable, "-m", module]
         if pass_supervisor_arg:
             cmd.extend(["--supervisor", self.supervisor_url])
         if extra_args:
             cmd.extend(extra_args)
 
-        creationflags = 0
         preexec_fn = None
-        if sys.platform == "win32" and new_console:
-            creationflags = subprocess.CREATE_NEW_CONSOLE
-        elif sys.platform != "win32":
+        if sys.platform != "win32":
             # Linux/macOS: 父进程退出时子进程自动收到 SIGTERM
             preexec_fn = _make_child_preexec()
 
@@ -199,9 +182,8 @@ class ProcessManager:
             cmd,
             cwd=str(self.workspace_root),
             env=env,
-            stdout=stdout,
-            stderr=stderr,
-            creationflags=creationflags,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
             preexec_fn=preexec_fn,
             start_new_session=True,  # engine 独立进程组，杀 engine 不波及 supervisor
         )
@@ -217,8 +199,6 @@ class ProcessManager:
             proc = self._spawn(
                 name=name,
                 module="engine",
-                capture_output=True,
-                new_console=False,
                 extra_args=["--worker-id", name],
             )
             self.engines.append(proc)
@@ -251,8 +231,6 @@ class ProcessManager:
         self.discord_adapter = self._spawn(
             name="discord-adapter",
             module="adapters.discord.app",
-            capture_output=True,
-            new_console=False,
             pass_supervisor_arg=False,
             extra_env=extra_env,
         )
@@ -263,8 +241,6 @@ class ProcessManager:
         self.onebot_adapter = self._spawn(
             name="onebot-adapter",
             module="adapters.onebot.app",
-            capture_output=True,
-            new_console=False,
             pass_supervisor_arg=False,
             extra_env={
                 "ONEBOT_HOST": self.onebot_host,
@@ -302,8 +278,6 @@ class ProcessManager:
                 "--reverse-suffix", "/onebot/v11/ws",
                 "--quick-login", self.napcat_quick_login,
             ],
-            capture_output=True,
-            new_console=False,
             pass_supervisor_arg=False,
         )
 

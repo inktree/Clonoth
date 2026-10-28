@@ -17,7 +17,7 @@ from .stream_buffer import _StreamBuffer
 from providers.dsml import StreamFilter as _DSMLStreamFilter
 from ..attachments import prepare_messages_for_llm
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
-from .loop_state import _LoopState, _persist_ctx, _short
+from .loop_state import _LoopState, _persist_ctx
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
 from .tool_format import build_llm_messages, repair_tool_result_pairing
 from ..hooks import HookContext, hook_registry
