@@ -6,17 +6,13 @@ strategy: normal
 keywords:
 - ryza
 - onnxruntime
-- hybrid
 - idle_unload
 - 空闲卸载
-- 显存
-- VRAM
 - CUDA context
 - local_onnx_tts
 - TTS 性能
-- 部署包
 priority: 75
-scan_depth: 1
+scan_depth: 0
 ---
 
 # Ryza ONNX TTS 运维记录（完整版）

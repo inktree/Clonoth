@@ -369,7 +369,7 @@ def append_discord_reply_modality_hint(rt: Any, inbound_text: str, input_modalit
         "normal_cn、normal_ja、whisper_cn、whisper_ja，应按语言和说话情景选择。"
         "使用 Mimo 时，格式为 <tts backend=\"mimo\" voice=\"音色名\">正文</tts>，voice 可省略以使用配置的默认音色。"
         "每个 TTS 段都可以独立选择；适配器会原样传给合成后端，不会用语言检测覆盖明确选择。"
-        "正常文字必须包含完整回复，TTS 只能作为附加语音；不要发送纯 TTS。"
+        "支持文字加 <tts> 语音回复，也支持纯 <tts> 语音回复。"
     )
     if input_modality == "voice" and rt.discord_voice_reply_on_voice_input:
         hint = (
