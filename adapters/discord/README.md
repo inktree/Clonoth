@@ -5,14 +5,16 @@
 ## 目录结构
 
 ```
-adapters/discord/
-├── app.py           # 入口：配置常量、DiscordRuntime、SDK 初始化、事件注册
-├── main.py   # 兼容性入口（调用 app.main()）
-├── agent.py         # Bridge Server、消息处理主逻辑、审批/取消 View
-├── callbacks.py     # EventRouter 回调实现（发送 Discord 消息、编辑、React）
-├── context.py       # 群聊上下文构建（历史记录、成员信息、提及解析）
-├── messaging.py     # 附件收集、图片/文件 MIME 识别、媒体文本生成
-└── __init__.py
+adapters/
+├── message_text.py      # 跨平台确定性分段、代码围栏闭合与 <tts> 标签解析
+└── discord/
+    ├── app.py           # 入口：配置常量、DiscordRuntime、SDK 初始化、事件注册
+    ├── main.py          # 兼容性入口（调用 app.main()）
+    ├── agent.py         # Bridge Server、消息处理主逻辑、!model 命令、审批/取消 View
+    ├── callbacks.py     # EventRouter 回调实现（发送 Discord 消息、编辑进度、React）
+    ├── context.py       # 群聊/私聊上下文构建（历史记录、成员身份、提及解析）
+    ├── messaging.py     # 附件收集、分块发送、语音转写/合成调用与安全重启
+    └── __init__.py
 ```
 
 ## 前置依赖
@@ -107,31 +109,32 @@ WantedBy=multi-user.target
 
 ### Bridge Server
 
-Bot 启动后会在 `127.0.0.1:{DISCORD_BRIDGE_PORT}` 开启一个 HTTP 服务，供 Supervisor 回调使用。主要端点：
+Bot 启动后会在 `127.0.0.1:{DISCORD_BRIDGE_PORT}` 开启一个本地 HTTP 服务，供 `discord_manage` 与 `clear_context` 等外部工具调用：
 
-- `POST /execute` — 执行 discord.py 代码（discord_manage 工具）
-- `POST /restart` — 触发 Bot 重启
+- `POST /discord` — 在 Bot 进程内执行异步 `discord.py` 代码并返回 JSON 结果
 
 ### 消息流程
 
 ```
 用户消息 → discord.py on_message
-  → 构建上下文（历史、成员、附件）
-  → SDK submit_inbound → Supervisor
-  → Supervisor 处理并产生事件
-  → EventRouter 轮询事件
-  → callbacks 发送 Discord 回复
+  → 构建上下文（群聊/私聊历史、成员身份、附件与语音转写）
+  → SDK submit_inbound → Supervisor (群聊默认 use_branch=True 并发分支)
+  → Supervisor 调度 Engine 执行并向 /v1/ws 推送实时事件
+  → EventRouter 消费 WebSocket 事件流
+  → callbacks 调用 message_text.py 确定性切分文本、闭合代码块并合成/发送 TTS 语音
 ```
 
 ### 附件处理
 
-附件通过 `_collect_attachments()` 从 Discord CDN 下载并保存到 `data/attachments/` 目录。如果 SDK client 已初始化且 Supervisor 提供了上传端点，会优先走 API 上传。
+附件通过 `_collect_attachments()` 从 Discord CDN（含引用消息与转发消息 `message_snapshots`）提取并上传至 Supervisor（或写入 `data/attachments/`）。
 
-### 音频消息处理
+### 音频消息处理（ASR & 双后端 TTS）
 
-Discord 用户发送音频附件时，适配器会保存附件并调用 Supervisor 的 `/v1/audio/transcribe` 进行转写。后端音频接口统一接入 Mimo ASR。转写成功后，文本会以语音输入模式提交给 Clonoth。
+Discord 用户发送音频附件时，适配器调用 Supervisor 的 `/v1/audio/transcribe`（Mimo ASR）转写为文本，并以语音输入模式提交给 Clonoth。
 
-回复中显式标记的 `<tts>...</tts>` 或 `[[tts]]...[[/tts]]` 片段会调用 Supervisor 的 `/v1/audio/synthesize` 合成音频附件。后端音频接口统一接入 Mimo TTS。
+回复中显式标记的 `<tts ...>...</tts>`（或 `[[tts]]...[[/tts]]`）片段会调用 Supervisor 的 `/v1/audio/synthesize` 合成语音附件并发送：
+- **本地 Ryza ONNX (`backend="ryza_onnx"`)**：支持 `normal_cn`、`normal_ja`、`whisper_cn`、`whisper_ja` 预设，输出 32kHz WAV，空闲自动卸载模型释放显存。
+- **Mimo 云端 (`backend="mimo"`)**：支持自定义 `voice` 与 `instruction`。
 
 ## Docker 注意事项
 

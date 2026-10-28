@@ -17,7 +17,7 @@ Supervisor 是系统的控制面。它接收外部输入，维护 session、任�
 - 通过 `/v1/events` 和 session 级事件接口向 SDK 或适配器暴露事件流。
 - 在 task 完成后根据 `result.action` 进行统一路由，例如 finish、dispatch、switch、preempt、compact 等后续动作。
 
-`supervisor/task_router.py` 中的 `TaskRouterMixin` 是完成态任务的统一分发入口。它会先处理批量任务、上下文压缩任务和轮摘要任务，再根据 task result 中的 action 字段进入对应子路由。
+`supervisor/task_router.py` 中的 `TaskRouterMixin` 是完成态任务的统一分发入口。它会先处理批量任务、上下文压缩任务与入口分支合并（`_finalize_branch_task_locked`），再根据 task result 中的 action 字段进入对应子路由（`finish`、`dispatch`、`switch`、`preempt`、`compact` 等）。
 
 ### Engine：LLM 推理与工具执行
 
@@ -39,9 +39,9 @@ Engine 是执行面。它从 Supervisor 领取任务，加载节点配置，构�
 
 Bot Adapter 是平台接入层。它不直接执行模型推理，也不直接管理任务队列，而是把 Discord、命令行或其他平台的输入转成 Clonoth 的 inbound 请求，并把事件流转回平台消息。
 
-SDK 中的 `EventRouter` 是 Adapter 的通用协议层。它轮询 Supervisor 事件流，维护触发消息和主任务状态，并通过 `AdapterCallbacks` 通知具体平台适配器执行发送消息、编辑进度、展示审批界面、刷新 typing 状态等操作。
+SDK 中的 `EventRouter` 是 Adapter 的通用协议层。它通过 WebSocket `/v1/ws` 实时订阅 Supervisor 事件流，维护触发消息和主/子任务状态，并通过 `AdapterCallbacks` 通知具体平台适配器执行发送消息、编辑进度、展示审批界面、刷新 typing 状态等操作。
 
-SDK 保留平台无关逻辑，例如协议标记清理、审批去重和事件分发。平台相关逻辑，例如 Discord 的 `[SPLIT]`、`[REACT]`、消息编辑节流和动画展示，由具体 Adapter 自行处理。
+SDK 保留平台无关逻辑，例如协议标记清理、审批去重和事件分发。平台相关逻辑，例如 `adapters/message_text.py` 的 `[SPLIT]` 确定性切分、代码围栏闭合、`<tts>` 语音标签提取，以及 Discord 的 `[REACT]`、消息编辑节流和动画展示，由具体 Adapter 处理。
 
 ## 2. 进程模型
 
@@ -53,7 +53,7 @@ Clonoth 采用多进程模型。Supervisor、Engine 和 Bot Adapter 可以分别
 2. Supervisor 记录 inbound event，并把输入放入待处理队列。
 3. Engine 通过 `/v1/inbound/next` 和 `/v1/tasks/next` 领取工作。
 4. Engine 执行节点或工具任务后，通过 `/v1/tasks/{task_id}/complete` 回报结果。
-5. Bot Adapter 或 SDK 通过 `/v1/events` 按 `after_seq` 轮询新事件，并把输出呈现到平台。
+5. Bot Adapter 通过 SDK 的 `EventRouter`（WebSocket `/v1/ws`）实时接收新事件，并把输出呈现到平台。
 
 这种设计让调度状态集中在 Supervisor，推理和工具执行集中在 Engine，平台协议集中在 Adapter。任一层重启时，可以依靠事件日志、任务状态和会话信息恢复运行。
 
@@ -122,7 +122,7 @@ inbound → task_created → node_started → llm_call → tool_call → finish
 
 ## 6. 节点系统
 
-节点由 yaml 配置定义。用户配置目录是 `config/nodes/`。系统内建节点（压缩、摘要、记忆提取等）自 2026-08-30 起由所属内置插件通过 nodes face 声明（PLUGIN_META.nodes，声明文件在 `engine/builtin/nodes/`），`engine/system_nodes/` 仅作为遗留目录兜底。解析优先级：插件声明 > `engine/system_nodes/` > `config/nodes/`（Paradox 式覆盖语义）。
+节点由 yaml 配置定义。用户配置目录是 `config/nodes/`（支持 `*.local.yaml` 本机私有覆盖）。系统内建节点（上下文压缩 `system.compactor`、记忆提取 `system.memory_extractor`、记忆整理 `system.dream`）由所属内建插件在 `engine/builtin/` 中通过 nodes face 声明，解析优先级为：内建插件声明 > `config/nodes/*.local.yaml` > `config/nodes/*.yaml`。
 
 一个 node yaml 通常描述以下内容：
 

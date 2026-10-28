@@ -1,6 +1,6 @@
 # Clonoth SDK
 
-Pure protocol layer that encapsulates all communication between a Bot adapter and the Clonoth Supervisor. The SDK handles HTTP API calls, event polling, protocol state management, and approval logic — so adapters only need to implement platform-specific operations (sending messages, editing UI, etc.).
+Pure protocol layer that encapsulates all communication between a Bot adapter and the Clonoth Supervisor. The SDK handles HTTP API calls, real-time WebSocket event streaming (`/v1/ws`), protocol state management, and approval deduplication/auto-approval — so adapters only need to implement platform-specific operations (sending messages, editing UI, etc.).
 
 The SDK has **zero platform dependencies** (no discord.py, no telegram, etc.). Platform concerns live in the adapter.
 
@@ -10,12 +10,12 @@ Four layers, bottom to top:
 
 | Layer | Class | Role |
 |-------|-------|------|
-| **HTTP Client** | `ClonothClient` | 11 typed async methods wrapping every Supervisor HTTP endpoint |
-| **State** | `SessionState` | Centralized runtime state — replaces scattered global dicts (triggers, session maps, watermarks, task states) |
-| **Event Router** | `EventRouter` | Polls `/v1/events`, dispatches 18 event types through protocol handlers, then notifies the adapter |
-| **Callbacks** | `AdapterCallbacks` | 15-method `Protocol` interface — the adapter implements these to perform platform operations |
+| **HTTP + WS Client** | `ClonothClient` | Typed async methods wrapping Supervisor HTTP endpoints and WebSocket `/v1/ws` stream |
+| **State** | `SessionState` | Centralized runtime state — triggers, session maps, channel context watermarks, and task states |
+| **Event Router** | `EventRouter` | Streams `/v1/ws` events with exponential-backoff reconnect, dispatches protocol handlers, and notifies the adapter |
+| **Callbacks** | `AdapterCallbacks` | `Protocol` interface — the adapter implements these to perform platform operations |
 
-Supporting modules: `BotConfig` (configuration injection), `types` (dataclasses for API responses), `approval` (dedup + path classification + auto-approve).
+Supporting modules: `BotConfig` (configuration injection), `types` (dataclasses for API responses), `approval` (`ApprovalTracker` dedup + `auto_approve` retry logic; path trust classification is provided by Supervisor policy via `clonoth_runtime.classify_path`).
 
 ## Two-Layer Hook Architecture
 
@@ -96,13 +96,13 @@ asyncio.run(router.run())
 | File | Description |
 |------|-------------|
 | `__init__.py` | Public API surface — re-exports all user-facing symbols |
-| `client.py` | `ClonothClient` — async HTTP client for 11 Supervisor API endpoints |
+| `client.py` | `ClonothClient` — async HTTP client + `ws_connect()` WebSocket stream client |
 | `state.py` | `SessionState` + dataclasses (`TriggerInfo`, `MainTaskState`, `ChildTaskState`) — centralized runtime state |
-| `callbacks.py` | `AdapterCallbacks` — 15-method `typing.Protocol` the adapter implements |
-| `event_router.py` | `EventRouter` — poll loop, 18 event handlers, Layer 1/2 dispatch, `strip_protocol_markers()` |
+| `callbacks.py` | `AdapterCallbacks` — `typing.Protocol` the adapter implements |
+| `event_router.py` | `EventRouter` — WebSocket event loop, periodic sweep, Layer 1/2 dispatch, `strip_protocol_markers()` |
 | `config.py` | `BotConfig` — configuration dataclass injected into router and client |
 | `types.py` | `Event`, `InboundResult`, `RunningTask`, `HealthInfo`, `OpenAIConfig` — API response types |
-| `approval.py` | `ApprovalTracker` (dedup), `classify_path` / `is_external_operation` (path classification), `auto_approve` (retry logic) |
+| `approval.py` | `ApprovalTracker` (dedup) and `auto_approve` (workspace-level auto-approval) |
 
 ## SDK Boundary
 

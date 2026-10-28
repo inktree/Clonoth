@@ -12,10 +12,10 @@ Clonoth 是一个模块化、可扩展的多平台 AI Agent 框架。面向长�
 
 Clonoth 采用 Supervisor + Engine + Bot Adapter 的多进程架构。
 
-- **Supervisor** 负责进程管理、会话管理、任务路由、审批策略、事件记录、计划任务和管理接口。
-- **Engine** 负责执行 AI 节点，包括上下文构建、模型调用、工具调用、Hook 执行、记忆处理、上下文压缩和节点切换。
-- **Bot Adapter** 负责接入外部平台，例如 Discord 和 QQ，并将平台消息转换为 Clonoth 的会话与任务请求。
-- **SDK** 为外部调用方提供客户端、回调、审批和事件路由等封装。
+- **Supervisor** 负责进程管理、会话管理、任务路由、审批策略、事件流广播（WebSocket `/v1/ws`）、用量计费统计（SQLite `usage_store`）、本地 ONNX TTS / Mimo 语音合成转写、计划任务和管理接口。
+- **Engine** 负责执行 AI 节点，包含模块化推理循环（`engine/inference/`）、内建插件体系（`engine/builtin/`：渐进式知识/技能大纲注入、记忆自动提取、Dream 记忆归并、上下文压缩、MCP 运行时、异步工具调度）、Hook 执行与信号总线（`engine/signals/`）。
+- **Bot Adapter** 负责接入外部平台（Discord、QQ/OneBot、Web 前端），通过共享的确定性文本切分与 TTS 标签解析模块（`adapters/message_text.py`）处理长消息分段、代码围栏闭合与多后端语音收发。
+- **SDK (`clonoth_sdk/`)** 为平台适配器提供纯 WebSocket 事件路由（`EventRouter`）、会话与触发状态管理（`SessionState`）、审批去重与自动放行（`ApprovalTracker`）及回调协议（`AdapterCallbacks`）。
 
 这种拆分方式使平台接入、运行时控制和模型执行可以独立演进，也便于在不同部署环境中按需组合。
 
@@ -25,7 +25,7 @@ Clonoth 采用 Supervisor + Engine + Bot Adapter 的多进程架构。
 
 `providers` 包提供统一的模型 Provider 接口。`ProviderRegistry` 负责发现和注册 Provider 实现，新增模型后端时通常只需要新增对应的 `providers/*.py` 文件，并按约定暴露实现类。
 
-当前目录中包含 OpenAI、OpenAI Responses、Anthropic、Gemini 等 Provider 相关实现。
+当前目录中包含 OpenAI、OpenAI Responses、Anthropic、Gemini、DeepSeek 等 Provider 实现，统一支持流式推理思考链（Reasoning）回传、Prompt Cache 断点对齐与多维 Token/费用统计。
 
 ### Hook 系统
 
@@ -37,38 +37,58 @@ Hook 系统将运行时策略从主推理流程中拆出，便于测试和维护
 
 `plugins` 目录支持外部插件。插件通过 `PLUGIN_META`（自动发现）或 `register(ctx)` 函数（收到 EngineContext 统一注册面入口）注册 hook handler、工具、HTTP 路由和前端贡献（面板/槽位/样式）。示例文件 `plugins/example_hook.py.disabled` 展示了基本协议，去掉 `.disabled` 后缀即可作为插件模板启用；运行时装卸见设置区「插件」管理页。
 
-### 多平台接入
+### 多平台接入与本地语音（TTS / ASR）
 
-Clonoth 面向多平台 Bot 场景设计。当前项目包含 Discord 管理工具和 QQ/OneBot 相关数据与适配痕迹，平台接入层可以通过 Bot Adapter 将平台事件统一交给 Supervisor 和 Engine 处理。
+Clonoth 内置完整的 **Web 前端**、**Discord 适配器**与 **QQ / OneBot (NapCat) 适配器**：
+
+- **确定性消息切分（`adapters/message_text.py`）**：统一处理 Discord / OneBot 的 `[SPLIT]` / `[LEFT]` 标记、自然边界长文切分、缩进保留与跨段代码块（` ``` `）自动闭合重开，无需额外的后置 QA 节点。
+- **双后端语音支持**：统一通过 Supervisor `/v1/audio/synthesize` 与 `/v1/audio/transcribe` 提供语音能力，支持 `<tts backend="ryza_onnx" preset="normal_cn">...</tts>`（本地 Ryza v2ProPlus ONNX 引擎，支持按需懒加载与空闲自动卸载释放显存/内存）与 `<tts backend="mimo">...</tts>`（Mimo 云端语音合成/识别）。
 
 ### 工具系统
 
-`tools` 和 `toolbox` 提供工具注册、运行和上下文支持。工具可以由 Engine 调用，用于文件操作、科学计算、图片处理、Discord 管理、网页读取、MCP 客户端接入等任务。
+`tools`（外部子进程工具）和 `toolbox`（内建进程内工具与远程 Worker 转发）提供统一 `(args, ctx)` ABI 的工具注册与执行支持，内置文件读写、差异补丁（`apply_diff`）、目录遍历（`list_dir`）、全文检索（`search_in_files`）、命令执行（支持超时自动升级异步通知）、多模态媒体理解（`read_media`）、Discord Bridge 管理与 MCP 持久连接池。
 
-### 技能系统
+### 技能与记忆系统（渐进式大纲注入）
 
-`skills` 目录保存可注入的技能说明。技能可以按关键词或常驻策略注入上下文，用于给 Agent 增加特定领域能力、工具使用规范或平台交互规则。
+`engine/builtin/knowledge_inject` 统一管理 `skills/` 与长期记忆的上下文注入：
 
-### 记忆系统
+- **渐进式披露（Progressive Disclosure）**：超长技能与记忆自动提取结构化标题大纲注入系统提示词，Agent 按需调用工具拉取全文，大幅降低常驻 Prompt Token 消耗并提升缓存命中率。
+- **自动提取与 Dream 归并**：支持对话空闲/增量触发 `engine/builtin/memory_extract.py` 提取记忆碎片，并由 `engine/builtin/dream.py` 定时归并整理。
 
-Engine 包含记忆提取、记忆存储、上下文压缩和轮次摘要相关模块。记忆系统用于在长期会话中保存用户偏好、项目事实和可复用背景信息。
+## 目录结构
 
-## 目录结构简表
-
-| 路径 | 说明 |
-| --- | --- |
-| `engine/` | AI 节点执行核心，包含推理步骤、上下文、记忆、工具调用、Hook 和系统节点。 |
-| `supervisor/` | 任务监督层，包含任务路由、会话、审批、安全策略、计划任务和管理 API。 |
-| `providers/` | 模型 Provider 实现与 Provider 注册表。 |
-| `clonoth_sdk/` | 适配器层 SDK，封装事件路由、审批和回调协议。 |
-| `tools/` | 可由 Agent 调用的自定义工具。 |
-| `toolbox/` | 工具运行时、注册表、MCP 和技能运行支持。 |
-| `skills/` | 技能定义，用于向模型注入领域能力和行为规则。 |
-| `plugins/` | 外部 Hook 插件目录。 |
-| `adapters/` | 平台适配器（Discord、QQ/OneBot、Web 前端）。 |
-| `remote_worker_sdk/` | 远程 Worker SDK，用于将工具执行卸载到远程机器。 |
-| `config/` | 运行时、节点、工作流和模型路由配置。 |
-| `docs/` | 架构设计、集成说明和演进文档。 |
+```text
+Clonoth/
+├── engine/                     # AI 节点执行核心
+│   ├── inference/              # 推理主循环 (ai_step, llm_call, tool_format, pseudo_handlers, async_tools)
+│   ├── builtin/                # 内建核心插件 (knowledge_inject, memory_extract, dream, compact, mcp)
+│   ├── hooks/                  # Hook 注册表与生命周期拦截协议
+│   ├── faces/                  # 插件能力注册面 (tools, nodes, routes, prompt_sections, ui)
+│   ├── signals/                # 进程内信号总线与 JSONL 桥接
+│   ├── tool_result_formatters.py # 单阶段工具结果摘要/详情格式化器
+│   └── runner.py               # Worker 进程主循环与任务拉取
+├── supervisor/                 # 控制面与调度中心
+│   ├── api.py                  # FastAPI HTTP + WebSocket (/v1/ws) 接口
+│   ├── task_router.py          # 任务完成态统一状态机路由与分支合并
+│   ├── session.py              # 会话管理、Fork/Merge 分支与级联清理
+│   ├── local_onnx_tts.py       # 本地 Ryza ONNX TTS 懒加载与空闲自动卸载引擎
+│   ├── usage_store.py          # SQLite 多维 Token 用量与模型计费统计
+│   └── process_manager.py      # Engine Workers 与平台适配器子进程生命周期管理
+├── providers/                  # 模型后端实现 (openai, openai_responses, anthropic, gemini, deepseek)
+├── toolbox/                    # 内建工具集 (builtins/)、统一上下文与远程 Worker 运行时
+├── tools/                      # 外部子进程工具 (discord_manage, clear_context, read_media, clonoth_debug)
+├── clonoth_sdk/                # 平台无关协议 SDK (ClonothClient, EventRouter, SessionState, ApprovalTracker)
+├── adapters/                   # 多平台接入层
+│   ├── message_text.py         # 跨平台确定性文本切分、代码围栏闭合与 <tts> 标签解析
+│   ├── discord/                # Discord Bot 适配器与本地 Bridge Server
+│   ├── onebot/                 # QQ / OneBot v11 (NapCat) 适配器
+│   └── web/                    # React + TypeScript + Vite 管理与对话前端
+├── plugins/                    # 外部扩展插件 (ide, plugin_manager, message_retry, reroll_button)
+├── remote_worker_sdk/          # 远程工具执行 Worker SDK
+├── config/                     # 运行时配置 (runtime.yaml) 与节点定义 (nodes/*.yaml)
+├── skills/                     # 技能说明文档库 (SKILL.md)
+└── docs/                       # 架构设计与模块说明文档
+```
 
 ## 快速开始
 
@@ -109,12 +129,13 @@ cp config.example.yaml data/config.yaml
 cp policy.example.yaml data/policy.yaml
 ```
 
-三份配置文件的职责：
+配置文件的职责：
 
-- **`.env`**：环境变量，存放 API Key 等敏感信息。不提交到仓库。
-- **`data/config.yaml`**：Provider 选择、模型、base URL。支持 `${ENV_VAR}` 引用环境变量。不提交到仓库。
-- **`data/policy.yaml`**：安全策略（文件读写权限、命令执行审批规则）。
-- **`config/runtime.yaml`**：Engine 运行时参数（步数限制、上下文压缩阈值、worker 数量等）。可提交到仓库。
+- **`.env`**：环境变量，存放 API Key、Bot Token 等敏感信息。不提交到仓库。
+- **`data/config.yaml`**：Provider 选择、模型、base URL 与语音配置。支持 `${ENV_VAR}` 引用环境变量。不提交到仓库。
+- **`data/policy.yaml`**：安全策略（文件读写权限、命令执行审批规则、`extra_roots`）。
+- **`config/runtime.yaml`**：Engine 与 Supervisor 运行时参数（步数限制、压缩阈值、worker 数量、适配器与本地 TTS 开关等），可提交到仓库。
+- **`config/runtime.local.yaml` & `config/nodes/*.local.yaml`**（可选）：本机私有覆盖配置，自动与主配置深度合并，已被 Git 忽略，便于多工作树/本地真机调试。
 
 `data/config.yaml` 默认通过 `${OPENAI_BASE_URL}` 等引用 `.env` 中的变量，通常无需额外编辑。
 
