@@ -8,12 +8,10 @@ keywords:
 - extra_headers
 - additional_headers
 - WS connection failed
-- 事件流
-- connection open
 - ws_connect
 - clonoth_websockets
 priority: 70
-scan_depth: 1
+scan_depth: 0
 ---
 
 # Clonoth 事件流中断排查手册

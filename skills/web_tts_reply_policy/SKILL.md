@@ -6,7 +6,7 @@ strategy: normal
 keywords:
 - '[TTS:auto]'
 priority: 80
-scan_depth: 2
+scan_depth: 0
 ---
 
 # Web TTS 回复规则

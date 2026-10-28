@@ -278,6 +278,7 @@ def _strip_discord_wrapper_for_scan(text: str) -> str:
     if m:
         cmd_part = text[m.end():]
         cmd_part = re.sub(r"\n*请根据以上上下文，执行当前用户的指令并给出回复。\s*$", "", cmd_part)
+        cmd_part = re.sub(r"\n*【Discord 回复方式提示】[\s\S]*$", "", cmd_part)
         # Keep speaker name (without role list) + actual command body
         cmd_part = re.sub(r"^([^\n（(]{1,80})(?:（身份组:\s*[^）\n]*）|\([^)\n]*\))\s*:\s*", r"\1: ", cmd_part)
         out_parts.append(cmd_part)

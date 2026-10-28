@@ -1,54 +1,12 @@
-# BotTTS Skills
+# Clonoth Skills
 
-这里维护 BotTTS 的业务 skills。
+这里维护按需激活（`strategy: normal`、`scan_depth: 0`）的业务与运维 Skills。所有已落地的常规开发规范不再挂载为 `constant` 常驻 Skill。
 
-当前阶段聚焦本地开发，不做 QQ / Discord 实际接入。
+## 当前 Skills
 
-## 当前 skills
-
-| Skill | 策略 | 用途 |
+| Skill | 策略 | 触发条件与用途 |
 |---|---|---|
-| `local-development` | constant | 本地开发、同步、启动流程。 |
-| `project-structure` | constant | BotTTS 与 Clonoth 分层维护规范。 |
-| `response-quality` | constant | 本地助手回复质量规范。 |
-| `memory-guidelines` | constant | BotTTS 长期记忆提取与使用规范。 |
-| `local-voice-development` | constant | 本地语音工作流开发规范。 |
-| `local-troubleshooting` | normal | 本地运行故障排查，按关键词触发。 |
-
-## 格式
-
-每个 skill 位于独立目录中：
-
-```text
-skills/<skill-name>/SKILL.md
-```
-
-`SKILL.md` 使用 YAML frontmatter：
-
-```yaml
----
-name: skill-name
-description: skill description
-enabled: true
-strategy: constant
-order: 0
-priority: 0
-node_ids:
-  - local_assistant
----
-```
-
-## 同步
-
-执行：
-
-```powershell
-cd ..\BotTTS
-.\scripts\sync-to-clonoth.ps1
-```
-
-同步到：
-
-```text
-Clonoth/skills/
-```
+| `clonoth-ryza-tts-ops` | normal | Ryza ONNX TTS 运维记录：hybrid 环境、性能与显存实测、空闲卸载、CUDA context 残留与测试脚本。 |
+| `clonoth-ws-eventstream-troubleshooting` | normal | Clonoth SDK WebSocket 事件流（`/v1/ws`）中断排查、websockets v14+ 头参数与重启方式选择。 |
+| `discord-voice-reply-policy` | normal | Discord 语音消息转写与 `<tts>` 语音合成回复协议说明。 |
+| `web_tts_reply_policy` | normal | Web 前端看到 `[TTS:auto]` 时的 `<tts>` 语音回复标记规则。 |
