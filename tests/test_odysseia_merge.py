@@ -597,3 +597,80 @@ def test_anthropic_prevents_tool_result_after_merged_text_block():
             {"type": "tool_result", "tool_use_id": "second", "content": "result two"},
         ]},
     ]
+
+
+@pytest.mark.parametrize("mode,allow,expected", [
+    ("allowlist", [], []),
+    ("allowlist", ["public"], ["public"]),
+    ("all", [], ["public", "private"]),
+])
+def test_memory_allowlist_preserves_explicit_empty(mode, allow, expected):
+    from engine.builtin.knowledge_inject import _filter_entries
+
+    entries = [
+        {"kind": "memory", "book": "public", "id": "one"},
+        {"kind": "memory", "book": "private", "id": "two"},
+    ]
+    filtered = _filter_entries(entries, memory_mode=mode, memory_allow=allow)
+    assert [entry["book"] for entry in filtered] == expected
+
+
+@pytest.mark.parametrize("merged_count,transcript_count,finalized", [
+    (None, 0, False),
+    (0, None, False),
+    (0, 0, True),
+])
+def test_branch_finalize_preserves_failed_merge(merged_count, transcript_count, finalized):
+    from supervisor.task_router import TaskRouterMixin
+
+    cleaned = []
+    state = SimpleNamespace(
+        _skip_merge_sessions=set(),
+        _merge_branch_locked=lambda *args: merged_count,
+        _merge_branch_transcript_locked=lambda *args: transcript_count,
+        _cleanup_branch_locked=cleaned.append,
+    )
+    task = SimpleNamespace(
+        session_id="branch_test",
+        input={"parent_session_id": "parent", "branch_session_id": "branch_test", "base_count": 0},
+    )
+    assert TaskRouterMixin._finalize_branch_task_locked(state, task, merge=True) == "parent"
+    assert task.input.get("_branch_finalized", False) is finalized
+    assert cleaned == (["branch_test"] if finalized else [])
+    if not finalized:
+        assert "_branch_merged_count" not in task.input
+
+
+@pytest.mark.parametrize("recursive,fail_in_child", [(False, False), (True, False), (True, True)])
+def test_list_dir_reports_directory_read_errors(tmp_path, monkeypatch, recursive, fail_in_child):
+    from pathlib import Path
+    from toolbox.builtins.list_dir import list_dir
+    from toolbox.context import ToolContext
+
+    child = tmp_path / "unreadable"
+    child.mkdir()
+    blocked = child if fail_in_child else tmp_path
+    original_iterdir = Path.iterdir
+
+    def read_directory(path):
+        if path == blocked:
+            raise OSError(f"directory unreadable: {path}")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", read_directory)
+
+    async def run():
+        async with httpx.AsyncClient() as http:
+            ctx = ToolContext(
+                supervisor_url="http://localhost", session_id="test", run_id="test",
+                worker_id="test", workspace_root=tmp_path, http=http, registry=None,
+            )
+            return await list_dir({"path": ".", "recursive": recursive}, ctx)
+
+    result = asyncio.run(run())
+    assert result["success"] is False
+    assert result["ok"] is False
+    section = result["data"]["results"][0]
+    assert section["success"] is False
+    assert "directory unreadable" in section["error"]
+    assert section["entries"] == []

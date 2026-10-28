@@ -915,7 +915,7 @@ def _filter_entries(
     # Purpose: give the unified budget stage one already-authorized entry list.
     filtered: list[dict[str, Any]] = []
     skill_allow_set = set(skill_allow or []) if skill_allow is not None else None
-    memory_allow_set = set(memory_allow or []) if memory_allow else None
+    memory_allow_set = set(memory_allow) if memory_allow is not None else None
 
     for entry in entries:
         node_ids = entry.get("node_ids") or []
@@ -936,9 +936,6 @@ def _filter_entries(
                 continue
             if memory_mode == "constant" and entry.get("strategy") != "constant":
                 continue
-            # Why: the legacy memory builder filtered allowlist only when the
-            # allow collection was truthy. How: keep that condition here.
-            # Purpose: knowledge.max_budget_chars=0 remains behavior-compatible.
             if memory_mode == "allowlist" and memory_allow_set is not None and entry.get("book") not in memory_allow_set:
                 continue
         else:

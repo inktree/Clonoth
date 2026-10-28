@@ -725,20 +725,21 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
 
     try {
       await cancelActiveTasks(sessionId);
-    } catch {}
-
-    set((state) => {
-      const nextActiveTask = { ...state.activeTaskBySession };
-      delete nextActiveTask[sessionId];
-      return {
-        isGenerating: false,
-        generatingBySession: {
-          ...state.generatingBySession,
-          [sessionId]: false,
-        },
-        activeTaskBySession: nextActiveTask,
-      };
-    });
+      set((state) => {
+        const nextActiveTask = { ...state.activeTaskBySession };
+        delete nextActiveTask[sessionId];
+        return {
+          isGenerating: false,
+          generatingBySession: {
+            ...state.generatingBySession,
+            [sessionId]: false,
+          },
+          activeTaskBySession: nextActiveTask,
+        };
+      });
+    } catch (err) {
+      console.error(`[cancel] 取消请求失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   },
 
   preemptCurrentTask: async (message: string, attachments?: Attachment[]) => {
@@ -752,7 +753,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     try {
       const uploadedAttachments = await uploadMessageAttachments(attachments, conversationKey);
       await preemptTask(taskId, message, uploadedAttachments);
-    } catch {}
+    } catch (err) {
+      console.error(`[preempt] 抢占请求失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   },
 
   updateContextUsage: (data) => {

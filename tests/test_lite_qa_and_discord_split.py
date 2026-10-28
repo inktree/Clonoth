@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import runpy
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,11 +10,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from adapters.discord.callbacks import DiscordCallbacks
-from adapters.discord.messaging import (
-    _extract_tts_segments,
-    _send_split_text,
-    _split_long_text,
-)
+from adapters.discord.messaging import _send_split_text
+from adapters.message_text import extract_tts_segments, split_long_text, split_message_text
 from engine.conversation_store import ConversationStore, Message
 from engine.inference.resume_builder import apply_resume_messages
 from engine.node import load_node
@@ -105,7 +103,7 @@ def test_extract_tts_segments_preserves_code_indentation_and_strips_split_marker
         "```\n"
         "<tts backend=\"ryza_onnx\" preset=\"normal_cn\">第一句[SPLIT]第二句[LEFT]第三句</tts>"
     )
-    display_text, segments = _extract_tts_segments(raw)
+    display_text, segments = extract_tts_segments(raw)
     assert "    if True:\n        return 1  # two spaces before comment" in display_text
     assert len(segments) == 1
     assert segments[0]["text"] == "第一句 第二句 第三句"
@@ -113,24 +111,30 @@ def test_extract_tts_segments_preserves_code_indentation_and_strips_split_marker
     assert segments[0]["preset"] == "normal_cn"
 
 
-def test_split_long_text_closes_and_reopens_fenced_code_and_preserves_indent() -> None:
+@pytest.mark.parametrize("limit", [1900, 4300])
+def test_split_long_text_closes_and_reopens_fenced_code_and_preserves_indent(limit) -> None:
     code_lines = ["```python", "def compute():"]
-    for i in range(80):
+    for i in range(240):
         code_lines.append(f"    value_{i} = {i} + 1000000000")
     code_lines.append("    return value_0")
     code_lines.append("```")
     long_code = "\n".join(code_lines)
     assert len(long_code) > 2000
 
-    chunks = _split_long_text(long_code, limit=1900)
+    chunks = split_long_text(long_code, limit=limit)
     assert len(chunks) >= 2
     for chunk in chunks:
-        assert len(chunk) <= 2000
+        assert len(chunk) <= limit
         assert chunk.startswith("```python\n")
         assert chunk.endswith("```")
     # Check that indentation on the first line after reopening fence is preserved
     second_body_first_line = chunks[1].splitlines()[1]
     assert second_body_first_line.startswith("    ")
+    body_lines = [
+        line for chunk in chunks for line in chunk.splitlines()
+        if line and not line.startswith("```")
+    ]
+    assert body_lines == code_lines[1:-1]
 
 
 def test_send_split_text_combines_explicit_split_left_and_long_chunks_without_truncating() -> None:
@@ -199,3 +203,36 @@ def test_send_intermediate_reply_delivers_tts_only_message(monkeypatch: pytest.M
     tts_mock.assert_awaited_once()
     args = tts_mock.await_args.args
     assert args[3] == [{"text": "纯语音中间回复", "backend": "ryza_onnx", "preset": "normal_cn"}]
+
+
+@pytest.mark.parametrize(
+    "markup, expected",
+    [
+        ('<TTS backend=\'MIMO\' voice=Alice instruction="Speak gently">one[SPLIT]two[LEFT]three</TTS>',
+         {"text": "one two three", "backend": "mimo", "voice": "Alice", "instruction": "Speak gently"}),
+        ('[[tts]]one[LEFT]two[[/tts]]', {"text": "one two"}),
+    ],
+)
+def test_shared_tts_markup_attributes_and_legacy_segments(markup, expected):
+    assert extract_tts_segments("before\n" + markup + "\nafter") == (
+        "before\n\nafter", [expected],
+    )
+
+
+def test_onebot_text_pipeline_keeps_long_tail_and_literal_fenced_code():
+    # Load the dependency-free utility without bootstrapping the NoneBot plugin.
+    process_emojis = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "adapters" / "onebot" / "emoji_handler.py"),
+    )["process_emojis"]
+    prefix = "正文。" * 3000
+    code = "\n```python\n    value = '[QQ_EMOJI:test] [at:123] [SPLIT] [LEFT]'\n\n    return value\n```"
+    chunks = split_message_text(prefix + code + "[LEFT]尾部END", limit=4300, split_signal="[SPLIT]")
+    assert all(len(chunk) <= 4300 for chunk in chunks)
+    assert chunks[-1] == "尾部END"
+
+    async def render():
+        return [segment for chunk in chunks for segment in await process_emojis(chunk, None, [])]
+
+    rendered = asyncio.run(render())
+    assert all(segment["type"] == "text" for segment in rendered)
+    assert "".join(segment["content"] for segment in rendered) == prefix + code + "尾部END"

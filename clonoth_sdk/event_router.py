@@ -594,8 +594,8 @@ class EventRouter:
         """处理 outbound_message 事件。
 
         两条路径：
-          Path 1（主节点回复）：src_seq 命中 trigger → 消费 trigger，
-              移除 MainTaskState，清理协议标记，调用 send_reply。
+          Path 1（主节点回复）：src_seq 命中 trigger → 清理协议标记，
+              调用 send_reply，正常返回后消费 trigger 和 MainTaskState。
               对应 bot_adapter.py L1297-1373。
           Path 2（Fallback）：无 trigger 匹配 → 过滤 system.* 节点，
               通过 session_conv_map 解析 conv_key，调用 send_to_channel。
@@ -606,14 +606,18 @@ class EventRouter:
 
         # Path 1: 主节点回复（src_seq 在 triggers 中）
         if src_seq and src_seq in self._state.triggers:
-            trigger = self._state.consume_trigger(src_seq)
-            main_state = self._state.remove_main_state(src_seq)
+            trigger = self._state.get_trigger(src_seq)
+            main_state = self._state.get_main_state(src_seq)
             text = strip_protocol_markers((p.get("text") or "").strip())
             attachments = p.get("attachments") or []
             try:
                 await self._cb.send_reply(
                     trigger, text, attachments, main_state=main_state,
                 )
+                if self._state.get_trigger(src_seq) is trigger:
+                    self._state.consume_trigger(src_seq)
+                if self._state.get_main_state(src_seq) is main_state:
+                    self._state.remove_main_state(src_seq)
                 await self._notify_response_info(event, trigger)
             except Exception as e:
                 logger.error("send_reply failed: %s", e)

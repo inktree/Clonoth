@@ -58,26 +58,29 @@ class AdapterCallbacks(Protocol):
         对应 bot_adapter.py L1297-1373 的主节点回复处理分支。
 
         SDK 已完成：
-          - 通过 source_inbound_seq 精确匹配并消费 trigger（从 triggers 中移除）
-          - 移除关联的 MainTaskState（通过 main_state 参数传出）
+          - 通过 source_inbound_seq 精确匹配 trigger，尚未消费
+          - 读取关联的 MainTaskState（通过 main_state 参数传出），尚未移除
           - 清理内部协议标记（[CLONOTH_TOOL_TRACE v...]...）
 
         适配器需要：
-          - 删除 trigger 的 status_msg（platform_data["status_msg"]，「⏳处理中」提示）
-          - 删除 main_state 中的 log_msg（platform_data["log_msg"]，进度日志消息）
+          - 发送正常结束后删除 trigger 的 status_msg（「⏳处理中」提示）
+          - 发送正常结束后结算 main_state 中的 log_msg（进度日志消息）
           - 解析并处理 Bot 自定义标记（[SPLIT] 分段、[REACT:...] 反应、[BOT_RESTART] 信号）
           - 将文本和附件发送到平台
           - 记录机器人回复到频道历史缓存
           - 群聊场景下，若有 progress_records，可发送最终日志 embed
 
+        发送失败必须抛出异常；正常返回（包括合法空回复）后 SDK 才消费
+        trigger / main_state 并发送回复说明。不能将实际发送失败伪装为正常返回。
+
         Args:
-            trigger: 被消费的触发信息。platform_data 中包含平台消息引用
+            trigger: 尚未消费的触发信息。platform_data 中包含平台消息引用
                      （如 Discord 适配器的 message、status_msg、channel_id）。
             text: 清理过 SDK 协议标记后的回复文本（可能为空字符串）。
                   仍包含 Bot 自定义标记，适配器自行解析处理。
             attachments: 附件列表，每个元素为 dict（含 path / filename 等字段），
                          格式由 Supervisor 定义。
-            main_state: 被移除的主任务状态。包含 progress_records（进度记录列表）、
+            main_state: 尚未移除的主任务状态。包含 progress_records（进度记录列表）、
                         platform_data（log_msg 等平台引用）。
                         为 None 表示该 trigger 没有关联的任务状态记录。
         """

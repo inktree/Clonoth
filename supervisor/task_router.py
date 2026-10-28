@@ -142,10 +142,10 @@ class TaskRouterMixin:
             or ""
         )
 
-    def _merge_branch_transcript_locked(self, parent_session_id: str, branch_session_id: str) -> int:
+    def _merge_branch_transcript_locked(self, parent_session_id: str, branch_session_id: str) -> int | None:
         """Append branch transcript records into parent transcript, rewriting session_id.
 
-        Returns number of records merged.
+        Returns number of records merged, or None if reading or writing failed.
         """
         from pathlib import Path
         import json
@@ -181,6 +181,7 @@ class TaskRouterMixin:
                     pass
         except Exception as e:
             log.warning("Failed to merge branch transcript %s: %s", branch_session_id, e)
+            return None
         return count
 
     def _checkpoint_branch_task_locked(self, task: Task) -> int:
@@ -202,6 +203,8 @@ class TaskRouterMixin:
             base_count,
             event_type="branch_checkpointed",
         )
+        if merged_count is None:
+            return 0
         if merged_count > 0:
             task.input["base_count"] = base_count + merged_count
             task.input["_restart_checkpointed_count"] = (
@@ -225,17 +228,18 @@ class TaskRouterMixin:
         if _no_merge:
             task.input["_branch_skipped_merge"] = True
         if merge and not _no_merge:
-            try:
-                base_count = int(task.input.get("base_count") or 0)
-            except Exception:
-                base_count = 0
+            base_count = int(task.input.get("base_count") or 0)
             merged_count = self._merge_branch_locked(parent_session_id, branch_session_id, base_count)
+            if merged_count is None:
+                return parent_session_id
             # [2026-05-19] Merge branch transcript records into parent transcript.
             # Why: engine writes TaskRecord to branch_xxx.jsonl (keyed by task.session_id),
             # but turn_summary and snip_history look up records in the parent transcript.
             # How: append all branch transcript lines to parent transcript file.
             # Purpose: ensure turn summary write-back and snip_history can find the records.
-            self._merge_branch_transcript_locked(parent_session_id, branch_session_id)
+            transcript_count = self._merge_branch_transcript_locked(parent_session_id, branch_session_id)
+            if transcript_count is None:
+                return parent_session_id
         # [Fork/Merge 2026-05-12] finalize 标记写入 task.input。
         # 原因：完成、取消、僵尸回收等路径都可能尝试收束同一个入口分支。
         # 做法：用 _branch_finalized 做进程内幂等保护，并记录 merged_count 供调试。

@@ -276,16 +276,6 @@ class DiscordCallbacks:
         msg: discord.Message = pd.get("message")
         channel_id: int = pd.get("channel_id", 0)
 
-        status_msg = pd.get("status_msg")
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-        if main_state:
-            await self._settle_log_msg(main_state, "✓ 完成")
-
         should_restart = False
         if text and text.rstrip().endswith(self.rt.restart_signal):
             should_restart = True
@@ -308,6 +298,7 @@ class DiscordCallbacks:
                 str(pd.get("_discord_input_modality") or "text"),
             )
 
+        delivered = False
         if text or attachments:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
             # [2026-10-19 fix] Why: DM replies were still sent with reply_to=msg,
@@ -315,23 +306,31 @@ class DiscordCallbacks:
             # drop the reply reference when the trigger is a DM. Purpose: private
             # replies read as plain messages while guild replies keep threading.
             reply_target = None if trigger.is_dm else msg
-            try:
-                sent = await _send_split_text(self.rt, ch, text or "", reply_to=reply_target, files=files or None)
-            except Exception:
-                logger.exception("send_reply failed ch=%s seq=%s", channel_id, trigger.inbound_seq)
-            else:
-                if sent:
-                    _record_bot_reply(
-                        self.rt, channel_id, text,
-                        msg_id=sent[0].id,
-                        context_watermark=pd.get("_context_watermark"),
-                    )
+            sent = await _send_split_text(self.rt, ch, text or "", reply_to=reply_target, files=files or None)
+            if sent:
+                delivered = True
+                _record_bot_reply(
+                    self.rt, channel_id, text,
+                    msg_id=sent[0].id,
+                    context_watermark=pd.get("_context_watermark"),
+                )
         if voice_segments:
             voice_sent = await _send_discord_tts_segments(self.rt, ch, trigger.conversation_key, voice_segments)
+            if not voice_sent and not delivered:
+                raise RuntimeError("discord tts segments delivery failed")
             if voice_sent:
                 _record_bot_reply(
                     self.rt, channel_id, "", context_watermark=pd.get("_context_watermark"),
                 )
+
+        status_msg = pd.get("status_msg")
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        if main_state:
+            await self._settle_log_msg(main_state, "✓ 完成")
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)

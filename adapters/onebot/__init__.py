@@ -51,6 +51,7 @@ from .emoji_handler import load_bqbs, process_emojis, strip_output_markers
 if CLONOTH_WORKSPACE not in sys.path:
     sys.path.insert(0, CLONOTH_WORKSPACE)
 
+from adapters.message_text import extract_tts_segments, split_message_text  # noqa: E402
 from clonoth_sdk import (  # noqa: E402  # sys.path 必须先插入 ClonothZX 工作区。
     BotConfig,
     ChildTaskState,
@@ -72,7 +73,6 @@ _QQ_MESSAGE_LIMIT = 4300
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _AUDIO_SUFFIXES = {".mp3", ".wav", ".ogg", ".opus", ".m4a", ".aac", ".amr", ".silk", ".webm"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
-_TTS_SEGMENT_RE = re.compile(r"<tts>([\s\S]*?)</tts>|\[\[tts\]\]([\s\S]*?)\[\[/tts\]\]", re.IGNORECASE)
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
 # 目标阶段，避免 stream_delta 高频到达时重复调用 OneBot React API。
@@ -827,14 +827,6 @@ def _get_fallback_bot() -> Optional[Bot]:
         return None
 
 
-def _truncate_qq_text(text: str) -> str:
-    """限制单条 QQ 消息长度，避免超过 OneBot 实现的消息上限。"""
-    if len(text) <= _QQ_MESSAGE_LIMIT:
-        return text
-    suffix = "\n（内容过长，已截断）"
-    return text[: _QQ_MESSAGE_LIMIT - len(suffix)] + suffix
-
-
 def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
     """把 emoji_handler 的轻量段描述转换为 OneBot Message。"""
     message_segments: List[MessageSegment] = []
@@ -852,20 +844,6 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
             if qq_id:
                 message_segments.append(MessageSegment.at(qq_id))
     return Message(message_segments)
-
-
-def _extract_tts_segments(text: str) -> tuple[str, List[str]]:
-    """提取助手回复中的 TTS 段，并返回去掉标记后的展示文本。"""
-    segments: List[str] = []
-
-    def _replace(match: re.Match[str]) -> str:
-        segment = (match.group(1) or match.group(2) or "").strip()
-        if segment:
-            segments.append(segment)
-        return segment
-
-    display_text = _TTS_SEGMENT_RE.sub(_replace, text or "").strip()
-    return display_text, segments
 
 
 def _voice_reply_allowed(target: Dict[str, Any], input_modality: str, has_tts_segments: bool) -> bool:
@@ -894,9 +872,9 @@ def _fallback_spoken_text(display_text: str) -> str:
     return text
 
 
-async def _synthesize_onebot_tts(text: str, conversation_key: str) -> Optional[Path]:
-    """调用 Supervisor 的 Mimo TTS 接口，返回本地音频附件路径。"""
-    spoken = (text or "").strip()
+async def _synthesize_onebot_tts(segment: dict[str, str], conversation_key: str) -> Optional[Path]:
+    """调用 Supervisor 的统一 TTS 接口，返回本地音频附件路径。"""
+    spoken = (segment.get("text") or "").strip()
     if not spoken:
         return None
     body: Dict[str, Any] = {
@@ -904,10 +882,15 @@ async def _synthesize_onebot_tts(text: str, conversation_key: str) -> Optional[P
         "conversation_key": conversation_key or "qq_audio",
         "format": ONEBOT_TTS_FORMAT or "wav",
     }
-    if ONEBOT_TTS_VOICE:
-        body["voice"] = ONEBOT_TTS_VOICE
-    if ONEBOT_TTS_INSTRUCTION:
-        body["instruction"] = ONEBOT_TTS_INSTRUCTION
+    for name in ("backend", "preset"):
+        if segment.get(name):
+            body[name] = segment[name]
+    voice = segment.get("voice") or ONEBOT_TTS_VOICE
+    instruction = segment.get("instruction") or ONEBOT_TTS_INSTRUCTION
+    if voice:
+        body["voice"] = voice
+    if instruction:
+        body["instruction"] = instruction
     try:
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             response = await client.post(f"{CLONOTH_BASE_URL.rstrip('/')}/v1/audio/synthesize", json=body, headers={"Authorization": f"Bearer {_client._resolve_admin_token()}"})
@@ -934,7 +917,7 @@ async def _send_qq_voice_or_file(bot: Bot, target: Dict[str, Any], path: Path) -
     await _send_attachment_path(bot, target, path, filename=path.name)
 
 
-async def _send_tts_voice_segments(bot: Bot, target: Dict[str, Any], conversation_key: str, segments: List[str]) -> None:
+async def _send_tts_voice_segments(bot: Bot, target: Dict[str, Any], conversation_key: str, segments: list[dict[str, str]]) -> None:
     """合成并发送 TTS 语音段，发送完成后删除临时音频。"""
     for segment in segments:
         path: Optional[Path] = None
@@ -967,15 +950,12 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any) -> No
 
 
 async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
-    """按 [SPLIT] 拆分最终文本，逐段发送并清理 QQ 不支持的标记。"""
+    """按协议标记和消息上限无损切分正文，逐段发送并处理 QQ 表情。"""
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
     sent_any = False
-    parts = text.split(_SPLIT_SIGNAL) if text else []
-    for index, raw_part in enumerate(parts):
-        part = _truncate_qq_text(raw_part.strip())
-        if not part:
-            continue
+    parts = split_message_text(text, limit=_QQ_MESSAGE_LIMIT, split_signal=_SPLIT_SIGNAL)
+    for index, part in enumerate(parts):
         segments = await process_emojis(part, bot, _bqbs)
         if not segments:
             continue
@@ -1062,13 +1042,13 @@ async def _send_text_and_attachments(
     record_group_history: bool = True,
 ) -> None:
     """统一发送文本、TTS 语音和附件，可选把展示文本写回群历史。"""
-    display_text, tts_segments = _extract_tts_segments(text or "")
+    display_text, tts_segments = extract_tts_segments(text or "")
     should_send_voice = _voice_reply_allowed(target, input_modality, bool(tts_segments))
     voice_segments = list(tts_segments)
     if should_send_voice and not voice_segments:
         fallback = _fallback_spoken_text(display_text)
         if fallback:
-            voice_segments = [fallback]
+            voice_segments = [{"text": fallback}]
 
     if display_text:
         if await _send_split_text(bot, target, display_text) and record_group_history and target.get("type") == "group":

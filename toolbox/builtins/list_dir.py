@@ -76,11 +76,6 @@ _DEFAULT_IGNORE_DIRS = frozenset({
 })
 
 
-def _should_ignore(rel_parts: tuple[str, ...], ignore_dirs: frozenset[str]) -> bool:
-    """Return True if any path component is in the ignore set."""
-    return any(part in ignore_dirs for part in rel_parts)
-
-
 def _list_entries_flat(
     base: Path,
     ignore_dirs: frozenset[str],
@@ -89,10 +84,7 @@ def _list_entries_flat(
     dirs: list[str] = []
     files: list[str] = []
 
-    try:
-        children = sorted(base.iterdir(), key=lambda c: c.name)
-    except Exception:
-        children = []
+    children = sorted(base.iterdir(), key=lambda c: c.name)
 
     for child in children:
         if child.name in ignore_dirs:
@@ -119,19 +111,19 @@ def _list_entries_recursive(
     dirs: list[str] = []
     files: list[str] = []
 
-    for child in sorted(base.rglob("*")):
-        try:
-            rel_parts = child.relative_to(base).parts
-        except ValueError:
-            continue
-        if _should_ignore(rel_parts, ignore_dirs):
-            continue
-
-        rel_posix = child.relative_to(base).as_posix()
-        if child.is_dir():
-            dirs.append(rel_posix + "/")
-        elif child.is_file():
-            files.append(rel_posix)
+    pending = [base]
+    while pending:
+        current = pending.pop()
+        for child in sorted(current.iterdir(), key=lambda c: c.name):
+            if child.name in ignore_dirs:
+                continue
+            rel_posix = child.relative_to(base).as_posix()
+            if child.is_dir():
+                dirs.append(rel_posix + "/")
+                if not child.is_symlink():
+                    pending.append(child)
+            elif child.is_file():
+                files.append(rel_posix)
 
     entries: list[dict[str, str]] = []
     for d in sorted(dirs):
@@ -206,10 +198,17 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             })
             continue
 
-        if recursive:
-            entries, fc, dc = _list_entries_recursive(p, ignore_dirs)
-        else:
-            entries, fc, dc = _list_entries_flat(p, ignore_dirs)
+        try:
+            if recursive:
+                entries, fc, dc = _list_entries_recursive(p, ignore_dirs)
+            else:
+                entries, fc, dc = _list_entries_flat(p, ignore_dirs)
+        except OSError as exc:
+            results.append({
+                "path": dir_path, "success": False, "error": str(exc),
+                "entries": [], "fileCount": 0, "dirCount": 0,
+            })
+            continue
 
         results.append({
             "path": dir_path, "success": True,

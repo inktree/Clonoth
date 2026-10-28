@@ -218,8 +218,8 @@ class SessionMixin:
         base_count: int,
         *,
         event_type: str = "branch_merged",
-    ) -> int:
-        """Incrementally merge an entry branch tail into its parent ConversationStore."""
+    ) -> int | None:
+        """Merge an entry branch tail; return its count, or None on failure."""
         from engine.conversation_store import ConversationStore
 
         parent = str(parent_session_id or "").strip()
@@ -229,19 +229,11 @@ class SessionMixin:
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         count = 0
         try:
-            merge_fn = getattr(store, "merge", None)
-            if callable(merge_fn):
-                count = int(merge_fn(parent, branch, base_count=int(base_count or 0)) or 0)
-            else:
-                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore 无 merge 方法的情况。
-                # 原因：本次任务只允许改 supervisor 层，目标树里的 engine store 可能仍是旧版。
-                # 做法：读取 branch 中 fork 基准之后的消息并批量追加到 parent。
-                # 目的：保持新 supervisor 在旧 store 上也能完成分支回写。
-                branch_messages = list(store.load(branch))
-                tail = branch_messages[int(base_count or 0):]
-                if tail:
-                    store.append_batch(parent, tail)
-                count = len(tail)
+            branch_messages = list(store.load(branch))
+            tail = branch_messages[int(base_count or 0):]
+            if tail:
+                store.append_batch(parent, tail)
+            count = len(tail)
         except Exception as exc:
             self.eventlog.append(
                 session_id=parent,
@@ -255,7 +247,7 @@ class SessionMixin:
                 },
                 transient=True,
             )
-            return 0
+            return None
 
         self.eventlog.append(
             session_id=parent,

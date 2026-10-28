@@ -20,6 +20,8 @@ from typing import Any
 import discord  # type: ignore[import-untyped]
 import httpx
 
+from adapters.message_text import TTS_BACKENDS, TTS_PRESETS, extract_tts_segments, split_message_text
+
 
 _CST = datetime.timezone(datetime.timedelta(hours=8))
 logger = logging.getLogger("discord_bot")
@@ -51,16 +53,6 @@ _AUDIO_EXT_MAP: dict[str, str] = {
     ".silk": "audio/silk",
 }
 _AUDIO_SUFFIXES = set(_AUDIO_EXT_MAP)
-_TTS_SEGMENT_RE = re.compile(
-    r"<tts\b(?P<attrs>[^>]*)>(?P<html_text>[\s\S]*?)</tts>"
-    r"|\[\[tts\]\](?P<legacy_text>[\s\S]*?)\[\[/tts\]\]",
-    re.IGNORECASE,
-)
-_TTS_ATTR_RE = re.compile(
-    r"(?P<name>[A-Za-z_][\w-]*)\s*=\s*(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))"
-)
-_TTS_BACKENDS = {"mimo", "ryza_onnx"}
-_TTS_PRESETS = {"normal_cn", "normal_ja", "whisper_cn", "whisper_ja"}
 
 
 def _extract_reactions(rt: Any, text: str) -> tuple[str, list[str]]:
@@ -196,41 +188,6 @@ def _current_message_media_text(message: discord.Message) -> str:
     return " ".join(parts).strip()
 
 
-def _split_long_text(text: str, limit: int = 1900) -> list[str]:
-    """按自然边界切分，保留缩进，并在跨消息时闭合、重开代码围栏。"""
-    chunks: list[str] = []
-    remaining = text
-    # Reserve room for a newline and closing fence, including custom limits.
-    budget = limit - 4
-    while len(remaining) > limit:
-        window = remaining[:budget]
-        cut = window.rfind("\n\n")
-        if cut < budget // 2:
-            cut = window.rfind("\n")
-        if cut < budget // 2:
-            for punct in ("。", "！", "？", "；", "…", ".", "!", "?"):
-                pos = window.rfind(punct)
-                if pos > cut:
-                    cut = pos + 1
-        if cut < budget // 2:
-            cut = window.rfind(" ")
-        if cut <= 0:
-            cut = budget
-        chunk = remaining[:cut]
-        remaining = remaining[cut:].lstrip("\r\n")
-        opening_fence = None
-        for line in chunk.splitlines():
-            if line.lstrip(" \t").startswith("```"):
-                opening_fence = line if opening_fence is None else None
-        if opening_fence is not None:
-            chunk += "\n```"
-            remaining = opening_fence + "\n" + remaining
-        chunks.append(chunk)
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
 async def _send_split_text(
     rt: Any,
     channel: Any,
@@ -240,20 +197,7 @@ async def _send_split_text(
     files: list[discord.File] | None = None,
 ) -> list[discord.Message]:
     """统一处理代码块外的分段标记和超长文本，不截断内容。"""
-    parts = [""]
-    # Keep fenced code opaque, including an unfinished final code block.
-    for index, section in enumerate(re.split(r"(```[\s\S]*?(?:```|$))", text)):
-        if index % 2:
-            parts[-1] += section
-        else:
-            logical_parts = section.replace("[LEFT]", rt.split_signal).split(rt.split_signal)
-            parts[-1] += logical_parts[0]
-            parts.extend(logical_parts[1:])
-    chunks = [
-        chunk
-        for part in parts if part.strip()
-        for chunk in _split_long_text(part.strip("\r\n"), limit=1900)
-    ]
+    chunks = split_message_text(text, limit=1900, split_signal=rt.split_signal)
     if not chunks and files:
         chunks = [""]
     sent: list[discord.Message] = []
@@ -448,44 +392,6 @@ def append_discord_reply_modality_hint(rt: Any, inbound_text: str, input_modalit
     return f"{inbound_text}\n\n{hint}"
 
 
-def _parse_tts_attributes(raw: str) -> dict[str, str]:
-    """Parse the small, allow-listed attribute surface accepted by ``<tts>``."""
-    attributes: dict[str, str] = {}
-    for match in _TTS_ATTR_RE.finditer(raw or ""):
-        name = match.group("name").lower()
-        value = next((item for item in (match.group("double"), match.group("single"), match.group("bare")) if item is not None), "").strip()
-        if name in {"backend", "preset", "voice", "instruction"} and value:
-            attributes[name] = value
-    backend = attributes.get("backend", "").lower()
-    if backend and backend not in _TTS_BACKENDS:
-        attributes.pop("backend", None)
-    preset = attributes.get("preset", "").lower()
-    if preset:
-        if preset in _TTS_PRESETS:
-            attributes["preset"] = preset
-        else:
-            attributes.pop("preset", None)
-    return attributes
-
-
-def _extract_tts_segments(text: str) -> tuple[str, list[dict[str, str]]]:
-    """提取 TTS 段及其逐段合成参数，并返回去掉标记后的展示文本。"""
-    segments: list[dict[str, str]] = []
-
-    def _replace(match: re.Match[str]) -> str:
-        segment = match.group("html_text") or match.group("legacy_text") or ""
-        segment = re.sub(r"\[SPLIT\]|\[LEFT\]", " ", segment).strip()
-        if segment:
-            item = {"text": segment}
-            item.update(_parse_tts_attributes(match.group("attrs") or ""))
-            segments.append(item)
-        return ""
-
-    display_text = _TTS_SEGMENT_RE.sub(_replace, text or "")
-    display_text = re.sub(r"\n{3,}", "\n\n", display_text).strip()
-    return display_text, segments
-
-
 def _fallback_spoken_text(display_text: str) -> str:
     """语音输入需要回复但模型没有显式标记时，取一段短文本合成。"""
     text = re.sub(r"```[\s\S]*?```", "", display_text or "")
@@ -520,9 +426,9 @@ async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation
     preset = (segment.get("preset") or "").strip().lower()
     voice = (segment.get("voice") or getattr(rt, "discord_tts_voice", "") or "").strip()
     instruction = (segment.get("instruction") or getattr(rt, "discord_tts_instruction", "") or "").strip()
-    if backend in _TTS_BACKENDS:
+    if backend in TTS_BACKENDS:
         body["backend"] = backend
-    if preset in _TTS_PRESETS:
+    if preset in TTS_PRESETS:
         body["preset"] = preset
     if voice:
         body["voice"] = voice
@@ -564,7 +470,7 @@ async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: st
 
 def prepare_discord_tts_reply(rt: Any, text: str, input_modality: str) -> tuple[str, list[dict[str, str]]]:
     """准备展示文本和需要发送的 TTS 段。"""
-    display_text, tts_segments = _extract_tts_segments(text or "")
+    display_text, tts_segments = extract_tts_segments(text or "")
     should_send_voice = _discord_voice_reply_allowed(rt, input_modality, bool(tts_segments))
     voice_segments = list(tts_segments)
     if should_send_voice and not voice_segments:

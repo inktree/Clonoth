@@ -84,7 +84,7 @@ def strip_output_markers(text: str) -> str:
     text = _ITALIC_RE.sub(lambda m: m.group(1), text)
     text = _UNDERLINE_ITALIC_RE.sub(lambda m: m.group(1), text)
     text = _HEADING_RE.sub("", text)
-    return text.strip()
+    return text
 
 
 def _custom_face_url(face: Any) -> str:
@@ -104,63 +104,68 @@ async def process_emojis(text: str, bot: Any, bqbs: List[str]) -> List[Dict[str,
     """处理文本中的 QQ 表情标记，返回可发送的消息段描述。
 
     处理方式如下：
-    1. 先移除 Discord 表情、Reaction 标记和 Markdown 标记。
+    1. 保护代码围栏；仅在代码块外移除 Discord 表情、Reaction 和 Markdown 标记。
     2. 遇到 [QQ_EMOJI:name] 时拆分文本。
     3. 通过 fetch_custom_face 懒加载 QQ 自定义表情列表，并按 bqbs.txt 下标取图。
 
     返回 dict 而不是直接返回 MessageSegment，是为了让该模块保持轻量，避免
     在工具层直接依赖 NoneBot2 的消息段实现。
     """
-    text = strip_output_markers(text)
     segments: List[Dict[str, Any]] = []
-    last_end = 0
     bqblist = None
-
-    # 合并 QQ_EMOJI 和 CQ:at 标记，按位置排序统一处理
-    emoji_matches = [(m.start(), m.end(), "emoji", m) for m in _QQ_EMOJI_RE.finditer(text)]
-    at_matches = [(m.start(), m.end(), "at", m) for m in _AT_RE.finditer(text)]
-    all_matches = sorted(emoji_matches + at_matches, key=lambda x: x[0])
-
-    for start, end, match_type, match in all_matches:
-        before = text[last_end:start]
-        if before.strip():
-            segments.append({"type": "text", "content": before})
-
-        if match_type == "at":
-            # group(1) 匹配 [at:xxx]，group(2) 匹配 [CQ:at,qq=xxx]
-            qq_id = match.group(1) or match.group(2)
-            segments.append({"type": "at", "qq": qq_id})
-            last_end = end
+    # Fenced code is literal, including emoji/at markers and indentation.
+    for index, section in enumerate(re.split(r"(```[\s\S]*?(?:```|$))", text)):
+        if index % 2:
+            segments.append({"type": "text", "content": section})
             continue
+        text = strip_output_markers(section)
+        last_end = 0
 
-        # QQ_EMOJI 处理
-        name = match.group(1).strip()
-        if name in bqbs:
-            if bqblist is None:
-                try:
-                    bqblist = await bot.call_api("fetch_custom_face")
-                except Exception:
-                    # 表情 API 失败时不应影响最终文本回复，因此退回到文本占位。
-                    bqblist = []
-            index = bqbs.index(name)
-            if index < len(bqblist):
-                url = _custom_face_url(bqblist[index])
-                if url:
-                    segments.append({"type": "image", "url": url})
+        # 合并 QQ_EMOJI 和 CQ:at 标记，按位置排序统一处理
+        emoji_matches = [(m.start(), m.end(), "emoji", m) for m in _QQ_EMOJI_RE.finditer(text)]
+        at_matches = [(m.start(), m.end(), "at", m) for m in _AT_RE.finditer(text)]
+        all_matches = sorted(emoji_matches + at_matches, key=lambda x: x[0])
+
+        for start, end, match_type, match in all_matches:
+            before = text[last_end:start]
+            if before:
+                segments.append({"type": "text", "content": before})
+
+            if match_type == "at":
+                # group(1) 匹配 [at:xxx]，group(2) 匹配 [CQ:at,qq=xxx]
+                qq_id = match.group(1) or match.group(2)
+                segments.append({"type": "at", "qq": qq_id})
+                last_end = end
+                continue
+
+            # QQ_EMOJI 处理
+            name = match.group(1).strip()
+            if name in bqbs:
+                if bqblist is None:
+                    try:
+                        bqblist = await bot.call_api("fetch_custom_face")
+                    except Exception:
+                        # 表情 API 失败时不应影响最终文本回复，因此退回到文本占位。
+                        bqblist = []
+                index = bqbs.index(name)
+                if index < len(bqblist):
+                    url = _custom_face_url(bqblist[index])
+                    if url:
+                        segments.append({"type": "image", "url": url})
+                    else:
+                        # 找到名称但没有可发送地址时，保留可读占位，避免内容无声丢失。
+                        segments.append({"type": "text", "content": f"[表情:{name}]"})
                 else:
-                    # 找到名称但没有可发送地址时，保留可读占位，避免内容无声丢失。
+                    # bqbs.txt 与 fetch_custom_face 返回数量不一致时，保留可读占位。
                     segments.append({"type": "text", "content": f"[表情:{name}]"})
-            else:
-                # bqbs.txt 与 fetch_custom_face 返回数量不一致时，保留可读占位。
+            elif name:
+                # 模型输出了未知表情名时，转成 QQ 可读文本，而不是暴露内部标记。
                 segments.append({"type": "text", "content": f"[表情:{name}]"})
-        elif name:
-            # 模型输出了未知表情名时，转成 QQ 可读文本，而不是暴露内部标记。
-            segments.append({"type": "text", "content": f"[表情:{name}]"})
 
-        last_end = end
+            last_end = end
 
-    after = text[last_end:]
-    if after.strip():
-        segments.append({"type": "text", "content": after})
+        after = text[last_end:]
+        if after:
+            segments.append({"type": "text", "content": after})
 
     return segments
