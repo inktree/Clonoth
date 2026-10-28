@@ -158,34 +158,20 @@ class OpenAIProvider(BaseProvider):
     })
 
     def _prepare_messages(
-        self_or_messages: Any,
-        messages: list[dict[str, Any]] | None = None,
-        *,
-        reasoning_field: str | None = None,
+        self,
+        messages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """L3: 将 L2 输出转换为 OpenAI API 最终格式。
 
-        兼容实例调用 `self._prepare_messages(messages)` 与静态调用
-        `OpenAIProvider._prepare_messages(messages)`。
-        当指定了非空 `reasoning_field` 时，仅对带 `tool_calls` 的 `assistant` 消息
+        当实例配置了非空 `reasoning_field` 时，仅对带 `tool_calls` 的 `assistant` 消息
         保留或从 `_meta.reasoning` 还原该字段（缺失时补空串 `""`）；当 `reasoning_field`
         为空时保持 100% 纯标准 OpenAI Chat Completions 格式。
         """
-        if isinstance(self_or_messages, OpenAIProvider):
-            raw_messages = messages if messages is not None else []
-            rf = (
-                reasoning_field
-                if reasoning_field is not None
-                else getattr(self_or_messages, "_reasoning_field", "")
-            ) or ""
-        else:
-            raw_messages = self_or_messages if isinstance(self_or_messages, list) else []
-            rf = (reasoning_field or "").strip()
-        rf = str(rf).strip()
+        rf = self._reasoning_field
 
         allowed = OpenAIProvider._MSG_ALLOWED_KEYS
         result: list[dict[str, Any]] = []
-        for msg in raw_messages:
+        for msg in messages:
             clean = {k: v for k, v in msg.items() if k in allowed and v is not None and v != ""}
             # role 和 content 必须保留，即使 content 为空字符串
             clean["role"] = msg.get("role", "user")
@@ -211,7 +197,7 @@ class OpenAIProvider(BaseProvider):
                         r_val = _meta["reasoning"]
                 if isinstance(r_val, str) and r_val:
                     clean[rf] = r_val
-                elif clean.get("tool_calls") or getattr(self_or_messages, "_always_backfill_reasoning", False):
+                elif clean.get("tool_calls") or self._always_backfill_reasoning:
                     clean[rf] = ""
             if "tool_call_id" in clean and isinstance(clean["tool_call_id"], str):
                 clean["tool_call_id"] = sanitize_tool_call_id(clean["tool_call_id"])
@@ -244,6 +230,7 @@ class OpenAIProvider(BaseProvider):
         if not k:
             raise RuntimeError(f"{self.provider_name} api_key is empty")
 
+        self._always_backfill_reasoning: bool = False
         self._http = http
         self._api_key = k
         self._base_url = _normalize_base_url(base_url)
@@ -251,30 +238,32 @@ class OpenAIProvider(BaseProvider):
         po = provider_options if isinstance(provider_options, dict) else {}
         rf = reasoning_field if reasoning_field is not None else po.get("reasoning_field")
         if rf is None:
-            rf = getattr(self, "default_reasoning_field", "")
+            rf = self.default_reasoning_field
         self._reasoning_field: str = str(rf or "").strip()
 
         re_val = reasoning_effort if reasoning_effort is not None else po.get("reasoning_effort")
         if re_val is None:
-            re_val = getattr(self, "default_reasoning_effort", None)
+            re_val = self.default_reasoning_effort
         re_str = str(re_val or "").strip()
         self._reasoning_effort: str | None = re_str if re_str else None
 
         mt_val = max_tokens if max_tokens is not None else po.get("max_tokens")
         if mt_val is None:
-            mt_val = getattr(self, "default_max_tokens", None)
+            mt_val = self.default_max_tokens
         try:
-            self._max_tokens: int | None = int(mt_val) if mt_val is not None and int(mt_val) > 0 else None
+            normalized_mt = int(mt_val) if mt_val is not None else None
         except (TypeError, ValueError):
-            self._max_tokens = None
+            normalized_mt = None
+        self._max_tokens: int | None = normalized_mt if normalized_mt is not None and normalized_mt > 0 else None
 
         mct_val = max_completion_tokens if max_completion_tokens is not None else po.get("max_completion_tokens")
         if mct_val is None:
-            mct_val = getattr(self, "default_max_completion_tokens", None)
+            mct_val = self.default_max_completion_tokens
         try:
-            self._max_completion_tokens: int | None = int(mct_val) if mct_val is not None and int(mct_val) > 0 else None
+            normalized_mct = int(mct_val) if mct_val is not None else None
         except (TypeError, ValueError):
-            self._max_completion_tokens = None
+            normalized_mct = None
+        self._max_completion_tokens: int | None = normalized_mct if normalized_mct is not None and normalized_mct > 0 else None
 
     def _build_payload(
         self,

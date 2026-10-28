@@ -716,3 +716,103 @@ def test_tool_context_snapshot_carries_approval_without_leaking_between_calls(tm
             assert requested_ops == ["/v1/ops/request", "/v1/ops/request"]
 
     asyncio.run(run())
+
+
+
+@pytest.mark.parametrize("kind", ["openai", "deepseek"])
+def test_openai_instance_preparation_preserves_reasoning_and_prefill(kind):
+    from providers.openai import OpenAIProvider
+
+    cls = OpenAIProvider if kind == "openai" else DeepSeekProvider
+    provider = cls(
+        http=None, api_key="test", base_url=None, model="test",
+        provider_options={"reasoning_field": "reasoning_content", "max_tokens": "123", "max_completion_tokens": "456"},
+    )
+    prepared = provider._prepare_messages([
+        {"role": "assistant", "content": "", "id": "internal", "_meta": {"reasoning": "chain"},
+         "tool_calls": [{"id": "tool:1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+    ])
+    assert prepared[0] == {
+        "role": "assistant", "content": "", "reasoning_content": "chain",
+        "tool_calls": [{"id": "tool_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}],
+    }
+    assert prepared[-1] == {"role": "user", "content": "请继续。"}
+    ordinary = provider._prepare_messages([{"role": "assistant", "content": "answer"}])
+    assert ordinary[0].get("reasoning_content") == ("" if kind == "deepseek" else None)
+    payload = provider._build_payload([{"role": "user", "content": "hello"}], None)
+    assert payload["max_tokens"] == 123
+    if kind == "openai":
+        assert payload["max_completion_tokens"] == 456
+    else:
+        assert "max_completion_tokens" not in payload
+        assert payload["thinking"] == {"type": "enabled"}
+    assert provider._build_provider_meta() == (
+        {"provider": "deepseek", "thinking": True} if kind == "deepseek" else {}
+    )
+
+
+@pytest.mark.parametrize("kind", ["gemini", "anthropic", "responses"])
+@pytest.mark.parametrize("primary,alias,expected", [
+    (None, None, None), ("123", "456", 123), (None, "456", 456),
+    ("invalid", "456", None), (0, "456", None), (-1, "456", None),
+])
+def test_provider_token_configuration_is_normalized_once(kind, primary, alias, expected):
+    from providers.anthropic import AnthropicProvider
+    from providers.gemini import GeminiProvider
+    from providers.openai_responses import OpenAIResponsesProvider
+
+    cls = {"gemini": GeminiProvider, "anthropic": AnthropicProvider, "responses": OpenAIResponsesProvider}[kind]
+    alias_key = "max_output_tokens" if kind == "gemini" else "max_completion_tokens"
+    options = {"max_tokens": primary, alias_key: alias, "temperature": 0, "top_p": 0.8, "top_k": 4}
+    provider = cls(http=None, api_key="test", base_url=None, model="test", provider_options=options)
+    options["max_tokens"] = "999"
+    for _ in range(2):
+        if kind == "gemini":
+            config = provider._build_body([{"role": "user", "content": "hello"}], None)["generationConfig"]
+            assert config["maxOutputTokens"] == (expected if expected is not None else 65535)
+            assert {key: config[key] for key in ("temperature", "topP", "topK")} == {"temperature": 0, "topP": 0.8, "topK": 4}
+            config["temperature"] = 9
+        elif kind == "anthropic":
+            payload = provider._build_payload([{"role": "user", "content": "hello"}], max_tokens=777)
+            assert payload["max_tokens"] == (expected if expected is not None else 777)
+        else:
+            payload = provider._build_payload(input_items=[], instructions="", tools=None, stream=False)
+            assert payload.get("max_output_tokens") == expected
+
+
+@pytest.mark.parametrize("kind,options,expected", [
+    ("gemini", {"thinking_config": {"thinkingBudget": 12, "thinkingLevel": " low ", "includeThoughts": True}}, {"thinkingLevel": "LOW", "includeThoughts": True}),
+    ("gemini", {"thinking_config": {"thinkingBudget": 12, "thinkingLevel": "high"}, "reasoning_effort": "none", "thought_summary": False}, None),
+    ("gemini", {"thinking_config": {"includeThoughts": True}, "reasoning_effort": " high ", "thought_summary": "off"}, {"thinkingLevel": "HIGH"}),
+    ("anthropic", {"thinking": {"type": "enabled", "budget_tokens": 12}, "reasoning_effort": " HIGH ", "thought_summary": "off"}, {"type": "enabled", "display": "omitted"}),
+    ("anthropic", {"reasoning_effort": "none", "thought_summary": True}, {"type": "disabled"}),
+    ("anthropic", {}, {"type": "adaptive", "display": "summarized"}),
+    ("responses", {"reasoning": {"summary": "concise"}}, {"summary": "concise"}),
+    ("responses", {"reasoning": {"summary": "concise"}, "thought_summary": False}, None),
+    ("responses", {"reasoning_effort": " NONE ", "thought_summary": True}, {"effort": "none"}),
+])
+def test_provider_thinking_templates_preserve_policy_and_request_isolation(kind, options, expected):
+    from providers.anthropic import AnthropicProvider
+    from providers.gemini import GeminiProvider
+    from providers.openai_responses import OpenAIResponsesProvider
+
+    cls = {"gemini": GeminiProvider, "anthropic": AnthropicProvider, "responses": OpenAIResponsesProvider}[kind]
+    provider = cls(http=None, api_key="test", base_url=None, model="test", provider_options=options)
+    for _ in range(2):
+        if kind == "gemini":
+            payload = provider._build_body([{"role": "user", "content": "hello"}], None)
+            thinking = payload["generationConfig"].get("thinkingConfig")
+        elif kind == "anthropic":
+            payload = provider._build_payload([{"role": "user", "content": "hello"}], temperature=0.7)
+            thinking = payload.get("thinking")
+            if options.get("reasoning_effort", "").strip().lower() == "high":
+                assert payload["output_config"] == {"effort": "high"}
+                assert "temperature" not in payload
+            else:
+                assert payload["temperature"] == 0.7
+        else:
+            payload = provider._build_payload(input_items=[], instructions="", tools=None, stream=False)
+            thinking = payload.get("reasoning")
+        assert thinking == expected
+        if thinking is not None:
+            thinking.clear()

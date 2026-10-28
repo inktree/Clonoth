@@ -17,6 +17,7 @@ class ProviderRegistry:
         # 原因：runner 需要通过配置字符串找到 provider；做法：集中到 registry；
         # 目的：新增 provider 时只需新增 providers/*.py，不再修改 engine if-elif 路由。
         self._registry: dict[str, type[BaseProvider]] = {}
+        self._disposal_ledger: Any = None
 
     def register(self, name: str, cls: type[BaseProvider]) -> Callable[[], None]:
         """Register a provider class by its public provider name.
@@ -41,7 +42,7 @@ class ProviderRegistry:
         # Why: provider disposers join the shared per-plugin ledger like hooks
         # and tools. How: record when a ledger is attached and a loader
         # collecting block is active. Purpose: one unload undoes all surfaces.
-        ledger = getattr(self, "_disposal_ledger", None)
+        ledger = self._disposal_ledger
         if ledger is not None:
             ledger.record(_dispose, key=("provider", self, provider_name))
         return _dispose
@@ -78,7 +79,7 @@ def auto_discover() -> ProviderRegistry:
                 continue
             if obj.__module__ != module.__name__:
                 continue
-            provider_name = str(getattr(obj, "provider_name", "") or "").strip().lower()
+            provider_name = str(obj.provider_name or "").strip().lower()
             if not provider_name:
                 continue
             registry.register(provider_name, obj)

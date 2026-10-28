@@ -445,7 +445,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             task_result = task.result or {}
             inner = task_result.get("result", {}) if isinstance(task_result.get("result"), dict) else {}
             result[task_id] = {
-                "status": task.status.value if hasattr(task.status, "value") else str(task.status),
+                "status": task.status.value,
                 "result_text": str(inner.get("text") or task_result.get("text") or ""),
                 "error": str(task_result.get("error") or ""),
             }
@@ -476,13 +476,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if sid and not self.session_generations.get(sid):
             self.session_generations[sid] = generation
 
-        kind = data.get("kind") or TaskKind.node
-        if not isinstance(kind, TaskKind):
-            value = getattr(kind, "value", kind)
-            try:
-                kind = TaskKind(str(value or "node"))
-            except Exception:
-                kind = TaskKind.node
+        kind = TaskKind(data.get("kind", TaskKind.node))
         data["kind"] = kind
 
         input_data = data.get("input_data")
@@ -795,7 +789,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     def set_session_provider_override(self, session_id: str, provider_override: dict[str, Any]) -> dict[str, Any] | None:
         """设置 session 级 provider 覆盖配置并持久化。"""
         sid = (session_id or "").strip()
-        clean = dict(provider_override or {}) if isinstance(provider_override, dict) else {}
+        clean = dict(provider_override)
         with self._lock:
             route_sid = self._route_session_id_for_session_locked(sid)
             info = self.sessions.get(route_sid)
@@ -848,7 +842,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     def set_session_workspace(self, session_id: str, workspace: dict[str, Any]) -> dict[str, Any] | None:
         """设置 session 级工作区配置并持久化。"""
         sid = (session_id or "").strip()
-        clean = dict(workspace or {}) if isinstance(workspace, dict) else {}
+        clean = dict(workspace)
         # 只保留 name/path 两个字段，避免脏数据
         name = str(clean.get("name") or "").strip()
         path = str(clean.get("path") or "").strip() or None
@@ -938,7 +932,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return "running"
 
         with self._lock:
-            registry = getattr(self._session_store, "_registry", {})
+            registry = self._session_store._registry
             child_ids: set[str] = set()
             branch_ids: set[str] = set()
             stack = [parent]
@@ -950,7 +944,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     continue
                 visited.add(current_parent)
                 for child_sid in self.parent_children.get(current_parent, set()):
-                    raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                    raw = registry.get(child_sid)
                     if not isinstance(raw, dict) or raw.get("reset"):
                         continue
                     if str(raw.get("node_id") or "") == "__entry_branch__" or child_sid.startswith("branch_"):
@@ -961,13 +955,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
             for (child_parent, _node_id, _ctx_key), child_sid in self.child_session_map.items():
                 if child_parent == parent or child_parent in branch_ids:
-                    raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                    raw = registry.get(child_sid)
                     if isinstance(raw, dict) and not raw.get("reset"):
                         child_ids.add(child_sid)
 
             rows: list[dict[str, Any]] = []
             for child_sid in sorted(child_ids):
-                raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                raw = registry.get(child_sid)
                 if not isinstance(raw, dict) or raw.get("reset"):
                     continue
                 node_id = str(raw.get("node_id") or "")
@@ -1059,16 +1053,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         准确终态。
         """
         candidates: list[str] = []
-        _sid = str(getattr(task, "session_id", "") or "").strip()
+        _sid = task.session_id
         if _sid:
             candidates.append(_sid)
-        if isinstance(task.input, dict):
-            _alt = str(task.input.get("child_session_id") or "").strip()
-            if _alt and _alt not in candidates:
-                candidates.append(_alt)
+        _alt = str(task.input.get("child_session_id") or "").strip()
+        if _alt and _alt not in candidates:
+            candidates.append(_alt)
         touched = False
         _now_iso = _now().isoformat()
-        _status = str(getattr(getattr(task, "status", None), "value", "") or "")
+        _status = task.status.value
         for cid in candidates:
             entry = self._session_store._registry.get(cid)
             if isinstance(entry, dict) and entry.get("is_child"):
@@ -1460,7 +1453,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             task = self.tasks.get(task_id)
             if task:
                 session = self.sessions.get(task.session_id or session_id)
-                conversation_key = str(getattr(session, "conversation_key", "") or "") if session else ""
+                conversation_key = session.conversation_key if session is not None else ""
                 if conversation_key.startswith("scheduler:"):
                     return OpRequestOut(
                         safety_level=SafetyLevel.auto,

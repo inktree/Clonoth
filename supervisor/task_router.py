@@ -1,13 +1,13 @@
 """Task 路由 mixin —— 处理 task 完成后的统一分发逻辑。"""
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import uuid
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
+from engine.conversation_store import Message
 
 from ._helpers import _now
 from .types import Task, TaskKind, TaskStatus
@@ -16,57 +16,26 @@ from .types import Task, TaskKind, TaskStatus
 log = logging.getLogger(__name__)
 
 
-def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
-    """Convert a task message into the history shape used for summary input.
-
-    Preserve content, metadata, tool calls, and native tool-result pairing fields
-    for both Message objects and serialized dictionaries.
-    """
-    if isinstance(message, dict):
-        d: dict[str, Any] = {
-            "role": str(message.get("role") or "unknown"),
-            "content": message.get("content") or "",
-        }
-        meta: dict[str, Any] = {}
-        raw_meta = message.get("_meta") if isinstance(message.get("_meta"), dict) else message.get("meta")
-        if isinstance(raw_meta, dict):
-            meta.update(raw_meta)
-        source_task_id = str(message.get("source_task_id") or "").strip()
-        if source_task_id:
-            meta.setdefault("source_task_id", source_task_id)
-        if meta:
-            d["_meta"] = meta
-        message_type = str(message.get("message_type") or "").strip()
-        if message_type:
-            d["message_type"] = message_type
-        if isinstance(message.get("tool_calls"), list) and message.get("tool_calls"):
-            d["tool_calls"] = copy.deepcopy(message.get("tool_calls"))
-        if message.get("tool_call_id"):
-            d["tool_call_id"] = str(message.get("tool_call_id") or "")
-        if message.get("name"):
-            d["name"] = str(message.get("name") or "")
-        return d
-
-    d = {"role": getattr(message, "role", "unknown"), "content": getattr(message, "content", "") or ""}
-    meta = dict(message.meta) if isinstance(getattr(message, "meta", None), dict) else {}
-    source_task_id = str(getattr(message, "source_task_id", "") or "").strip()
-    if source_task_id:
-        meta.setdefault("source_task_id", source_task_id)
+def _message_to_turn_summary_dict(message: Message) -> dict[str, Any]:
+    """Project a stored Message into summary history without mutating it."""
+    result: dict[str, Any] = {"role": message.role, "content": message.content}
+    meta = dict(message.meta)
+    if message.source_task_id:
+        meta.setdefault("source_task_id", message.source_task_id)
     if meta:
-        d["_meta"] = meta
-    message_type = str(getattr(message, "message_type", "") or "").strip()
-    if message_type:
-        d["message_type"] = message_type
-    if getattr(message, "tool_calls", None):
-        d["tool_calls"] = list(message.tool_calls)
-    if getattr(message, "tool_call_id", ""):
-        d["tool_call_id"] = str(message.tool_call_id)
-    if getattr(message, "name", ""):
-        d["name"] = str(message.name)
-    return d
+        result["_meta"] = meta
+    if message.message_type:
+        result["message_type"] = message.message_type
+    if message.tool_calls:
+        result["tool_calls"] = message.tool_calls
+    if message.tool_call_id:
+        result["tool_call_id"] = message.tool_call_id
+    if message.name:
+        result["name"] = message.name
+    return result
 
 
-def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
+def _format_task_messages_for_turn_summary(messages: list[Message]) -> str:
     """Format task messages for system.turn_summarizer without control-tool plumbing."""
     from engine.inference.tool_format import repair_tool_result_pairing
 
@@ -1675,12 +1644,12 @@ class TaskRouterMixin:
         # keep compressed_task_ids accurate after task-granular retention.
         _ctid_set: set[str] = set()
         for _rm in to_remove:
-            _rm_meta = _rm.meta if isinstance(getattr(_rm, "meta", None), dict) else {}
+            _rm_meta = _rm.meta
             # [2026-05-17] Why: compact_summary is not a real task id and should
             # not be recorded as a compressed task. How: inherit its historical
             # compressed_task_ids but skip the compact_summary source id itself.
             # Purpose: L2 snip metadata remains about real tasks only.
-            _rm_tid = str(_rm_meta.get("source_task_id", "") or getattr(_rm, "source_task_id", "") or "")
+            _rm_tid = str(_rm_meta.get("source_task_id", "") or _rm.source_task_id or "")
             if _rm_tid and _rm_tid != "compact_summary":
                 _ctid_set.add(_rm_tid)
             _old_ctids = _rm_meta.get("compressed_task_ids")
@@ -1756,7 +1725,7 @@ class TaskRouterMixin:
         self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
         return result
 
-    def _clone_compact_summary_message(self, summary_msg: Any) -> Any:
+    def _clone_compact_summary_message(self, summary_msg: Message) -> Message:
         """Clone a compact summary message for a branch session."""
         # [AutoC 2026-05-13] Why: parent and branch JSONL files should not share
         # the same Message id even when they carry the same summary content. How:
@@ -1764,17 +1733,17 @@ class TaskRouterMixin:
         # message-id based matching can distinguish parent and branch records.
         from uuid import uuid4
         from datetime import datetime, timezone
-        from engine.conversation_store import Message, MessageType
+        from engine.conversation_store import Message
 
         return Message(
             id=str(uuid4()),
-            role=getattr(summary_msg, "role", "user") or "user",
-            content=str(getattr(summary_msg, "content", "") or ""),
-            message_type=getattr(summary_msg, "message_type", "") or MessageType.SUMMARY,
+            role=summary_msg.role,
+            content=summary_msg.content,
+            message_type=summary_msg.message_type,
             created_at=datetime.now(timezone.utc).isoformat(),
-            meta=dict(getattr(summary_msg, "meta", {}) or {}),
-            source_node_id=getattr(summary_msg, "source_node_id", "") or "",
-            source_task_id=getattr(summary_msg, "source_task_id", "") or "compact_summary",
+            meta=dict(summary_msg.meta),
+            source_node_id=summary_msg.source_node_id,
+            source_task_id=summary_msg.source_task_id,
         )
 
     def _sync_compact_to_branches(
@@ -1873,7 +1842,7 @@ class TaskRouterMixin:
             store.replace_all(branch, new_base + branch_tail)
             for task in tasks:
                 task.input["base_count"] = len(new_base)
-                task.input["base_last_id"] = getattr(prefix_keep[-1], "id", "") if prefix_keep else branch_summary.id
+                task.input["base_last_id"] = prefix_keep[-1].id if prefix_keep else branch_summary.id
                 task.updated_at = _now()
             log.info(
                 "compact branch sync: %s base %d → %d, preserved tail=%d",

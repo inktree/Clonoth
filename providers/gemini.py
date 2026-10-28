@@ -55,6 +55,57 @@ class GeminiProvider(BaseProvider):
         self._base_url = base
         self._options = provider_options or {}
 
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_output_tokens")
+        try:
+            _max_tok = int(_raw_max_tok) if _raw_max_tok is not None else self.default_max_tokens
+        except (TypeError, ValueError):
+            _max_tok = self.default_max_tokens
+        self._max_tokens: int = _max_tok if _max_tok > 0 else self.default_max_tokens
+        self._generation_options: dict[str, Any] = {}
+        if self._options.get("temperature") is not None:
+            self._generation_options["temperature"] = self._options["temperature"]
+        if self._options.get("top_p") is not None:
+            self._generation_options["topP"] = self._options["top_p"]
+        if self._options.get("top_k") is not None:
+            self._generation_options["topK"] = self._options["top_k"]
+
+        _tc_copy: dict[str, Any] = {}
+        _raw_tc = self._options.get("thinking_config")
+        if isinstance(_raw_tc, dict):
+            _tc_copy.update(_raw_tc)
+            _tc_copy.pop("thinkingBudget", None)
+
+        _raw_effort = self._options.get("reasoning_effort")
+        if _raw_effort is not None:
+            _effort_up = str(_raw_effort).strip().upper()
+            if _effort_up and _effort_up != "NONE":
+                _tc_copy["thinkingLevel"] = _effort_up
+            else:
+                _tc_copy.pop("thinkingLevel", None)
+        elif "thinkingLevel" in _tc_copy:
+            _tl_up = str(_tc_copy.get("thinkingLevel") or "").strip().upper()
+            if _tl_up and _tl_up != "NONE":
+                _tc_copy["thinkingLevel"] = _tl_up
+            else:
+                _tc_copy.pop("thinkingLevel", None)
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if isinstance(_raw_ts, bool):
+            _summary_enabled = _raw_ts
+        elif isinstance(_raw_ts, str):
+            _summary_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none")
+        else:
+            _summary_enabled = bool(_raw_ts)
+
+        if _summary_enabled:
+            _tc_copy["includeThoughts"] = True
+        elif "thought_summary" in self._options:
+            _tc_copy.pop("includeThoughts", None)
+
+        self._thinking_config: dict[str, Any] | None = _tc_copy or None
+
     def _is_vertex_backend(self) -> bool:
         """Return True if this provider instance should use Vertex AI semantics, False for AI Studio."""
         backend_opt = str(self._options.get("backend") or "").strip().lower()
@@ -339,56 +390,12 @@ class GeminiProvider(BaseProvider):
         # - reasoning_effort -> thinkingConfig.thinkingLevel (uppercase; omitted if unset or "NONE")
         # - thought_summary -> thinkingConfig.includeThoughts (default True)
         # - thinkingBudget is never sent
-        _raw_max_tok = self._options.get("max_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self._options.get("max_output_tokens")
-        try:
-            _max_tok = int(_raw_max_tok) if _raw_max_tok is not None and int(_raw_max_tok) > 0 else self.default_max_tokens
-        except (TypeError, ValueError):
-            _max_tok = self.default_max_tokens
-        gen_config: dict[str, Any] = {"maxOutputTokens": _max_tok}
-        if self._options.get("temperature") is not None:
-            gen_config["temperature"] = self._options["temperature"]
-        if self._options.get("top_p") is not None:
-            gen_config["topP"] = self._options["top_p"]
-        if self._options.get("top_k") is not None:
-            gen_config["topK"] = self._options["top_k"]
-
-        _tc_copy: dict[str, Any] = {}
-        _raw_tc = self._options.get("thinking_config")
-        if isinstance(_raw_tc, dict):
-            _tc_copy.update(_raw_tc)
-            _tc_copy.pop("thinkingBudget", None)
-
-        _raw_effort = self._options.get("reasoning_effort")
-        if _raw_effort is not None:
-            _effort_up = str(_raw_effort).strip().upper()
-            if _effort_up and _effort_up != "NONE":
-                _tc_copy["thinkingLevel"] = _effort_up
-            else:
-                _tc_copy.pop("thinkingLevel", None)
-        elif "thinkingLevel" in _tc_copy:
-            _tl_up = str(_tc_copy.get("thinkingLevel") or "").strip().upper()
-            if _tl_up and _tl_up != "NONE":
-                _tc_copy["thinkingLevel"] = _tl_up
-            else:
-                _tc_copy.pop("thinkingLevel", None)
-
-        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
-        if isinstance(_raw_ts, bool):
-            _summary_enabled = _raw_ts
-        elif isinstance(_raw_ts, str):
-            _summary_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none")
-        else:
-            _summary_enabled = bool(_raw_ts)
-
-        if _summary_enabled:
-            _tc_copy["includeThoughts"] = True
-        elif "thought_summary" in self._options:
-            _tc_copy.pop("includeThoughts", None)
-
-        if _tc_copy:
-            gen_config["thinkingConfig"] = _tc_copy
+        gen_config: dict[str, Any] = {
+            "maxOutputTokens": self._max_tokens,
+            **self._generation_options,
+        }
+        if self._thinking_config is not None:
+            gen_config["thinkingConfig"] = dict(self._thinking_config)
         body["generationConfig"] = gen_config
         return body
 

@@ -362,3 +362,322 @@ def test_manage_schedule_and_tool_wrappers_preserve_crud_and_metadata(tmp_path, 
     assert reg.get_spec("example")["pure"] is True
     assert reg.get_spec("example")["async_mode"] is True
     assert asyncio.run(manage_tool({"action": "reload"}, ctx))["ok"]
+
+
+@pytest.fixture
+def supervisor_state(tmp_path):
+    from supervisor.eventlog import EventLog
+    from supervisor.policy import PolicyEngine
+    from supervisor.state import SupervisorState
+
+    return SupervisorState(
+        workspace_root=tmp_path,
+        eventlog=EventLog(tmp_path / "events.jsonl", run_id="batch4"),
+        policy=PolicyEngine(workspace_root=tmp_path),
+    )
+
+
+def _batch4_task(state, task_id, session_id, *, status=None, **kwargs):
+    from datetime import datetime, timezone
+    from supervisor.types import Task, TaskKind, TaskStatus
+
+    now = datetime.now(timezone.utc)
+    task = Task(
+        task_id=task_id, session_id=session_id, kind=TaskKind.tool,
+        status=TaskStatus.pending if status is None else status,
+        created_at=now, updated_at=now, **kwargs,
+    )
+    state.tasks[task_id] = task
+    state._task_order.append(task_id)
+    return task
+
+
+@pytest.mark.parametrize("content", ["", "  answer\n", [], [{"type": "text", "text": "image caption"}]])
+def test_message_projections_preserve_typed_content_and_metadata(content):
+    from engine.conversation_store import Message
+    from supervisor.api import _conversation_message_to_compact_dict
+    from supervisor.task_router import _message_to_turn_summary_dict
+
+    calls = [{"id": "call-1", "function": {"name": "search", "arguments": "{}"}}]
+    message = Message(
+        id="m-1", role="assistant", content=content, message_type="assistant",
+        source_task_id="task-1", ephemeral=True, meta={"usage": {"prompt_tokens": 0}},
+        tool_calls=calls, tool_call_id="result-1", name="search",
+    )
+    summary = _message_to_turn_summary_dict(message)
+    compact = _conversation_message_to_compact_dict(message)
+    for row in [summary, compact]:
+        assert row["role"] == "assistant"
+        assert row["content"] == content
+        assert row["tool_calls"] is calls
+        assert row["tool_call_id"] == "result-1" and row["name"] == "search"
+        assert row["_meta"]["source_task_id"] == "task-1"
+        assert row["_meta"] is not message.meta
+        assert row["_meta"]["usage"]["prompt_tokens"] == 0
+    assert compact["_dynamic"] is True
+    assert compact["_meta"]["message_type"] == "assistant"
+    assert "message_type" not in summary["_meta"]
+    assert message.meta == {"usage": {"prompt_tokens": 0}}
+
+    message.meta.update(source_task_id="original", message_type="original-type")
+    projected = _conversation_message_to_compact_dict(message)
+    assert projected["_meta"]["source_task_id"] == "original"
+    assert projected["_meta"]["message_type"] == "original-type"
+
+
+def test_turn_summary_repairs_pairs_without_mutating_stored_messages():
+    from engine.conversation_store import Message
+    from supervisor.task_router import _format_task_messages_for_turn_summary
+
+    calls = [
+        {"id": "finish-1", "type": "function", "function": {"name": "finish", "arguments": '{"text": "delivered"}'}},
+        {"id": "orphan", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+    ]
+    assistant = Message(id="a", role="assistant", content="answer", tool_calls=calls, source_task_id="task")
+    result = Message(id="r", role="tool", content="delivered", tool_call_id="finish-1", name="finish")
+    text = _format_task_messages_for_turn_summary([assistant, result])
+    assert "delivered" in text and "COMPLETED TASK LOG" in text
+    assert assistant.tool_calls == calls and len(assistant.tool_calls) == 2
+    assert assistant.meta == {} and result.role == "tool"
+
+
+def test_running_tasks_reaps_zombie_once_and_updates_terminal_registry(supervisor_state, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from supervisor.types import TaskStatus
+
+    state = supervisor_state
+    root = state.get_or_create_session(channel="test", conversation_key="test:zombie")
+    child, _ = state.get_or_create_child_session(root, "worker", "", "accumulate")
+    zombie = _batch4_task(
+        state, "zombie", root, status=TaskStatus.running, worker_id="worker",
+        lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=4),
+        input={"_system_task": True, "child_session_id": child},
+    )
+    pending = _batch4_task(state, "pending", root)
+    cleanup = Mock(wraps=state._cleanup_tool_result_artifacts_for_task)
+    monkeypatch.setattr(state, "_cleanup_tool_result_artifacts_for_task", cleanup)
+    rows = state.list_session_running_tasks(root)
+    assert [row["task_id"] for row in rows] == [pending.task_id]
+    assert zombie.status == TaskStatus.failed and zombie.lease_expires_at is None
+    assert zombie.result == {"action": "fail", "error": "lease expired (zombie reaped)"}
+    entry = state._session_store._registry[child]
+    assert entry["terminal_status"] == "failed" and entry["completed_at"]
+    state.list_session_running_tasks(root)
+    cleanup.assert_called_once_with("zombie")
+    events = state.eventlog.list_events(session_id=root, after_seq=0)
+    assert sum(e["type"] == "task_completed" and e["payload"]["task_id"] == "zombie" for e in events) == 1
+    assert state.list_session_running_tasks("missing") is None
+
+
+@pytest.mark.parametrize("lease_kind,awaiting_approval,expected", [
+    ("missing", False, "failed"), ("expired", False, "failed"),
+    ("recent", False, "running"), ("future", False, "running"),
+    ("missing", True, "running"), ("expired", True, "running"),
+])
+def test_running_tasks_respects_lease_grace_and_approval(supervisor_state, lease_kind, awaiting_approval, expected):
+    from datetime import datetime, timedelta, timezone
+    from supervisor.types import Approval, ApprovalStatus, TaskStatus
+
+    state = supervisor_state
+    sid = state.get_or_create_session(channel="test", conversation_key="test:leases")
+    now = datetime.now(timezone.utc)
+    lease = {"missing": None, "expired": now - timedelta(minutes=4),
+             "recent": now - timedelta(minutes=1), "future": now + timedelta(minutes=1)}[lease_kind]
+    task = _batch4_task(state, "lease", sid, status=TaskStatus.running,
+                        lease_expires_at=lease, input={"_system_task": True})
+    if awaiting_approval:
+        state.approvals["approval"] = Approval(
+            approval_id="approval", session_id=sid, operation="write_file",
+            status=ApprovalStatus.pending, fingerprint="fp", requested_at=now,
+        )
+    rows = state.list_session_running_tasks(sid)
+    assert task.status.value == expected
+    assert [row["task_id"] for row in rows] == ([] if expected == "failed" else ["lease"])
+
+
+def test_running_tasks_rechecks_candidates_after_routing_changes_state(supervisor_state, monkeypatch):
+    from supervisor.types import TaskStatus
+
+    state = supervisor_state
+    sid = state.get_or_create_session(channel="test", conversation_key="test:route")
+    first = _batch4_task(state, "first", sid, status=TaskStatus.running)
+    second = _batch4_task(state, "second", sid, status=TaskStatus.running)
+
+    def route(task):
+        assert task is first
+        second.status = TaskStatus.cancelled
+        _batch4_task(state, "created-by-route", sid)
+
+    monkeypatch.setattr(state, "_route_completed_task_locked", route)
+    rows = state.list_session_running_tasks(sid)
+    assert [row["task_id"] for row in rows] == ["created-by-route"]
+    assert second.status == TaskStatus.cancelled
+
+
+def test_delete_session_cascades_persisted_tree_and_retains_unrelated_work(supervisor_state):
+    from datetime import datetime, timedelta, timezone
+    from engine.conversation_store import ConversationStore, Message
+    from supervisor.types import Approval, ApprovalStatus, TaskStatus
+
+    state = supervisor_state
+    root = state.get_or_create_session(channel="test", conversation_key="test:delete")
+    child, _ = state.get_or_create_child_session(root, "worker", "", "fresh")
+    branch, _ = state._create_entry_branch_locked(child, 1)
+    other = state.get_or_create_session(channel="test", conversation_key="test:other")
+    state.conversation_map["alias-to-delete"] = root
+    # Persistence must still supply the descendant after its fast index entries disappear.
+    state.parent_children.pop(child, None)
+    state.parent_entry_branches.pop(child, None)
+    state.entry_branch_parents.pop(branch, None)
+    now = datetime.now(timezone.utc)
+    pending = _batch4_task(state, "pending-delete", child)
+    leased = _batch4_task(state, "leased-delete", branch, status=TaskStatus.running,
+                          worker_id="worker", lease_expires_at=now + timedelta(minutes=1))
+    detached = _batch4_task(state, "detached-delete", "detached", caller_task_id=pending.task_id)
+    untouched = _batch4_task(state, "untouched", other)
+    for task in [pending, detached, untouched]:
+        state.approvals[task.task_id] = Approval(
+            approval_id=task.task_id, session_id=task.session_id, task_id=task.task_id,
+            operation="write_file", status=ApprovalStatus.pending,
+            fingerprint=task.task_id, requested_at=now,
+        )
+        state._async_tools[task.task_id] = {
+            "session_id": task.session_id, "task_id": task.task_id,
+            "worker_id": "worker", "status": "running",
+        }
+    store = ConversationStore(state.workspace_root / "data" / "conversations")
+    for sid in [root, child, branch, other]:
+        store.append(sid, Message(id=sid, role="user", content="history"))
+        context_dir = state.workspace_root / "data" / "node_contexts" / sid
+        context_dir.mkdir(parents=True)
+        (context_dir / "context.json").write_text("{}", encoding="utf-8")
+        state._session_context_usage[(sid, "worker")] = {"prompt_tokens": 1}
+
+    assert state.delete_session(root)
+    deleted = {root, child, branch}
+    assert not deleted.intersection(state.sessions)
+    assert not deleted.intersection(state._session_store._registry)
+    assert not deleted.intersection(state.conversation_map.values())
+    assert not deleted.intersection(state.entry_branch_parents)
+    assert not deleted.intersection(state.child_session_map.values())
+    assert not deleted.intersection(state.parent_children)
+    assert not deleted.intersection(state.parent_entry_branches)
+    assert all(sid not in deleted for sid, _ in state._session_context_usage)
+    for sid in deleted:
+        assert not (store._data_dir / f"{sid}.jsonl").exists()
+        assert not (state.workspace_root / "data" / "node_contexts" / sid).exists()
+    assert pending.status == detached.status == TaskStatus.cancelled
+    assert leased.cancel_requested and leased.status == TaskStatus.running
+    for task in [pending, detached]:
+        assert state.approvals[task.task_id].status == ApprovalStatus.denied
+    assert set(state.pull_pending_cancels("worker")) == {pending.task_id, detached.task_id}
+    assert untouched.status == TaskStatus.pending
+    assert state.approvals[untouched.task_id].status == ApprovalStatus.pending
+    assert other in state.sessions and (store._data_dir / f"{other}.jsonl").exists()
+    assert not state.delete_session(root)
+    # A late engine completion is cancelled rather than routed back into deleted history.
+    state.complete_task(task_id=leased.task_id, worker_id="worker", result={"action": "finish", "result": {"text": "late"}})
+    assert leased.status == TaskStatus.cancelled
+    assert not (store._data_dir / f"{branch}.jsonl").exists()
+
+
+def test_session_store_remove_rolls_back_on_atomic_write_failure(supervisor_state, monkeypatch):
+    from supervisor import session_store
+
+    state = supervisor_state
+    sid = state.get_or_create_session(channel="test", conversation_key="test:flush-failure")
+    store = state._session_store
+    original = store._registry[sid]
+    disk = store._path.read_bytes()
+
+    def fail_replace(*args):
+        raise PermissionError("registry denied")
+
+    monkeypatch.setattr(session_store.os, "replace", fail_replace)
+    with pytest.raises(PermissionError, match="registry denied"):
+        store.remove_session(sid)
+    assert store._registry[sid] is original
+    assert store._path.read_bytes() == disk
+
+
+def test_delete_session_does_not_report_success_on_history_delete_failure(supervisor_state, monkeypatch):
+    from engine.conversation_store import ConversationStore
+
+    state = supervisor_state
+    sid = state.get_or_create_session(channel="test", conversation_key="test:delete-failure")
+
+    def fail_delete(self, session_id):
+        raise PermissionError("history denied")
+
+    monkeypatch.setattr(ConversationStore, "delete", fail_delete)
+    with pytest.raises(PermissionError, match="history denied"):
+        state.delete_session(sid)
+    assert sid in state.sessions and sid in state._session_store._registry
+    assert state.conversation_map["test:delete-failure"] == sid
+
+
+
+def test_parallel_running_task_queries_commit_one_failure(supervisor_state):
+    from concurrent.futures import ThreadPoolExecutor
+    from supervisor.types import TaskStatus
+
+    state = supervisor_state
+    sid = state.get_or_create_session(channel="test", conversation_key="test:parallel-reaper")
+    task = _batch4_task(state, "parallel", sid, status=TaskStatus.running,
+                        input={"_system_task": True})
+    ready = threading.Barrier(2)
+
+    def query():
+        ready.wait(timeout=5)
+        return state.list_session_running_tasks(sid)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [executor.submit(query) for _ in range(2)]
+        assert [future.result(timeout=10) for future in results] == [[], []]
+    assert task.status == TaskStatus.failed
+    events = state.eventlog.list_events(session_id=sid, after_seq=0)
+    assert sum(e["type"] == "task_completed" for e in events) == 1
+
+
+def test_zombie_branch_is_finalized_through_normal_failure_route(supervisor_state):
+    from supervisor.types import TaskStatus
+
+    state = supervisor_state
+    root = state.get_or_create_session(channel="test", conversation_key="test:branch-reaper")
+    branch, fork_meta = state._create_entry_branch_locked(root, 1)
+    task = _batch4_task(
+        state, "branch-zombie", branch, status=TaskStatus.running,
+        input={"parent_session_id": root, "branch_session_id": branch,
+               "base_count": fork_meta["base_count"], "_system_task": True},
+    )
+    assert state.list_session_running_tasks(root) == []
+    assert task.status == TaskStatus.failed and task.input["_branch_finalized"]
+    assert branch not in state.sessions and branch not in state._session_store._registry
+    assert branch not in state.entry_branch_parents
+
+
+def test_delete_session_removes_descendants_before_parent_on_failure(supervisor_state, monkeypatch):
+    from engine.conversation_store import ConversationStore
+
+    state = supervisor_state
+    root = state.get_or_create_session(channel="test", conversation_key="test:delete-order")
+    child, _ = state.get_or_create_child_session(root, "worker", "", "fresh")
+    nested, _ = state.get_or_create_child_session(child, "nested-worker", "", "fresh")
+    deleted = []
+    delete = ConversationStore.delete
+
+    def fail_nested(self, sid):
+        deleted.append(sid)
+        if sid == nested:
+            raise PermissionError("nested denied")
+        delete(self, sid)
+
+    monkeypatch.setattr(ConversationStore, "delete", fail_nested)
+    with pytest.raises(PermissionError, match="nested denied"):
+        state.delete_session(root)
+    assert deleted == [nested]
+    assert root in state.sessions
+    assert child in state.parent_children[root] and nested in state.parent_children[child]
+    monkeypatch.setattr(ConversationStore, "delete", delete)
+    assert state.delete_session(root)
+    assert not {root, child, nested}.intersection(state._session_store._registry)

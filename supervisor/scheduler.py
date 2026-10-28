@@ -396,19 +396,15 @@ class SchedulerThread:
                     if task is None or task.status != TaskStatus.running:
                         continue
                     _stale_min = int((_now_ts - task.updated_at).total_seconds() / 60)
-                    task.status = TaskStatus.failed
-                    task.result = {
-                        "action": "fail",
-                        "node_id": task.node_id or "",
-                        "error": f"Task timed out (no response for {_stale_min} minutes, worker likely crashed)",
-                    }
-                    task.updated_at = _now_ts
-                    task.lease_expires_at = None
-                    # [2026-09-14] 超时回收也是终态，写回子会话 registry，避免
-                    # supervisor 重启/裁剪后这类子会话在面板上变回 running 幽灵。
-                    self._state._mark_child_session_terminal(task)
-                    self._state._event_task_snapshot("task_completed", task, component="supervisor")
-                    self._state._route_completed_task_locked(task)
+                    self._state._fail_task_locked(
+                        task,
+                        result={
+                            "action": "fail",
+                            "node_id": task.node_id or "",
+                            "error": f"Task timed out (no response for {_stale_min} minutes, worker likely crashed)",
+                        },
+                        now=_now_ts,
+                    )
                     log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, stale {_stale_min}min)")
         except Exception as e:
             log.warning(f"[scheduler] cleanup error: {e}")

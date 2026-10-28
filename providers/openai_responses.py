@@ -154,6 +154,43 @@ class OpenAIResponsesProvider(BaseProvider):
         self._base_url = _normalize_base_url(base_url)
         self._options = provider_options or {}
 
+        # max_tokens / max_completion_tokens -> max_output_tokens
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_completion_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self.default_max_tokens
+        try:
+            value = int(_raw_max_tok) if _raw_max_tok is not None else None
+        except (TypeError, ValueError):
+            value = None
+        self._max_output_tokens: int | None = value if value is not None and value > 0 else None
+
+        # 注入 reasoning 参数（支持 reasoning_effort 与 thought_summary，thought_summary 默认为 False）
+        _reasoning: dict[str, Any] = {}
+        _raw_r_dict = self._options.get("reasoning")
+        if isinstance(_raw_r_dict, dict):
+            _reasoning.update(_raw_r_dict)
+
+        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if _raw_effort is not None:
+            _effort_str = str(_raw_effort).strip().lower()
+            if _effort_str:
+                _reasoning["effort"] = _effort_str
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if _raw_ts is True or (isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("true", "1", "yes", "auto")):
+            _reasoning["summary"] = "auto"
+        elif isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("concise", "detailed"):
+            _reasoning["summary"] = _raw_ts.strip().lower()
+        elif "thought_summary" in self._options:
+            _reasoning.pop("summary", None)
+
+        if _reasoning.get("effort") == "none":
+            _reasoning.pop("summary", None)
+
+        self._reasoning: dict[str, Any] = _reasoning
+
     # ------------------------------------------------------------------
     # URL helpers
     # ------------------------------------------------------------------
@@ -670,43 +707,10 @@ class OpenAIResponsesProvider(BaseProvider):
                 else:
                     resp_tools.append(t)
             payload["tools"] = resp_tools
-        # max_tokens / max_completion_tokens -> max_output_tokens
-        _raw_max_tok = self._options.get("max_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self._options.get("max_completion_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self.default_max_tokens
-        try:
-            if _raw_max_tok is not None and int(_raw_max_tok) > 0:
-                payload["max_output_tokens"] = int(_raw_max_tok)
-        except (TypeError, ValueError):
-            pass
-
-        # 注入 reasoning 参数（支持 reasoning_effort 与 thought_summary，thought_summary 默认为 False）
-        _reasoning: dict[str, Any] = {}
-        _raw_r_dict = self._options.get("reasoning")
-        if isinstance(_raw_r_dict, dict):
-            _reasoning.update(_raw_r_dict)
-
-        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
-        if _raw_effort is not None:
-            _effort_str = str(_raw_effort).strip().lower()
-            if _effort_str:
-                _reasoning["effort"] = _effort_str
-
-        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
-        if _raw_ts is True or (isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("true", "1", "yes", "auto")):
-            _reasoning["summary"] = "auto"
-        elif isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("concise", "detailed"):
-            _reasoning["summary"] = _raw_ts.strip().lower()
-        elif "thought_summary" in self._options:
-            _reasoning.pop("summary", None)
-
-        if _reasoning.get("effort") == "none":
-            _reasoning.pop("summary", None)
-
-        if _reasoning:
-            payload["reasoning"] = _reasoning
+        if self._max_output_tokens is not None:
+            payload["max_output_tokens"] = self._max_output_tokens
+        if self._reasoning:
+            payload["reasoning"] = dict(self._reasoning)
         return payload
 
     # ------------------------------------------------------------------

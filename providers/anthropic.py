@@ -413,6 +413,50 @@ class AnthropicProvider(BaseProvider):
             base = base[:-len("/v1")].rstrip("/")
         self._base_url = base
         self._options = provider_options or {}
+        self._last_payload: dict[str, Any] | None = None
+
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_completion_tokens")
+        try:
+            value = int(_raw_max_tok) if _raw_max_tok is not None else None
+        except (TypeError, ValueError):
+            value = None
+        self._max_tokens: int | None = value if value is not None and value > 0 else None
+
+        # 注入 thinking / output_config / display 参数
+        _thinking: dict[str, Any] = {}
+        self._reasoning_effort: str | None = None
+        _raw_t_dict = self._options.get("thinking")
+        if isinstance(_raw_t_dict, dict):
+            _thinking.update(_raw_t_dict)
+            _thinking.pop("budget_tokens", None)
+
+        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if _raw_effort is not None:
+            _effort_str = str(_raw_effort).strip().lower()
+            self._reasoning_effort = _effort_str or None
+            if _effort_str == "none":
+                _thinking = {"type": "disabled"}
+            elif _effort_str:
+                _thinking.setdefault("type", "adaptive")
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if isinstance(_raw_ts, bool):
+            _ts_enabled = _raw_ts
+        elif isinstance(_raw_ts, str):
+            _ts_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none", "omitted")
+        else:
+            _ts_enabled = bool(_raw_ts)
+
+        if _thinking.get("type") == "disabled":
+            _thinking.pop("display", None)
+        else:
+            _thinking.setdefault("type", "adaptive")
+            if _thinking.get("type") in ("adaptive", "enabled"):
+                _thinking["display"] = "summarized" if _ts_enabled else "omitted"
+
+        self._thinking: dict[str, Any] = _thinking
 
     # -- Auth headers --
 
@@ -450,13 +494,7 @@ class AnthropicProvider(BaseProvider):
         system_text, converted = _convert_messages(messages)
         converted_tools = _convert_tools(tools)
 
-        _raw_max_tok = self._options.get("max_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self._options.get("max_completion_tokens")
-        try:
-            eff_max_tokens = int(_raw_max_tok) if _raw_max_tok is not None and int(_raw_max_tok) > 0 else max_tokens
-        except (TypeError, ValueError):
-            eff_max_tokens = max_tokens
+        eff_max_tokens = self._max_tokens if self._max_tokens is not None else max_tokens
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -472,42 +510,11 @@ class AnthropicProvider(BaseProvider):
         if stream:
             payload["stream"] = True
 
-        # 注入 thinking / output_config / display 参数
-        _thinking: dict[str, Any] = {}
-        _raw_t_dict = self._options.get("thinking")
-        if isinstance(_raw_t_dict, dict):
-            _thinking.update(_raw_t_dict)
-            _thinking.pop("budget_tokens", None)
-
-        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
-        if _raw_effort is not None:
-            _effort_str = str(_raw_effort).strip().lower()
-            if _effort_str == "none":
-                _thinking = {"type": "disabled"}
-            elif _effort_str:
-                _thinking.setdefault("type", "adaptive")
-                _out_cfg = dict(payload.get("output_config") or {})
-                _out_cfg["effort"] = _effort_str
-                payload["output_config"] = _out_cfg
-                payload.pop("temperature", None)
-
-        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
-        if isinstance(_raw_ts, bool):
-            _ts_enabled = _raw_ts
-        elif isinstance(_raw_ts, str):
-            _ts_enabled = _raw_ts.strip().lower() not in ("false", "0", "no", "off", "none", "omitted")
-        else:
-            _ts_enabled = bool(_raw_ts)
-
-        if _thinking.get("type") == "disabled":
-            _thinking.pop("display", None)
-        else:
-            _thinking.setdefault("type", "adaptive")
-            if _thinking.get("type") in ("adaptive", "enabled"):
-                _thinking["display"] = "summarized" if _ts_enabled else "omitted"
-
-        if _thinking:
-            payload["thinking"] = _thinking
+        if self._reasoning_effort and self._reasoning_effort != "none":
+            payload["output_config"] = {"effort": self._reasoning_effort}
+            payload.pop("temperature", None)
+        if self._thinking:
+            payload["thinking"] = dict(self._thinking)
         self._last_payload = payload
         return payload
 
@@ -827,7 +834,7 @@ class AnthropicProvider(BaseProvider):
 
     def _dump_error_payload(self, status_code: int, error_msg: str) -> None:
         """Dump the last request payload on error for forensic analysis."""
-        payload = getattr(self, '_last_payload', None)
+        payload = self._last_payload
         if not payload:
             return
         try:

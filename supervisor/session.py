@@ -34,20 +34,9 @@ class SessionMixin:
 
     # ---- Fork/Merge 入口分支管理 ----
 
-    def _ensure_entry_branch_indexes_locked(self) -> None:
-        """Ensure fork/merge branch indexes exist on older reconstructed states."""
-        # [Fork/Merge 2026-05-12] 兼容旧 SupervisorState 实例或测试桩。
-        # 原因：分支索引是新增内存字段，部分单元测试可能直接构造 mixin 所需属性。
-        # 做法：在每个分支管理入口惰性补齐两张索引。目的：让新逻辑不依赖
-        # __init__ 一定已经按最新代码运行，保持 supervisor 层向后兼容。
-        if not hasattr(self, "parent_entry_branches"):
-            self.parent_entry_branches = {}
-        if not hasattr(self, "entry_branch_parents"):
-            self.entry_branch_parents = {}
 
     def _is_entry_branch_session_locked(self, branch_session_id: str, *, parent_session_id: str | None = None) -> bool:
         """Return whether a session id is an entry fork branch."""
-        self._ensure_entry_branch_indexes_locked()
         bid = str(branch_session_id or "").strip()
         if not bid:
             return False
@@ -56,9 +45,8 @@ class SessionMixin:
             return False
         if parent:
             return True
-        entry = getattr(self, "_session_store", None)
-        registry = getattr(entry, "_registry", {}) if entry is not None else {}
-        raw = registry.get(bid) if isinstance(registry, dict) else None
+        registry = self._session_store._registry
+        raw = registry.get(bid)
         if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
             if parent_session_id is None:
                 return True
@@ -67,7 +55,6 @@ class SessionMixin:
 
     def _entry_branch_ids_for_parent_locked(self, parent_session_id: str) -> set[str]:
         """Collect active entry branch session ids for a parent session."""
-        self._ensure_entry_branch_indexes_locked()
         parent = str(parent_session_id or "").strip()
         if not parent:
             return set()
@@ -84,16 +71,14 @@ class SessionMixin:
         # resolve active branch indexes first, then sessions.json entry-branch
         # records, and fall back to the original id for normal sessions. Purpose:
         # switch_node/context/cancel endpoints mutate the durable conversation.
-        self._ensure_entry_branch_indexes_locked()
         sid = str(session_id or "").strip()
         if not sid:
             return ""
         parent = self.entry_branch_parents.get(sid, "")
         if parent:
             return parent
-        entry = getattr(self, "_session_store", None)
-        registry = getattr(entry, "_registry", {}) if entry is not None else {}
-        raw = registry.get(sid) if isinstance(registry, dict) else None
+        registry = self._session_store._registry
+        raw = registry.get(sid)
         if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
             stored_parent = str(raw.get("parent_session_id") or "").strip()
             if stored_parent:
@@ -131,7 +116,6 @@ class SessionMixin:
         """Create a branch session for one inbound and fork parent history into it."""
         from engine.conversation_store import ConversationStore
 
-        self._ensure_entry_branch_indexes_locked()
         parent = str(parent_session_id or "").strip()
         seq = int(inbound_seq or 0)
         branch_session_id = f"branch_{seq}" if seq > 0 else f"branch_{uuid.uuid4().hex[:12]}"
@@ -180,7 +164,7 @@ class SessionMixin:
                     fork_result = {
                         "copied": len(source_messages),
                         "base_count": len(source_messages),
-                        "base_last_id": getattr(source_messages[-1], "id", "") if source_messages else "",
+                        "base_last_id": source_messages[-1].id if source_messages else "",
                     }
                 else:
                     branch_count = store.message_count(branch_session_id)
@@ -304,7 +288,6 @@ class SessionMixin:
         [2026-10-19] exclude_task_id: the task that triggered this cleanup is
         allowed to keep running so it can finish its own turn normally.
         """
-        self._ensure_entry_branch_indexes_locked()
         branch = str(branch_session_id or "").strip()
         if not branch:
             return
@@ -792,6 +775,88 @@ class SessionMixin:
 
             return {"ok": True, "deduped": False, "event_seq": int(evt.get("seq", 0) or 0)}
 
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session tree by id, cancelling its in-flight work first."""
+        from engine.context_store import cleanup_session_contexts
+
+        with self._lock:
+            if session_id not in self.sessions:
+                return False
+
+            session_ids = {session_id}
+            session_order = [session_id]
+            for parent_sid in session_order:
+                children = set(self.parent_children.get(parent_sid, set()))
+                children.update(self._entry_branch_ids_for_parent_locked(parent_sid))
+                children.update(
+                    sid for sid, entry in self._session_store._registry.items()
+                    if entry.get("parent_session_id") == parent_sid
+                )
+                children.update(
+                    child_sid for (parent, _node, _key), child_sid in self.child_session_map.items()
+                    if parent == parent_sid
+                )
+                for child_sid in children - session_ids:
+                    session_ids.add(child_sid)
+                    session_order.append(child_sid)
+
+            task_ids = {
+                task.task_id for task in self.tasks.values()
+                if task.session_id in session_ids
+                or task.input.get("child_session_id") in session_ids
+                or task.input.get("parent_session_id") in session_ids
+            }
+            children_by_caller: dict[str, list[str]] = {}
+            for task in self.tasks.values():
+                children_by_caller.setdefault(task.caller_task_id or "", []).append(task.task_id)
+            queue = list(task_ids)
+            for task_id in queue:
+                for child_id in children_by_caller.get(task_id, []):
+                    if child_id not in task_ids:
+                        task_ids.add(child_id)
+                        queue.append(child_id)
+
+            now = _now()
+            for task_id in task_ids:
+                self._cancel_task_for_reset_locked(self.tasks[task_id], now)
+            for approval in list(self.approvals.values()):
+                if approval.status == ApprovalStatus.pending and (
+                    approval.session_id in session_ids or approval.task_id in task_ids
+                ):
+                    self.decide_approval(
+                        approval_id=approval.approval_id, decision="deny", comment="session deleted",
+                    )
+            for async_id, entry in list(self._async_tools.items()):
+                if entry.get("status") == "running" and (
+                    entry.get("session_id") in session_ids or entry.get("task_id") in task_ids
+                ):
+                    self.cancel_async_tool(async_id)
+
+            # Remove descendants first so a failed cleanup remains reachable from the root.
+            for sid in reversed(session_order):
+                self._delete_conversation_session_locked(sid)
+                cleanup_session_contexts(self.workspace_root, sid)
+                self._session_store.remove_session(sid)
+                self._remove_child_mapping_for_session_locked(sid)
+                self._purge_context_usage_for_session(sid)
+                self.sessions.pop(sid, None)
+                self.session_generations.pop(sid, None)
+                self._cancelled_sessions.discard(sid)
+                self._skip_merge_sessions.discard(sid)
+                self.session_entry_overrides.pop(sid, None)
+                self.session_last_entry_node.pop(sid, None)
+                self.entry_branch_parents.pop(sid, None)
+                self.parent_entry_branches.pop(sid, None)
+                self.parent_children.pop(sid, None)
+                for branches in self.parent_entry_branches.values():
+                    branches.discard(sid)
+                for children in self.parent_children.values():
+                    children.discard(sid)
+                for key, mapped_sid in list(self.conversation_map.items()):
+                    if mapped_sid == sid:
+                        self.conversation_map.pop(key)
+            return True
+
     def reset_conversation(
         self,
         *,
@@ -894,7 +959,6 @@ class SessionMixin:
                 if self.conversation_map[key] != excluded_sid:
                     self.conversation_map.pop(key)
 
-            self._ensure_entry_branch_indexes_locked()
             for sid in reset_session_ids - {old_session_id}:
                 parent_sid = self.entry_branch_parents.pop(sid, "")
                 self._delete_conversation_session_locked(sid)
@@ -1007,7 +1071,7 @@ class SessionMixin:
         # Purpose: operators can inspect one task's work without noise from
         # prior tasks in the same long-lived session.
         if task_id:
-            messages = [m for m in messages if getattr(m, 'source_task_id', '') == task_id]
+            messages = [m for m in messages if m.source_task_id == task_id]
 
         # [2026-06-07] Structural compatibility for older mixed terminal-tool
         # rejection rows. Why: old rows predate MessageMeta.tool_rejection_code,
@@ -1019,8 +1083,8 @@ class SessionMixin:
         hidden_tool_result_ids: dict[str, str] = {}
         terminal_tools = {"finish", "ask"}
         for amsg in messages:
-            calls = getattr(amsg, "tool_calls", None)
-            if getattr(amsg, "role", "") != "assistant" or not isinstance(calls, list):
+            calls = amsg.tool_calls
+            if amsg.role != "assistant":
                 continue
             names: list[str] = []
             ids: list[str] = []
@@ -1339,7 +1403,7 @@ class SessionMixin:
 
         with self._lock:
             si_obj = self.sessions.get(session_id)
-            entry_nid = str(getattr(si_obj, "entry_node_id", "") or "")
+            entry_nid = si_obj.entry_node_id if si_obj is not None else ""
             candidates: list[dict[str, Any]] = []
             for (sid, nid), entry in self._session_context_usage.items():
                 entry_node = str(entry.get("node_id") or nid or "")

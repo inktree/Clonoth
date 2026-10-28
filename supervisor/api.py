@@ -13,13 +13,15 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
+
+from engine.conversation_store import Message
 
 from .config_store import ConfigStore
 from .process_manager import ProcessManager
@@ -89,12 +91,6 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _provider_public_value(cfg: Any, key: str) -> str:
-    if isinstance(cfg, dict):
-        return str(cfg.get(key) or "")
-    return str(getattr(cfg, key, "") or "")
-
-
 def _resolve_session_active_node_effective(
     *,
     st: SupervisorState,
@@ -119,21 +115,12 @@ def _resolve_session_active_node_effective(
         return result
 
     providers_payload = cs.get_providers_public()
-    provider_blocks = (
-        providers_payload.get("providers", {}) if isinstance(providers_payload, dict)
-        else getattr(providers_payload, "providers", {})
-    )
-    provider_configs: dict[str, dict[str, str]] = {}
-    for name, cfg in provider_blocks.items():
-        provider_configs[str(name)] = {
-            "model": _provider_public_value(cfg, "model"),
-            "base_url": _provider_public_value(cfg, "base_url"),
-        }
-
-    active_provider = str(
-        providers_payload.get("active_provider", "") if isinstance(providers_payload, dict)
-        else getattr(providers_payload, "active_provider", "")
-    ) or "openai"
+    provider_blocks = providers_payload["providers"]
+    provider_configs: dict[str, dict[str, str]] = {
+        name: {"model": cfg["model"], "base_url": cfg["base_url"]}
+        for name, cfg in provider_blocks.items()
+    }
+    active_provider = providers_payload["active_provider"]
     default_model = (
         provider_configs.get(active_provider, {}).get("model")
         or provider_configs.get("openai", {}).get("model")
@@ -163,53 +150,26 @@ def _resolve_session_active_node_effective(
     return result
 
 
-def _conversation_message_to_compact_dict(message: Any) -> dict[str, Any]:
-    """Convert ConversationStore rows to the dict shape expected by compact."""
-    # [2026-06-06] Why: the API reads persisted Message objects, while the shared
-    # compact planner receives the in-memory dict shape used by the engine. How:
-    # preserve role/content/tool fields and mirror source_task_id into _meta.
-    # Purpose: API-triggered compaction sees the same task boundaries as engine
-    # manual and automatic compaction.
-    if isinstance(message, dict):
-        raw = dict(message)
-    else:
-        to_dict = getattr(message, "to_dict", None)
-        raw = dict(to_dict()) if callable(to_dict) else {
-            "role": getattr(message, "role", "unknown"),
-            "content": getattr(message, "content", ""),
-            "message_type": getattr(message, "message_type", ""),
-            "meta": getattr(message, "meta", {}),
-            "source_task_id": getattr(message, "source_task_id", ""),
-            "tool_calls": getattr(message, "tool_calls", []),
-            "tool_call_id": getattr(message, "tool_call_id", ""),
-            "name": getattr(message, "name", ""),
-            "ephemeral": getattr(message, "ephemeral", False),
-        }
-
-    compact_message: dict[str, Any] = {
-        "role": str(raw.get("role") or "unknown"),
-        "content": raw.get("content", ""),
-    }
-    raw_meta = raw.get("_meta") if isinstance(raw.get("_meta"), dict) else raw.get("meta")
-    meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
-    source_task_id = str(raw.get("source_task_id") or "").strip()
-    if source_task_id:
-        meta.setdefault("source_task_id", source_task_id)
-    message_type = str(raw.get("message_type") or "").strip()
-    if message_type:
-        compact_message["message_type"] = message_type
-        meta.setdefault("message_type", message_type)
+def _conversation_message_to_compact_dict(message: Message) -> dict[str, Any]:
+    """Project a stored Message into the compact planner's history shape."""
+    result: dict[str, Any] = {"role": message.role, "content": message.content}
+    meta = dict(message.meta)
+    if message.source_task_id:
+        meta.setdefault("source_task_id", message.source_task_id)
+    if message.message_type:
+        result["message_type"] = message.message_type
+        meta.setdefault("message_type", message.message_type)
     if meta:
-        compact_message["_meta"] = meta
-    if raw.get("ephemeral") or raw.get("_dynamic"):
-        compact_message["_dynamic"] = True
-    if isinstance(raw.get("tool_calls"), list) and raw.get("tool_calls"):
-        compact_message["tool_calls"] = raw.get("tool_calls")
-    if raw.get("tool_call_id"):
-        compact_message["tool_call_id"] = str(raw.get("tool_call_id") or "")
-    if raw.get("name"):
-        compact_message["name"] = str(raw.get("name") or "")
-    return compact_message
+        result["_meta"] = meta
+    if message.ephemeral:
+        result["_dynamic"] = True
+    if message.tool_calls:
+        result["tool_calls"] = message.tool_calls
+    if message.tool_call_id:
+        result["tool_call_id"] = message.tool_call_id
+    if message.name:
+        result["name"] = message.name
+    return result
 
 
 # [WS events 2026-05-17] Why: WebSocket clients should keep long-lived event
@@ -990,7 +950,7 @@ def create_app(
         # dispatch_origin carries a parent_session_id, register the newly created
         # agent session as a child of the resolved parent. Purpose: /children API
         # and sidebar child-node tree stay consistent.
-        if msg.dispatch_origin and isinstance(msg.dispatch_origin, dict):
+        if msg.dispatch_origin:
             _dispatch_parent = str(msg.dispatch_origin.get("parent_session_id") or "").strip()
             if _dispatch_parent and session_id != _dispatch_parent:
                 with st._lock:
@@ -1034,8 +994,8 @@ def create_app(
                     if (
                         _parent_info is not None
                         and _child_info is not None
-                        and getattr(_parent_info, "workspace", None)
-                        and not getattr(_child_info, "workspace", None)
+                        and _parent_info.workspace
+                        and not _child_info.workspace
                     ):
                         _child_info.workspace = dict(_parent_info.workspace)
                         st._session_store.update_workspace(session_id, _child_info.workspace)
@@ -1051,7 +1011,7 @@ def create_app(
         # first run. How: apply the optional provider_override right after session
         # creation and before record_inbound_message_event. Purpose: no race between
         # setting the override and the task picking it up.
-        if msg.provider_override and isinstance(msg.provider_override, dict):
+        if msg.provider_override:
             st.set_session_provider_override(session_id, msg.provider_override)
 
         evt = st.eventlog.append(
@@ -1182,70 +1142,11 @@ def create_app(
 
     @app.get("/v1/sessions/{session_id}/running_tasks")
     async def session_running_tasks(session_id: str) -> dict[str, Any]:
-        """Bot 查询当前 session 中 running/pending 状态的 task 列表。
-        自动收割 lease 过期超过 grace period 的僵尸 task。
-        跳过 session 中存在 pending approval 的 task（等审批不算僵尸）。"""
+        """Return running/pending tasks after state-owned expired-lease recovery."""
         st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
+        tasks = st.list_session_running_tasks(session_id)
+        if tasks is None:
             raise HTTPException(status_code=404, detail="session not found")
-        now = _now()
-        _GRACE = timedelta(seconds=180)
-        tasks: list[dict[str, Any]] = []
-        with st._lock:
-            # [Fork/Merge 2026-05-12] running_tasks 查询主 session 时也返回入口分支任务。
-            # 原因：adapter 以后需要在多个并发 branch 中选择显式 preempt 目标。
-            # 做法：把主 session 与 parent→branches 索引合并为查询集合。
-            # 目的：端点仍以主 session_id 调用，但能观察所有活跃分支。
-            session_ids = {session_id, *st._entry_branch_ids_for_parent_locked(session_id)}
-            # 检查该 session 或任一分支是否有 pending approval
-            _has_pending_approval = any(
-                a.status == ApprovalStatus.pending and a.session_id in session_ids
-                for a in st.approvals.values()
-            )
-            for task in st.tasks.values():
-                if task.session_id not in session_ids:
-                    continue
-                if task.status not in (TaskStatus.running, TaskStatus.pending):
-                    continue
-                # 收割僵尸：running + lease 过期超过 grace period
-                # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
-                # fix: lease_expires_at 为 None 时也视为僵尸，避免无 lease 的 running 任务永远无法被收割
-                if (task.status == TaskStatus.running
-                        and (not task.lease_expires_at or task.lease_expires_at + _GRACE < now)
-                        and not _has_pending_approval):
-                    task.status = TaskStatus.failed
-                    task.updated_at = now
-                    task.lease_expires_at = None
-                    task.result = {"action": "fail", "error": "lease expired (zombie reaped)"}
-                    # 写事件，使 events.jsonl 与内存状态一致
-                    st.eventlog.append(
-                        session_id=task.session_id,
-                        component="supervisor",
-                        type_="task_completed",
-                        payload=task.model_dump(mode="json"),
-                    )
-                    # [Fork/Merge 2026-05-12] 僵尸回收是 fail 终态，也必须走统一路由。
-                    # 原因：入口分支被回收时需要 merge 回主 session，并输出错误事件。
-                    # 做法：复用 task_router 的 fail 路由。目的：避免 reaped branch 永久悬挂。
-                    st._route_completed_task_locked(task)
-                    continue
-                _is_async = bool(task.input.get("_async_dispatch"))
-                _is_system = bool(task.input.get("_system_task"))
-                _is_scheduled = bool(task.input.get("schedule_id"))
-                branch_session_id = str(task.input.get("branch_session_id") or "")
-                if not branch_session_id and task.session_id != session_id:
-                    branch_session_id = task.session_id
-                tasks.append({
-                    "task_id": task.task_id,
-                    "node_id": task.node_id or "",
-                    "status": task.status.value,
-                    "created_at": task.created_at.isoformat() if task.created_at else "",
-                    "caller_task_id": task.caller_task_id or "",
-                    "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system and not _is_scheduled),
-                    "source_inbound_seq": task.source_inbound_seq,
-                    "branch_session_id": branch_session_id,
-                    "parent_session_id": str(task.input.get("parent_session_id") or (session_id if branch_session_id else "")),
-                })
         return {"tasks": tasks}
 
     # [2026-05-28] 全局按 node_id 查找活跃任务（跨 session）。
@@ -1783,13 +1684,13 @@ def create_app(
             session_id=session_id,
             component="shell",
             type_=ev.type,
-            payload=dict(ev.payload or {}),
+            payload=ev.payload,
             transient=transient,
         )
         if ev.type == "outbound_message":
             st.record_outbound_message_event(evt)
         if ev.type == "context_usage":
-            st.update_context_usage(session_id, dict(ev.payload or {}))
+            st.update_context_usage(session_id, ev.payload)
         # [AutoC 2026-06-03] Why: scheduler stale-task reaper checks task.updated_at
         # but the engine heartbeat (renew_lease) only refreshes lease_expires_at,
         # causing live tasks to be falsely reaped after 10 min of no state mutation.
@@ -1855,14 +1756,14 @@ def create_app(
         # on conversation_key string prefixes. How: look up the session registry
         # for parent_session_id and include it in the response. Purpose: sidebar
         # filtering uses structured metadata instead of fragile naming conventions.
-        registry = getattr(st._session_store, "_registry", {})
+        registry = st._session_store._registry
         for sid, si in st.sessions.items():
             if channel and si.channel != channel:
                 continue
-            raw = registry.get(sid) if isinstance(registry, dict) else None
+            raw = registry.get(sid)
             parent_sid = str(raw.get("parent_session_id") or "").strip() if isinstance(raw, dict) else ""
             ws_name = ""
-            if isinstance(si.workspace, dict):
+            if si.workspace:
                 ws_name = str(si.workspace.get("name") or "").strip()
             results.append({
                 "session_id": si.session_id,
@@ -1896,41 +1797,11 @@ def create_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str, request: Request) -> dict[str, Any]:
-        """Delete a session and its conversation store."""
-        # [2026-06-16] Require Admin Token before deleting session data.
-        # Why: deletion removes Supervisor state and durable conversation files.
-        # How: add Request injection and verify it before any mutation.
-        # Purpose: keep this web-facing destructive endpoint admin-only.
+        """Delete a session through the state-owned lifecycle operation."""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
+        if not st.delete_session(session_id):
             raise HTTPException(status_code=404, detail="session not found")
-        si = st.sessions[session_id]
-        # Remove from sessions and conversation_map
-        with st._lock:
-            del st.sessions[session_id]
-            conv_key = si.conversation_key
-            if conv_key and st.conversation_map.get(conv_key) == session_id:
-                del st.conversation_map[conv_key]
-        # Delete ConversationStore JSONL
-        try:
-            from pathlib import Path
-            from engine.conversation_store import ConversationStore
-            conv_store = ConversationStore(Path(st.workspace_root) / "data" / "conversations")
-            conv_store.delete(session_id)
-        except Exception:
-            pass
-        # Clean up node contexts
-        try:
-            from engine.context_store import cleanup_session_contexts
-            cleanup_session_contexts(st.workspace_root, session_id)
-        except Exception:
-            pass
-        # Mark as reset in sessions.json
-        try:
-            st._session_store.on_session_reset(session_id)
-        except Exception:
-            pass
         return {"ok": True, "session_id": session_id}
 
     @app.get("/v1/sessions/{session_id}/messages")
@@ -2136,13 +2007,6 @@ def create_app(
         """设置 session 级 provider 覆盖配置。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        # [AutoC 2026-06-01] Why: provider overrides are intentionally generic
-        # JSON dictionaries, but the endpoint must reject non-object bodies before
-        # they reach SessionInfo. How: FastAPI parses the body and this guard keeps
-        # only dict values. Purpose: provider adapters can add fields later while
-        # malformed requests get a clear 400 response.
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="provider_override must be a JSON object")
         result = st.set_session_provider_override(session_id, body)
         if result is None:
             raise HTTPException(status_code=404, detail="session not found")
@@ -2177,8 +2041,6 @@ def create_app(
         """设置 session 级工作区配置 {name, path}。"""
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        if not isinstance(body, dict):
-            raise HTTPException(status_code=400, detail="workspace must be a JSON object")
         result = st.set_session_workspace(session_id, body)
         if result is None:
             raise HTTPException(status_code=404, detail="session not found")
@@ -2213,7 +2075,7 @@ def create_app(
             ws_path = Path(path).resolve()
         elif session_id:
             ws = st.get_session_workspace(session_id)
-            if ws and isinstance(ws, dict) and ws.get("path"):
+            if ws and ws.get("path"):
                 ws_path = Path(ws["path"]).resolve()
 
         if not ws_path:
@@ -2602,7 +2464,7 @@ def create_app(
                     pm.stop_engine()
                 except Exception:
                     pass
-                for _eng in getattr(pm, 'engines', []):
+                for _eng in pm.engines:
                     try:
                         _eng.popen.wait(timeout=5)
                     except Exception:
@@ -2669,7 +2531,6 @@ def create_app(
             # 修复：如果 session_id 是 entry branch，追溯到 parent session。
             # 子任务完成后 _inject_async_dispatch_result_locked 会往 parent 注入
             # inbound 并 fork 新 branch 处理结果，路径不受影响。
-            st._ensure_entry_branch_indexes_locked()
             _task_session_id = session_id
             _task_generation = session_generation
             _parent_of_branch = st.entry_branch_parents.get(session_id)
@@ -2833,10 +2694,8 @@ def create_app(
     @app.get("/v1/plugins")
     async def list_registered_plugins() -> dict[str, Any]:
         routes_by_owner: dict[str, list[dict[str, Any]]] = {}
-        routes_face = getattr(state, "routes_face", None)
-        if routes_face is not None:
-            for rec in routes_face.list_routes():
-                routes_by_owner.setdefault(rec["owner"], []).append(rec)
+        for rec in state.routes_face.list_routes():
+            routes_by_owner.setdefault(rec["owner"], []).append(rec)
         known: set[str] = set()
         plugins_out: list[dict[str, Any]] = []
         for meta in state.hook_registry.list_plugins():
@@ -2865,8 +2724,7 @@ def create_app(
 
     # 插件路由挂载必须放在 create_app 尾部：核心路由全部先注册，
     # 路由面的冲突检测才能以完整核心集合为基准，插件无法遮蔽核心端点。
-    if getattr(state, "routes_face", None) is not None:
-        state.routes_face.attach(app, workspace_root=state.workspace_root)
+    state.routes_face.attach(app, workspace_root=state.workspace_root)
 
     # 启动时打印 token 并写入共享文件供 engine 读取
     token = get_admin_token()

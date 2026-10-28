@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from clonoth_runtime import get_entry_node_id, get_str, load_runtime_config
@@ -12,7 +12,7 @@ from engine.tool_step import cleanup_tool_result_artifacts
 from ._helpers import _now
 
 logger = logging.getLogger(__name__)
-from .types import Task, TaskKind, TaskStatus
+from .types import ApprovalStatus, Task, TaskKind, TaskStatus
 
 
 class TaskStoreMixin:
@@ -522,7 +522,7 @@ class TaskStoreMixin:
             # (scout, smith, etc). How: also include all child session IDs
             # and their entry branches. Purpose: cancel_active_tasks can now
             # reach persistent sub-node tasks.
-            for _child_sid in getattr(self, 'parent_children', {}).get(sid, set()):
+            for _child_sid in self.parent_children.get(sid, set()):
                 session_ids.add(_child_sid)
                 session_ids.update(self._entry_branch_ids_for_parent_locked(_child_sid))
             for task in self.tasks.values():
@@ -703,18 +703,8 @@ class TaskStoreMixin:
                 *task.preempt_attachments,
                 *(list(attachments) if isinstance(attachments, list) else []),
             ]
-            # [Fork/Merge 2026-05-17] Why: a task can be running inside a
-            # temporary entry branch, but session event consumers watch the
-            # durable parent session. How: use the task route helper when the
-            # supervisor includes it, and keep the runtime branch id in the
-            # payload for diagnostics. Purpose: accepted preempt requests remain
-            # visible without changing the task-local preempt flag semantics.
-            route_for_task = getattr(self, "_route_session_id_for_task_locked", None)
-            route_session_id = (
-                str(route_for_task(task) or "").strip()
-                if callable(route_for_task)
-                else ""
-            ) or task.session_id
+            # Branch work is published on its durable parent session.
+            route_session_id = self._route_session_id_for_task_locked(task)
             payload = {"task_id": task_id, "session_id": route_session_id, "has_message": bool(message)}
             if route_session_id != task.session_id:
                 payload["runtime_session_id"] = task.session_id
@@ -843,6 +833,76 @@ class TaskStoreMixin:
                 self._event_task_snapshot("task_started", task)
                 return task.model_dump(mode="json")
             return None
+
+    def _fail_task_locked(
+        self, task: Task, *, result: dict[str, Any], now: datetime,
+    ) -> None:
+        """Commit a supervisor-owned task failure while the caller holds _lock."""
+        task.status = TaskStatus.failed
+        task.result = result
+        task.updated_at = now
+        task.lease_expires_at = None
+        self._cleanup_tool_result_artifacts_for_task(task.task_id)
+        self._mark_child_session_terminal(task)
+        self._event_task_snapshot("task_completed", task)
+        self._route_completed_task_locked(task)
+
+    def list_session_running_tasks(self, session_id: str) -> list[dict[str, Any]] | None:
+        """Reap expired leases and return a current running/pending projection."""
+        with self._lock:
+            if session_id not in self.sessions:
+                return None
+            now = _now()
+            grace = timedelta(seconds=180)
+            session_ids = {session_id, *self._entry_branch_ids_for_parent_locked(session_id)}
+            has_pending_approval = any(
+                approval.status == ApprovalStatus.pending and approval.session_id in session_ids
+                for approval in self.approvals.values()
+            )
+            candidates = [
+                task.task_id for task in self.tasks.values()
+                if task.session_id in session_ids and task.status == TaskStatus.running
+            ]
+            for task_id in candidates:
+                task = self.tasks[task_id]
+                # Routing an earlier failure can cancel another candidate.
+                if task.status != TaskStatus.running:
+                    continue
+                if not has_pending_approval and (
+                    task.lease_expires_at is None or task.lease_expires_at + grace < now
+                ):
+                    self._fail_task_locked(
+                        task, result={"action": "fail", "error": "lease expired (zombie reaped)"},
+                        now=now,
+                    )
+
+            rows: list[dict[str, Any]] = []
+            for task in self.tasks.values():
+                if task.session_id not in session_ids or task.status not in (
+                    TaskStatus.running, TaskStatus.pending,
+                ):
+                    continue
+                branch_session_id = str(task.input.get("branch_session_id") or "")
+                if not branch_session_id and task.session_id != session_id:
+                    branch_session_id = task.session_id
+                rows.append({
+                    "task_id": task.task_id,
+                    "node_id": task.node_id or "",
+                    "status": task.status.value,
+                    "created_at": task.created_at.isoformat(),
+                    "caller_task_id": task.caller_task_id or "",
+                    "is_user_entry": not (
+                        task.caller_task_id or task.input.get("_async_dispatch")
+                        or task.input.get("_system_task") or task.input.get("schedule_id")
+                    ),
+                    "source_inbound_seq": task.source_inbound_seq,
+                    "branch_session_id": branch_session_id,
+                    "parent_session_id": str(
+                        task.input.get("parent_session_id")
+                        or (session_id if branch_session_id else "")
+                    ),
+                })
+            return rows
 
     def complete_task(self, *, task_id: str, worker_id: str, result: dict[str, Any]) -> Task | None:
         tid = (task_id or "").strip()

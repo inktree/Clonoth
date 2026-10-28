@@ -276,8 +276,12 @@ class SessionStore:
         Purpose: 立即释放已完成 branch 和已过期 child 的注册记录。
         """
         if session_id in self._registry:
-            self._registry.pop(session_id)
-            self._flush()
+            entry = self._registry.pop(session_id)
+            try:
+                self._flush()
+            except Exception:
+                self._registry[session_id] = entry
+                raise
 
     def on_child_session_created(
         self,
@@ -366,6 +370,7 @@ class SessionStore:
             tmp_path = None  # rename 成功，不需要清理
         except Exception as exc:
             logger.error("sessions.json: atomic write failed: %s", exc)
+            raise
         finally:
             if tmp_path is not None:
                 try:
