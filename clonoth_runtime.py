@@ -270,9 +270,6 @@ async def fetch_llm_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict
     data = r.json()
     return data if isinstance(data, dict) else {}
 
-# 旧名别名，兼容外部调用
-fetch_openai_secret = fetch_llm_secret
-
 
 def normalize_llm_secret(data: dict[str, Any]) -> tuple[str, str, str]:
     """从全局配置 dict 中提取 api_key/base_url/model，支持环境变量引用。"""
@@ -282,9 +279,6 @@ def normalize_llm_secret(data: dict[str, Any]) -> tuple[str, str, str]:
     base_url = resolve_env_ref(str(data.get("base_url") or "").strip())
     model = resolve_env_ref(str(data.get("model") or "gpt-4o-mini").strip()) or "gpt-4o-mini"
     return api_key, base_url, model
-
-# 旧名别名，兼容外部调用
-normalize_openai_secret = normalize_llm_secret
 
 
 def load_policy_config(workspace_root: Path) -> dict[str, Any]:

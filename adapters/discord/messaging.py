@@ -486,7 +486,6 @@ def _format_progress_log(
     *,
     dot_state: dict[str, Any] | None = None,
     status: str = "",
-    max_lines: int = 6,
 ) -> str:
     """统一进度日志渲染。主节点和子节点共用。"""
     if not lines and not dot_state:
@@ -494,8 +493,8 @@ def _format_progress_log(
 
     log_block = ""
     if lines:
-        display = lines[-max_lines:]
-        start_idx = max(0, len(lines) - max_lines) + 1
+        display = lines[-6:]
+        start_idx = max(0, len(lines) - 6) + 1
         numbered = [f"{start_idx + i}| {l}" for i, l in enumerate(display)]
         log_block = "```\n" + "\n".join(numbered) + "\n```"
 
@@ -578,7 +577,7 @@ def _format_status_summary(dot_state: dict[str, Any] | None) -> str:
     return text
 
 
-async def _safe_restart(rt: Any, channel_id: int = 0, delay: float = 3.0) -> None:
+async def _safe_restart(rt: Any, channel_id: int = 0) -> None:
     """延迟后通过 pm2 restart 安全重启自身。"""
     if channel_id:
         try:
@@ -586,7 +585,7 @@ async def _safe_restart(rt: Any, channel_id: int = 0, delay: float = 3.0) -> Non
             notify_path.write_text(json.dumps({"channel_id": channel_id}))
         except Exception:
             pass
-    await asyncio.sleep(delay)
+    await asyncio.sleep(2.0)
     if rt.session_state:
         for _rs_seq, _rs_trigger in list(rt.session_state.triggers.items()):
             try:
@@ -595,14 +594,12 @@ async def _safe_restart(rt: Any, channel_id: int = 0, delay: float = 3.0) -> Non
                     await status_msg.edit(content="⚠️ Bot 正在重启...", view=None)
             except Exception:
                 pass
-        # [2026-05-14 bug fix] The original function referenced self outside a
-        # class. It now reaches the callback helper through DiscordRuntime.
         callback_obj = rt.callbacks
         if callback_obj:
             for _rs_seq, _rs_state in list(rt.session_state.main_task_states.items()):
                 await callback_obj._settle_log_msg(_rs_state, "⚠️ Bot 重启中")
             for _rs_key, _rs_child in list(rt.session_state.child_task_states.items()):
-                if getattr(_rs_child, "is_dm", False):
+                if _rs_child.is_dm:
                     msg = _rs_child.platform_data.get("msg")
                     if msg:
                         await msg.delete()

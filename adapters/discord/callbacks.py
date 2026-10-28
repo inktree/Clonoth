@@ -155,15 +155,11 @@ class DiscordCallbacks:
         self._dot_states: dict[int, dict[str, Any]] = {}
         self._child_dot_states: dict[str, dict[str, Any]] = {}
 
-    def _should_edit(self, key: int | str, min_interval: float = 1.0, *, channel_id: int = 0) -> bool:
+    def _should_edit(self, key: int | str, *, channel_id: int = 0) -> bool:
         """检查 per-key 节流和可选的 per-channel edit 令牌桶。"""
         now = time.time()
         last = self._last_edit_time.get(key, 0)
-        # [2026-05-20 edit-rate-limit] Why: each log message should still avoid
-        # excessive redraws. How: keep the existing per-key interval check, but
-        # lower the default to one second. Purpose: allow smoother websocket
-        # progress while preserving local debounce behavior.
-        if now - last < min_interval:
+        if now - last < 1.0:
             return False
 
         if channel_id:
@@ -343,7 +339,7 @@ class DiscordCallbacks:
                 confirm_msg = await ch.send("🔄 **Bot 重启需要管理员确认**", view=view)
                 view._msg = confirm_msg
             else:
-                asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
+                asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id))
 
         logger.info("send_reply ch=%s seq=%s", channel_id, seq)
 
@@ -430,7 +426,7 @@ class DiscordCallbacks:
         if poller_restart:
             try:
                 ch_id = int(conversation_key[len("discord:"):])
-                asyncio.create_task(_safe_restart(self.rt, channel_id=ch_id, delay=2.0))
+                asyncio.create_task(_safe_restart(self.rt, channel_id=ch_id))
             except ValueError:
                 pass
 
@@ -602,7 +598,7 @@ class DiscordCallbacks:
         is_dm: bool = False,
     ) -> None:
         msg = state.platform_data.get("msg")
-        is_dm = getattr(state, "is_dm", is_dm)
+        is_dm = state.is_dm or is_dm
         if msg:
             try:
                 if is_dm:
@@ -668,8 +664,7 @@ class DiscordCallbacks:
             # importing agent.py and creating a circular dependency.
             view = self.rt.approval_view_factory(approval_id) if self.rt.approval_view_factory else None
             msg = await ch.send(desc, view=view)
-            # [AutoC 2026-05-31] 保存消息引用给 ApprovalView.on_timeout 编辑用
-            if view and hasattr(view, '_msg'):
+            if view is not None:
                 view._msg = msg
         except Exception as e:
             logger.error("show_approval_ui send failed: %s", e)
@@ -720,7 +715,7 @@ class DiscordCallbacks:
         if conversation_key.startswith("discord:"):
             try:
                 ch_id = int(conversation_key[len("discord:"):])
-                asyncio.create_task(_safe_restart(self.rt, channel_id=ch_id, delay=2.0))
+                asyncio.create_task(_safe_restart(self.rt, channel_id=ch_id))
             except ValueError:
                 pass
 
@@ -746,9 +741,6 @@ class DiscordCallbacks:
                     await status_msg.edit(content="🔄 上下文已重置。", view=None)
                 except Exception:
                     pass
-            stale_main = pd.get("_stale_main_state")
-            if stale_main:
-                await self._settle_log_msg(stale_main, "🔄 已重置")
             stale_main = pd.get("_stale_main_state")
             if stale_main:
                 await self._settle_log_msg(stale_main, "🔄 已重置")
@@ -833,7 +825,7 @@ class DiscordCallbacks:
             self._last_edit_time.pop(seq, None)
 
         for task_key, child_state in child_states:
-            if getattr(child_state, "is_dm", False):
+            if child_state.is_dm:
                 msg = child_state.platform_data.get("msg")
                 if msg:
                     try:

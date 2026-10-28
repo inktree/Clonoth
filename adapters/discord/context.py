@@ -78,7 +78,7 @@ def _format_identity(
     return identity
 
 
-async def _resolve_mention(match: re.Match[str], guild: discord.Guild | None) -> str:
+def _resolve_mention(match: re.Match[str], guild: discord.Guild | None) -> str:
     """将 <@123456> 解析为 @显示名。解析失败则保留原文。"""
     uid_str = match.group(1)
     if not guild:
@@ -93,7 +93,7 @@ async def _resolve_mention(match: re.Match[str], guild: discord.Guild | None) ->
     return match.group(0)
 
 
-async def _resolve_mentions_in_text(text: str, guild: discord.Guild | None, bot_id: int | None) -> str:
+def _resolve_mentions_in_text(text: str, guild: discord.Guild | None) -> str:
     """解析文本中的用户 mention，统一解析为 @显示名。"""
     if not text:
         return text
@@ -102,8 +102,7 @@ async def _resolve_mentions_in_text(text: str, guild: discord.Guild | None, bot_
     last_end = 0
     for m in pattern.finditer(text):
         parts.append(text[last_end:m.start()])
-        resolved = await _resolve_mention(m, guild)
-        parts.append(resolved)
+        parts.append(_resolve_mention(m, guild))
         last_end = m.end()
     parts.append(text[last_end:])
     return "".join(parts).strip()
@@ -264,10 +263,8 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
     identity = _format_identity(author, rt.key_roles)
     time_prefix = _format_time_prefix(ref.created_at)
     text = ""
-    guild = message.guild
-    bot_id = rt.dc_client.user.id if rt.dc_client.user else None
     if ref.content:
-        text = await _resolve_mentions_in_text(ref.content, guild, bot_id)
+        text = _resolve_mentions_in_text(ref.content, message.guild)
     if not text:
         snapshots = getattr(ref, "message_snapshots", None)
         if snapshots and len(snapshots) > 0:

@@ -273,7 +273,6 @@ async def _initialize_sdk(rt: DiscordRuntime) -> None:
         rt.callbacks,
         rt.bot_config,
         entry_node_id=rt.entry_node_id,
-        poll_interval=3.0,
     )
     rt.event_router.set_raw_event_hook(rt.callbacks.raw_event_hook)
     rt.router_task = asyncio.create_task(rt.event_router.run())
@@ -329,8 +328,7 @@ def register_events(rt: DiscordRuntime) -> None:
         raw_text = message.content.strip()
 
         guild = message.guild
-        bot_id = rt.dc_client.user.id if rt.dc_client.user else None
-        clean_text = await _resolve_mentions_in_text(raw_text, guild, bot_id)
+        clean_text = _resolve_mentions_in_text(raw_text, guild)
 
         reply_author_name = ""
         if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):

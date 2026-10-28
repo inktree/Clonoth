@@ -1376,7 +1376,6 @@ async def _startup() -> None:
         _callbacks,
         bot_config,
         entry_node_id=ENTRY_NODE_ID,
-        poll_interval=1.0,
     )
     _router_task = asyncio.create_task(_event_router.run())
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
@@ -1471,7 +1470,6 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
             text=inbound_text,
             message_id=str(event.message_id),
             attachments=attachments or None,
-            use_context=True,
             entry_node_id=ENTRY_NODE_ID,
         )
         # 2026-05-01 修改原因：群聊 @Bot 后需要给触发消息一个反馈；这里在
@@ -1587,7 +1585,6 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
             text=inbound_text,
             message_id=str(event.message_id),
             attachments=attachments or None,
-            use_context=True,
             entry_node_id=ENTRY_NODE_ID,
         )
         # 2026-05-01 修改原因：私聊提交成功后需要提示对方“正在输入”；这里调用

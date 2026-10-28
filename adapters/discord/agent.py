@@ -200,6 +200,7 @@ class BotRestartConfirmView(_SuperuserView):
         super().__init__(rt, timeout=120)
         self.channel_id = channel_id
         self.decided = False
+        self._msg: discord.Message | None = None
 
     async def on_timeout(self) -> None:
         if self.decided:
@@ -207,7 +208,7 @@ class BotRestartConfirmView(_SuperuserView):
         self.decided = True
         for child in self.children:
             child.disabled = True
-        if hasattr(self, "_msg") and self._msg:
+        if self._msg:
             try:
                 await self._msg.edit(content="⏰ Bot 重启审批已超时（自动拒绝）", view=self)
             except Exception:
@@ -222,7 +223,7 @@ class BotRestartConfirmView(_SuperuserView):
             child.disabled = True
         await interaction.response.edit_message(content="🔄 Bot 重启已批准，正在重启...", view=self)
         self.stop()
-        asyncio.create_task(_safe_restart(self.rt, channel_id=self.channel_id, delay=2.0))
+        asyncio.create_task(_safe_restart(self.rt, channel_id=self.channel_id))
 
     @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary, emoji="❌")
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -338,29 +339,7 @@ async def handle_agent(
     input_modality: str = "text",
 ) -> None:
     """入口：所有请求都走同一个 session，直接并发执行。"""
-    conv_key = f"discord:{channel_id}"
-    await _handle_agent_inner(
-        rt,
-        message,
-        user_input,
-        channel_id,
-        conv_key,
-        inbound_attachments=inbound_attachments,
-        input_modality=input_modality,
-    )
-
-
-async def _handle_agent_inner(
-    rt: Any,
-    message: discord.Message,
-    user_input: str,
-    channel_id: int,
-    conversation_key: str,
-    *,
-    inbound_attachments: list[dict[str, Any]] | None = None,
-    input_modality: str = "text",
-) -> None:
-    """handle_agent 核心逻辑。"""
+    conversation_key = f"discord:{channel_id}"
     if not rt.clonoth_client or not rt.session_state:
         await message.reply("Clonoth SDK 尚未初始化，请稍候重试。")
         return
@@ -419,14 +398,7 @@ async def _handle_agent_inner(
 
     if preempt_succeeded:
         session_id = existing_sid
-        old_trigger = None
-        old_trigger_seq = None
-        if preempted_src_seq:
-            old_trigger = rt.session_state.get_trigger(preempted_src_seq)
-            old_trigger_seq = preempted_src_seq
-        # [2026-05-14 refactor note] old_trigger_seq is kept to preserve the
-        # old branch structure during the move; the original code did not use it.
-        _ = old_trigger_seq
+        old_trigger = rt.session_state.get_trigger(preempted_src_seq) if preempted_src_seq else None
 
         cancel_view = CancelView(rt, session_id)
         try:
@@ -488,7 +460,6 @@ async def _handle_agent_inner(
             text=full_text,
             message_id=str(message.id),
             attachments=inbound_attachments or None,
-            use_context=True,
             entry_node_id=rt.entry_node_id,
             use_branch=not is_dm,
         )
@@ -588,7 +559,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
     # Resolve session_id for session-scoped operations
     session_id = ""
     conv_key = f"discord:{message.channel.id}"
-    if not is_global and hasattr(rt, "session_state") and rt.session_state:
+    if not is_global and rt.session_state:
         session_id = rt.session_state.get_session_id(conv_key) or ""
     # Fallback: query supervisor if local cache misses
     if not is_global and not session_id and rt.clonoth_client:

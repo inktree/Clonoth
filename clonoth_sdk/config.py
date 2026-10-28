@@ -19,7 +19,6 @@ class BotConfig:
         secret: 认证密钥（保留字段，当前 Supervisor 未启用认证）
         entry_node_id: 默认入口节点 ID，如 "my_main_node"
         conversation_key_prefix: 会话键前缀，如 "discord" 使生成的 key 为 "discord:{channel_id}"
-        poll_interval: 事件轮询间隔（秒）
         max_history: 频道历史队列最大长度
         workspace_root: Clonoth 工作区根目录
             可选。留空时可在启动阶段通过 ClonothClient.get_health() 动态获取。
@@ -29,7 +28,6 @@ class BotConfig:
     secret: str | None = None
     entry_node_id: str = ""
     conversation_key_prefix: str = ""
-    poll_interval: float = 0.8
     max_history: int = 50
     workspace_root: Path | None = None
     extra_roots: list[Path] = field(default_factory=list)

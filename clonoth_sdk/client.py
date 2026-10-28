@@ -128,35 +128,15 @@ class ClonothClient:
         text: str,
         message_id: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
-        use_context: bool = True,
         entry_node_id: str | None = None,
         use_branch: bool | None = None,
     ) -> InboundResult:
-        """提交用户消息到 Supervisor。
-
-        对应 POST /v1/inbound。
-        提取自 bot_adapter.py _submit_inbound() 中的 HTTP 调用逻辑。
-
-        Args:
-            channel: 频道类型标识，如 "discord_guild"、"discord_dm"、"cli"
-            conversation_key: 会话键，如 "discord:123456"
-            text: 用户消息文本（含历史上下文）
-            message_id: 平台消息 ID（可选）
-            attachments: 附件列表（可选），每项为 {"path": ..., "name": ...} 格式
-            use_context: 是否使用对话上下文，默认 True
-            entry_node_id: 入口节点 ID（可选，覆盖默认路由）
-
-        Returns:
-            InboundResult 包含 session_id 和 inbound_seq
-
-        Raises:
-            httpx.HTTPStatusError: HTTP 请求失败时抛出
-        """
+        """提交用户消息到 Supervisor（POST /v1/inbound）。"""
         payload: dict[str, Any] = {
             "channel": channel,
             "conversation_key": conversation_key,
             "text": text,
-            "use_context": use_context,
+            "use_context": True,
         }
         if message_id is not None:
             payload["message_id"] = message_id
@@ -177,38 +157,8 @@ class ClonothClient:
         )
 
     # ================================================================
-    #  Events — 事件流轮询
+    #  Events — 事件流消费
     # ================================================================
-
-    async def poll_events(
-        self,
-        *,
-        after_seq: int = 0,
-        types: str | None = None,
-        limit: int | None = None,
-    ) -> list[Event]:
-        """从全局事件流拉取新事件。
-
-        对应 GET /v1/events。
-        提取自 bot_adapter.py _outbound_poller() 中的事件轮询逻辑。
-
-        Args:
-            after_seq: 只返回 seq 大于此值的事件
-            types: 逗号分隔的事件类型过滤器（可选），如
-                "inbound_message,outbound_message,approval_requested"
-
-        Returns:
-            事件列表，按 seq 升序排列
-        """
-        params: dict[str, Any] = {"after_seq": after_seq}
-        if types:
-            params["types"] = types
-        if limit:
-            params["limit"] = limit
-
-        resp = await self._http().get(f"{self._base_url}/v1/events", params=params)
-        resp.raise_for_status()
-        return [Event.from_dict(e) for e in resp.json()]
 
     async def ws_connect(self, last_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
         """连接全局 WebSocket 事件流，逐条 yield 解析后的事件字典。

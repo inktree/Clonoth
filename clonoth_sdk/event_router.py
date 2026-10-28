@@ -107,7 +107,6 @@ class EventRouter:
         *,
         approval_tracker: ApprovalTracker | None = None,
         entry_node_id: str = "",
-        poll_interval: float = 3.0,  # deprecated, kept for backward compat
     ):
         """
         Args:
@@ -117,7 +116,6 @@ class EventRouter:
             config: Bot 配置。
             approval_tracker: 审批去重追踪器（可选，默认新建）。
             entry_node_id: 入口节点 ID（可选，默认取 config.entry_node_id）。
-            poll_interval: [deprecated] 已废弃，仅保留签名向后兼容。
         """
         self._client = client
         self._state = state
@@ -240,7 +238,7 @@ class EventRouter:
         # [SDK WS 2026-05-19] Why: stale-trigger cleanup used to be tied to poll
         # ticks. How: isolate it so both HTTP poll and WS sweep can call it.
         # Purpose: switching transports does not leave old status messages behind.
-        stale = self._state.cleanup_stale_triggers(timeout=600.0)
+        stale = self._state.cleanup_stale_triggers()
         for trigger in stale:
             try:
                 await self._cb.delete_status_message(trigger)
@@ -580,13 +578,14 @@ class EventRouter:
     async def _notify_response_info(self, event: Event, trigger=None) -> None:
         """Optional presentation callback; never append notices to reply text."""
         info = event.payload.get("response_info")
-        callback = getattr(self._cb, "send_response_notice", None)
-        if not callable(callback) or not isinstance(info, dict) or not info.get("notices"):
+        if not isinstance(info, dict) or not info.get("notices"):
             return
         if not event.payload.get("text") and not event.payload.get("attachments"):
             return
         try:
-            await callback(trigger, self._state.get_conversation_key(event.session_id) or "", info)
+            await self._cb.send_response_notice(
+                trigger, self._state.get_conversation_key(event.session_id) or "", info,
+            )
         except Exception:
             logger.exception("send_response_notice failed")
 
@@ -784,7 +783,7 @@ class EventRouter:
         # call signature. Purpose: keep progress records scoped to the exact triggering message.
         result = None
         if not is_system:
-            result = self._state.resolve_trigger(src_seq, event.session_id)
+            result = self._state.resolve_trigger(src_seq)
 
         # 入口节点 → 主任务进度
         if result and node_id == self._entry_node_id:
@@ -870,12 +869,10 @@ class EventRouter:
             return
         src_seq = int(p.get("source_inbound_seq") or 0)
         hp_msg = (p.get("message") or "").strip()
-        is_system = (node_id or "").startswith("system.")
 
         # 主节点进度
         if (
-            not is_system
-            and src_seq
+            src_seq
             and src_seq in self._state.triggers
             and node_id == self._entry_node_id
         ):
@@ -894,11 +891,7 @@ class EventRouter:
         if not node_id or node_id == self._entry_node_id or not hp_msg:
             return
 
-        # [Fork/Merge 2026-05-12] Use only source_inbound_seq for trigger attachment.
-        # Why: session fallback is ambiguous when several branch tasks share one parent session.
-        # How: resolve_trigger keeps the old signature but ignores event.session_id. Purpose:
-        # child progress is attached only to the inbound that created this task.
-        result = self._state.resolve_trigger(src_seq, event.session_id)
+        result = self._state.resolve_trigger(src_seq)
         # [2026-05-29 方案C第一步] 为什么：子进度事件可能属于其他 adapter，旧逻辑
         # 在解析 conversation_key 前就创建状态，并在无匹配时回退到日志频道。怎么改：
         # 使用与 dispatch 子 session 相同的 route resolver，只有确认归属后才创建
@@ -987,7 +980,7 @@ class EventRouter:
         # Purpose: approval handling remains visible without corrupting another trigger's progress.
         ap_session = str(p.get("session_id") or event.session_id)
         src_seq = int(p.get("source_inbound_seq") or 0)
-        result = self._state.resolve_trigger(src_seq, ap_session)
+        result = self._state.resolve_trigger(src_seq)
         conv_key = self._resolve_owned_route_conversation_key(
             event, p, trigger_result=result,
         )
@@ -1086,7 +1079,7 @@ class EventRouter:
         # How: resolve_trigger performs exact source lookup only. Purpose: lifecycle cleanup follows
         # the task that actually ended.
         if node_id == self._entry_node_id and event.type == "task_cancelled":
-            result = self._state.resolve_trigger(src_seq, event.session_id)
+            result = self._state.resolve_trigger(src_seq)
             if result:
                 trigger_seq, trigger = result
                 self._state.consume_trigger(trigger_seq)
@@ -1114,11 +1107,7 @@ class EventRouter:
                 if event.type == "task_completed"
                 else "✗ 任务已取消"
             )
-            # [Fork/Merge 2026-05-12] DM 判断优先从精确 trigger 取得。
-            # [2026-05-15] Fallback: system.* 节点没有 source_inbound_seq，
-            # resolve_trigger 总是返回 None。此时用 session_dm_channels 判断，
-            # 否则 DM 下的 system 节点日志永远不会被删除。
-            result = self._state.resolve_trigger(src_seq, event.session_id)
+            result = self._state.resolve_trigger(src_seq)
             if result:
                 is_dm = result[1].is_dm
             else:
@@ -1145,7 +1134,7 @@ class EventRouter:
         # source_inbound_seq is present and still maps to a trigger; otherwise task_cancelled events
         # will perform exact cleanup. Purpose: session cancel no longer deletes unrelated status UI.
         src_seq = int(p.get("source_inbound_seq") or 0)
-        result = self._state.resolve_trigger(src_seq, event.session_id)
+        result = self._state.resolve_trigger(src_seq)
         if result:
             trigger_seq, trigger = result
             self._state.consume_trigger(trigger_seq)
@@ -1178,7 +1167,7 @@ class EventRouter:
         # cleanup_for_task_preempted consumes only the matching source trigger and removes only the
         # exact child task key when present. Purpose: a preempt event cannot affect sibling branches.
         trigger, child_states = self._state.cleanup_for_task_preempted(
-            src_seq, event.session_id, task_id=task_id,
+            src_seq, task_id=task_id,
         )
 
         if trigger:
@@ -1216,7 +1205,7 @@ class EventRouter:
         # Why: compact events from branch tasks may share a parent session. How: resolve_trigger
         # ignores session fallback and returns None when source_inbound_seq is missing. Purpose:
         # compression progress cannot appear on another active request.
-        result = self._state.resolve_trigger(src_seq, event.session_id)
+        result = self._state.resolve_trigger(src_seq)
         if not result:
             return
         trigger_seq, trigger = result

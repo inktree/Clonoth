@@ -108,7 +108,7 @@ class ChildTaskState:
     """
     lines: list[str] = field(default_factory=list)
     prefix: str = ""
-    # 2026-04-17: 移除 dot_state, last_edit_time 字段及对应方法（同 MainTaskState）
+    is_dm: bool = False
     platform_data: dict[str, Any] = field(default_factory=dict)
 
 
@@ -264,36 +264,21 @@ class SessionState:
         return None
 
     def resolve_trigger(
-        self, source_inbound_seq: int, session_id: str,
+        self, source_inbound_seq: int,
     ) -> tuple[int, TriggerInfo] | None:
         """只按 source_inbound_seq 精确查找 trigger。
-
-        [Fork/Merge 2026-05-12] session_id is intentionally ignored by SDK event routing.
-        Why: concurrent forked inbounds can share the same parent session, so a session fallback
-        can update or consume the wrong trigger. How: keep the parameter for API compatibility,
-        but return a match only when source_inbound_seq exists in triggers. Purpose: make event
-        routing deterministic while preserving old callers' function signature.
 
         Returns:
             (inbound_seq, TriggerInfo) 元组，未找到则返回 None。
         """
-        # [Fork/Merge 2026-05-12] Keep session_id only for signature compatibility.
-        # Why: using it as a fallback would be ambiguous under concurrent branch tasks.
-        # How: bind it to '_' and perform no lookup with it. Purpose: exact trigger routing.
-        _ = session_id
         if source_inbound_seq:
             trigger = self.triggers.get(source_inbound_seq)
             if trigger is not None:
                 return source_inbound_seq, trigger
         return None
 
-    def cleanup_stale_triggers(self, timeout: float = 600.0) -> list[TriggerInfo]:
+    def cleanup_stale_triggers(self) -> list[TriggerInfo]:
         """清理超时的 trigger，返回被清理的列表。
-
-        对应 bot_adapter.py L1250-1266 的超时清理循环：
-          _stale_triggers = [seq for seq, info in _trigger_messages.items()
-                             if _now - info["created_at"] > 600]
-          for seq in _stale_triggers: ...
 
         同时清理关联的 main_task_states。
         调用方负责处理平台侧清理（edit status_msg、delete log_msg 等），
@@ -302,7 +287,7 @@ class SessionState:
         now = time.time()
         stale_seqs = [
             seq for seq, trigger in self.triggers.items()
-            if now - trigger.created_at > timeout
+            if now - trigger.created_at > 600.0
         ]
         stale_triggers: list[TriggerInfo] = []
         for seq in stale_seqs:
@@ -486,26 +471,15 @@ class SessionState:
     def cleanup_for_task_preempted(
         self,
         source_inbound_seq: int,
-        session_id: str,
         task_id: str = "",
     ) -> tuple[TriggerInfo | None, list[tuple[str, ChildTaskState]]]:
         """task_preempted 事件时按精确键清理被打断任务的关联状态。
-
-        [Fork/Merge 2026-05-12] This cleanup no longer falls back to session_id.
-        Why: several active triggers can share one parent session, so session fallback can clear
-        an unrelated inbound. How: consume a trigger only by source_inbound_seq and remove child
-        progress only by exact task_id when available. Purpose: keep preempt cleanup scoped to
-        the task that actually emitted the event.
 
         Returns:
             (trigger_or_none, child_states_list)。
             trigger 可能为 None（无匹配 trigger 时）。
             child_states_list 是 (task_key, ChildTaskState) 的列表。
         """
-        # [Fork/Merge 2026-05-12] Keep session_id only for old call sites.
-        # Why: task_preempted cleanup must not use session fallback. How: ignore this value and
-        # rely on source_inbound_seq/task_id. Purpose: prevent sibling branch state from being removed.
-        _ = session_id
         trigger: TriggerInfo | None = None
         trigger_seq: int = 0
 

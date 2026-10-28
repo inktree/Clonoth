@@ -136,7 +136,7 @@ class LocalOnnxTts:
             for mod_name in ("frontend.chinese2", "hf_space_v2proplus_onnx.frontend.chinese2"):
                 ch2 = sys.modules.get(mod_name)
                 if ch2 is not None and getattr(ch2, "is_g2pw", False) and getattr(ch2, "g2pw", None) is None:
-                    g2pw_cls = getattr(ch2, "G2PWPinyin")
+                    g2pw_cls = ch2.G2PWPinyin
                     ch_dir = os.path.dirname(ch2.__file__)
                     ch2.g2pw = g2pw_cls(
                         model_dir=os.path.join(ch_dir, "G2PWModel"),
@@ -144,7 +144,7 @@ class LocalOnnxTts:
                         v_to_u=False,
                         neutral_tone_with_five=True,
                     )
-            engine_class = getattr(runtime_module, "OnnxSynthesisEngine")
+            engine_class = runtime_module.OnnxSynthesisEngine
             model_providers, decoder_providers = self._providers()
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self._engine = engine_class(
@@ -218,10 +218,7 @@ def config_from_mapping(raw: dict[str, Any], workspace_root: Path) -> LocalOnnxT
     idle_raw = raw.get("local_onnx_tts_idle_unload_seconds")
     if idle_raw is None:
         idle_raw = os.getenv("CLONOTH_LOCAL_ONNX_TTS_IDLE_UNLOAD_SECONDS", "30")
-    try:
-        idle_unload_seconds = float(idle_raw)
-    except (TypeError, ValueError):
-        idle_unload_seconds = 30.0
+    idle_unload_seconds = float(idle_raw)
     return LocalOnnxTtsConfig(
         package_dir=package_dir,
         provider=provider,

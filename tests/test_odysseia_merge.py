@@ -12,7 +12,7 @@ import httpx
 import pytest
 import yaml
 
-from clonoth_sdk.approval import classify_path
+from clonoth_runtime import classify_path
 from engine import compact, data_cleanup
 from engine.inference.tool_format import JsonToolFormatter, NativeToolFormatter
 from providers.deepseek import DeepSeekProvider
@@ -185,9 +185,9 @@ def test_bounded_line_reader_skips_long_tail_and_keeps_next_line():
 
 
 def test_sdk_external_path_classification(tmp_path):
-    assert classify_path(tmp_path, [], "file.txt")[2] is False
-    assert classify_path(tmp_path, [], "../outside.txt")[2] is True
-    assert classify_path(tmp_path, [tmp_path.parent], "../trusted.txt")[2] is False
+    assert classify_path(tmp_path, [], "file.txt")[2] == "trusted"
+    assert classify_path(tmp_path, [], "../outside.txt")[2] == "external"
+    assert classify_path(tmp_path, [tmp_path.parent], "../trusted.txt")[2] == "trusted"
 
 
 def test_health_workspace_and_reset_clear_context_usage(tmp_path):
