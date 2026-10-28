@@ -385,8 +385,8 @@ class DiscordCallbacks:
                     pass
                 if text:
                     _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
-                if voice_segments:
-                    await _send_discord_tts_segments(self.rt, msg.channel, trigger.conversation_key, voice_segments)
+        if voice_segments:
+            await _send_discord_tts_segments(self.rt, msg.channel, trigger.conversation_key, voice_segments)
 
         logger.info("send_intermediate_reply ch=%s atts=%d", channel_id, len(dc_files))
 

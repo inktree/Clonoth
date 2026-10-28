@@ -158,13 +158,6 @@ class PolicyEngine:
         self._cfg: dict[str, Any] = _default_policy_dict()
 
         self._extra_roots: list[Path] = []
-
-    @property
-    def extra_roots(self) -> list[Path]:
-        """Public read access for attachment trust resolution."""
-        self._reload_if_needed()
-        return list(self._extra_roots)
-
         self._read_default: SafetyLevel = SafetyLevel.auto
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
@@ -179,6 +172,12 @@ class PolicyEngine:
 
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
+
+    @property
+    def extra_roots(self) -> list[Path]:
+        """Public read access for attachment trust resolution."""
+        self._reload_if_needed()
+        return list(self._extra_roots)
 
     def _ensure_policy_file_exists(self) -> None:
         if self._policy_path.exists():

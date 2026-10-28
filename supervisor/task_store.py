@@ -112,12 +112,6 @@ class TaskStoreMixin:
         caller_task_id: str | None = None,
         batch_id: str | None = None,
         batch_index: int = 0,
-        output_chain_entry_task_id: str | None = None,
-        output_chain_source_task_id: str | None = None,
-        output_chain_source_session_id: str | None = None,
-        output_chain_source_dispatch_origin: dict[str, Any] | None = None,
-        output_chain_path: list[str] | None = None,
-        output_chain_depth: int = 0,
     ) -> Task:
         now = _now()
         task_input = dict(input_data or {})
@@ -168,15 +162,6 @@ class TaskStoreMixin:
             caller_task_id=caller_task_id,
             batch_id=batch_id,
             batch_index=batch_index,
-            # [AutoC 2026-06-08] Why: output chain 下游 task 必须继承入口和原始 caller 元数据。
-            # How: _create_task_locked 接收可选 chain 参数并写入 Task，未传时沿用模型默认值。
-            # Purpose: 普通 task 创建路径保持兼容，output chain 路由可显式传递状态。
-            output_chain_entry_task_id=output_chain_entry_task_id,
-            output_chain_source_task_id=output_chain_source_task_id,
-            output_chain_source_session_id=output_chain_source_session_id,
-            output_chain_source_dispatch_origin=dict(output_chain_source_dispatch_origin or {}),
-            output_chain_path=list(output_chain_path or []),
-            output_chain_depth=int(output_chain_depth or 0),
             status=TaskStatus.pending,
             cancel_requested=False,
             worker_id=None,

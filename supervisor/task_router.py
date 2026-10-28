@@ -387,24 +387,9 @@ class TaskRouterMixin:
             return  # preempted 不触发记忆提取，也不 merge branch
         elif act == "dispatch":
             self._route_dispatch_locked(task, action)
-        elif act in ("finish", "ask", "reject"):
-            # [AutoC 2026-06-08] Why: output chain 会在 finish 后同步创建下游 task，入口分支不能提前收束。
-            # How: finish/ask 先交给 _route_finish_locked 判断 output、ask 和 __source__ 语义。
-            # Purpose: 只有最终穿透到 __source__ 或旧式离开链路时才 merge/cleanup branch。
-            # [AutoC 2026-06-10] Why: reject is also a terminal child action that
-            # must be routed before branch finalization. How: include it in this
-            # dispatch set and let _route_finish_locked select reject routing.
-            # Purpose: output chain QA can resume the entry task instead of falling
-            # through without routing.
+        elif act in ("finish", "ask"):
             self._route_finish_locked(task, action)
-            if task.output_chain_entry_task_id:
-                _entry_t = self.tasks.get(str(task.output_chain_entry_task_id).strip())
-                if _entry_t is not None and self._task_terminal(_entry_t):
-                    post_hook_task = _entry_t
-                    route_session_id = self._route_session_id_for_task_locked(_entry_t)
-                else:
-                    return
-            elif self._task_terminal(task):
+            if self._task_terminal(task):
                 route_session_id = self._route_session_id_for_task_locked(task)
             else:
                 return
@@ -715,38 +700,10 @@ class TaskRouterMixin:
         action_type = str(action.get("action") or "finish").strip() or "finish"
         if action_type == "ask":
             return self._route_ask_to_caller_locked(task, result)
-        if action_type == "reject":
-            return self._route_reject_to_source_locked(task, result)
-
-        output_target = self._node_output_target_locked(str(task.node_id or ""))
-        if output_target:
-            if output_target == "__source__":
-                return self._route_output_chain_to_source_locked(task, result)
-            return self._start_output_chain_task_locked(task, output_target, result)
-
         return self._route_finish_to_caller_or_user_locked(task, result)
 
-    def _node_output_target_locked(self, node_id: str | None) -> str:
-        """Return the node YAML output target used by the Supervisor route."""
-        # [AutoC 2026-06-08] Why: output chain 声明位于节点 YAML，但节点运行时不应感知路由拓扑。
-        # How: Supervisor 在 finish 后按需读取 Node.output，读取失败或空字段都返回空字符串。
-        # Purpose: 无 output 字段的节点完全沿用旧 finish 路由。
-        nid = str(node_id or "").strip()
-        if not nid:
-            return ""
-        try:
-            from engine.node import load_node
-            node = load_node(self.workspace_root, nid)
-        except Exception as exc:
-            log.warning("output chain: load node %s failed: %s", nid, exc)
-            return ""
-        return str(getattr(node, "output", "") or "").strip() if node else ""
-
-    def _output_chain_resume_data(self, task: Task, result: dict[str, Any], *, action_type: str = "finish") -> dict[str, Any]:
-        """Build the resume payload shared by ordinary finish and output chain finish."""
-        # [AutoC 2026-06-08] Why: output chain 的下游和旧 caller 恢复都需要同一份结构化结果。
-        # How: 保持原 child_result payload，并继续携带 action_type 兼容既有调用方。
-        # Purpose: 新链路不改变普通 finish 的下游可见数据格式。
+    def _build_child_result_resume_data(self, task: Task, result: dict[str, Any], *, action_type: str = "finish") -> dict[str, Any]:
+        """Build the structured child_result resume payload for caller resumption."""
         return {
             "type": "child_result",
             "child_node_id": str(task.node_id or task.tool_name or ""),
@@ -754,205 +711,8 @@ class TaskRouterMixin:
             "action_type": action_type,
         }
 
-    def _compute_or_inherit_output_chain_meta_locked(self, task: Task) -> dict[str, Any]:
-        """Compute entry/source/path metadata for the next output chain task."""
-        # [AutoC 2026-06-08] Why: __source__ 必须指向链入口的原始 caller，而不是直接上游。
-        # How: 链内任务继承已有元数据；链入口第一次创建下游时记录自身 task_id、caller、route session 和 dispatch origin。
-        # Purpose: 最终节点 output=__source__ 时能准确穿透回入口任务的原始调用方。
-        current_node = str(task.node_id or "").strip()
-        inherited_path = [str(x).strip() for x in (task.output_chain_path or []) if str(x).strip()]
-        if inherited_path:
-            path = list(inherited_path)
-        else:
-            path = [current_node] if current_node else []
-        entry_task_id = str(task.output_chain_entry_task_id or "").strip() or task.task_id
-        source_task_id = str(task.output_chain_source_task_id or "").strip() or str(task.caller_task_id or "").strip() or None
-        source_session_id = str(task.output_chain_source_session_id or "").strip() or self._route_session_id_for_task_locked(task)
-        dispatch_origin = dict(task.output_chain_source_dispatch_origin or {})
-        if not dispatch_origin and isinstance(task.input.get("_dispatch_origin"), dict):
-            dispatch_origin = dict(task.input.get("_dispatch_origin") or {})
-        depth = int(task.output_chain_depth or max(len(path) - 1, 0))
-        return {
-            "entry_task_id": entry_task_id,
-            "source_task_id": source_task_id,
-            "source_session_id": source_session_id,
-            "dispatch_origin": dispatch_origin,
-            "path": path,
-            "depth": depth,
-        }
-
-    def _validate_output_chain_target_locked(self, task: Task, target_node_id: str, meta: dict[str, Any]) -> tuple[bool, str]:
-        """Validate output chain next target for loops and configured max depth."""
-        # [AutoC 2026-06-08] Why: YAML output 配置错误可能形成递归链或过深链路。
-        # How: 用 output_chain_path 做循环检测，并从 runtime 读取 max_depth，默认 8 且上限 64。
-        # Purpose: 错误配置失败得可见，而不是无限创建任务。
-        target = str(target_node_id or "").strip()
-        if not target:
-            return False, "output chain target is empty"
-        path = [str(x).strip() for x in (meta.get("path") or []) if str(x).strip()]
-        if target in path:
-            return False, f"output chain loop detected: {' -> '.join([*path, target])}"
-        runtime_cfg = load_runtime_config(self.workspace_root)
-        max_depth = get_int(runtime_cfg, "engine.output_chain.max_depth", 8, min_value=1, max_value=64)
-        depth = int(meta.get("depth") or 0)
-        if depth + 1 > max_depth:
-            return False, f"output chain max depth exceeded: {depth + 1}/{max_depth}"
-        return True, ""
-
-    @staticmethod
-    def _extract_output_chain_text(result: dict[str, Any]) -> str:
-        """Extract raw finish text for the downstream output chain node."""
-        # [AutoC 2026-06-09] Why: downstream nodes should receive the raw
-        # finish text without any wrapper. AI nodes get context from their
-        # system prompt; script nodes get raw text for deterministic checks.
-        return str(result.get("text") or "").strip()
-
-    def _result_attachments(self, result: dict[str, Any]) -> list[dict[str, Any]]:
-        """Extract finish attachments from result dict.
-
-        Supported shapes:
-          1. result["data"]["attachments"]  — data-wrapped result
-          2. result["attachments"]           — flat inner result
-        """
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        atts = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
-        return list(atts) if isinstance(atts, list) else []
-
-    def _start_output_chain_task_locked(self, task: Task, target_node_id: str, result: dict[str, Any]) -> None:
-        """Create the next synchronous output chain task and suspend the current task."""
-        # [AutoC 2026-06-08] Why: finish + output 表示同步后处理，当前 task 不能先回到 caller 或用户。
-        # How: 创建 fresh child session 的下游 task，并把当前 task 改回 suspended 等待下游完成。
-        # Purpose: output chain 中间节点保持调用栈形态，ask/fail/cancel 仍可沿 caller chain 返回。
-        meta = self._compute_or_inherit_output_chain_meta_locked(task)
-        ok, error = self._validate_output_chain_target_locked(task, target_node_id, meta)
-        if not ok:
-            # [AutoC 2026-06-08] Why: output 配置校验失败发生在创建下游前，当前 finish 已经不能继续链路。
-            # How: 先按旧终态收束入口分支，再复用 fail 路由输出错误或恢复 caller。
-            # Purpose: 循环和深度错误不会遗留未清理的 entry branch。
-            self._finalize_branch_task_locked(task, merge=True)
-            return self._route_fail_locked(task, {"error": error})
-
-        target = str(target_node_id or "").strip()
-        route_parent_session_id = self._route_session_id_for_task_locked(task)
-        child_sid, _ = self.get_or_create_child_session(route_parent_session_id, target, f"output_chain:{task.task_id}", "fresh")
-        next_path = [*list(meta.get("path") or []), target]
-        next_depth = int(meta.get("depth") or 0) + 1
-        child_input: dict[str, Any] = {
-            "instruction": self._extract_output_chain_text(result),
-            "attachments": self._result_attachments(result),
-            # [AutoC 2026-06-09] Why: downstream nodes may need the full
-            # result dict (summary, data, attachments) beyond just text.
-            "upstream_result": dict(result) if isinstance(result, dict) else {},
-            "parent_session_id": route_parent_session_id if route_parent_session_id != task.session_id else "",
-            "child_session_id": child_sid,
-            "context_mode": "fresh",
-            "dispatch_context_mode": "fresh",
-            "use_context": False,
-            # [AutoC 2026-06-08] Why: 调试和事件消费者需要知道该 task 来自 output chain，而非普通 dispatch。
-            # How: 在 input 中写入轻量标记和上游 task/node，Task 字段保存可路由元数据。
-            # Purpose: 不影响 engine 协议，同时保留可观测性。
-            "_output_chain": True,
-            "_output_chain_from_task_id": task.task_id,
-            "_output_chain_from_node_id": str(task.node_id or task.tool_name or ""),
-        }
-        child = self._create_task_locked(
-            session_id=task.session_id,
-            session_generation=task.session_generation,
-            kind=TaskKind.node,
-            node_id=target,
-            input_data=child_input,
-            continuation={},
-            source_inbound_seq=task.source_inbound_seq,
-            caller_task_id=task.task_id,
-            output_chain_entry_task_id=str(meta.get("entry_task_id") or "") or None,
-            output_chain_source_task_id=meta.get("source_task_id"),
-            output_chain_source_session_id=str(meta.get("source_session_id") or "") or None,
-            output_chain_source_dispatch_origin=dict(meta.get("dispatch_origin") or {}),
-            output_chain_path=next_path,
-            output_chain_depth=next_depth,
-        )
-        task.status = TaskStatus.suspended
-        task.waiting_for_task_id = child.task_id
-        task.worker_id = None
-        task.lease_expires_at = None
-        task.updated_at = _now()
-        task.result = dict(task.result or {})
-        task.result["_output_chain_waiting_for"] = child.task_id
-        self._event_task_snapshot("task_suspended", task)
-
-    def _route_output_chain_to_source_locked(self, task: Task, result: dict[str, Any]) -> None:
-        """Route the final output chain result through the original source caller."""
-        # [AutoC 2026-06-08] Why: __source__ 表示回到链入口的原始 caller，不是最终节点的直接上游。
-        # How: 找到入口 task，完成中间 suspended 等待者，再用入口 task 执行旧式 caller/user 输出。
-        # Purpose: coder -> review -> qa 的最终结果只对原始 caller 或用户可见。
-        entry_id = str(task.output_chain_entry_task_id or "").strip()
-        entry = self.tasks.get(entry_id) if entry_id else None
-        if entry is None:
-            return self._route_finish_to_caller_or_user_locked(task, result)
-        self._complete_output_chain_waiters_locked(final_task=task, entry_task=entry)
-        resume_data = self._output_chain_resume_data(task, result, action_type="finish")
-        source_task_id = str(task.output_chain_source_task_id or entry.caller_task_id or "").strip()
-        if source_task_id:
-            entry.caller_task_id = source_task_id
-        source_session_id = str(task.output_chain_source_session_id or "").strip()
-        if source_session_id:
-            entry.input["_route_session_id"] = source_session_id
-        dispatch_origin = dict(task.output_chain_source_dispatch_origin or {})
-        if dispatch_origin:
-            entry.input["_dispatch_origin"] = dispatch_origin
-        self._finalize_branch_task_locked(entry, merge=True)
-        # [AutoC 2026-06-09] Why: _finalize_branch_task_locked 内部也会写 _route_session_id（覆盖为 parent_session_id），
-        # 在 dispatch_origin 场景下可能与 output chain 的 source_session_id 不一致。
-        # How: finalize 之后重新写入 source_session_id 保证穿透目标正确。
-        # Purpose: 最终 resume_caller_or_output 使用正确的 route session。
-        if source_session_id:
-            entry.input["_route_session_id"] = source_session_id
-        self._resume_caller_or_output_locked(entry, resume_data, result, action_type="finish", delivery_task=task)
-        # [AutoC 2026-06-08] Why: output chain 入口 task 在最初 finish 时被重新挂起，无法再走自己的 finally 清理。
-        # How: 等最终结果已经恢复 caller 或注入 dispatch_origin 后，再清理入口的 fresh/fork child session。
-        # Purpose: 回调事件仍能携带有效 child_session_id，同时不会泄漏一次性子会话。
-        self._cleanup_task_child_session_if_needed(entry)
-
-    def _complete_output_chain_waiters_locked(self, *, final_task: Task, entry_task: Task) -> None:
-        """Mark suspended output chain waiters as completed after final source routing."""
-        # [AutoC 2026-06-08] Why: output chain 中间 task 只是同步等待者，最终穿透后不应继续保持 suspended。
-        # How: 从最终 task 的 caller 链回溯到入口 task，逐个清空 waiting_for_task_id 并标记 completed。
-        # Purpose: 活跃任务列表不会残留已经完成的链路中间节点。
-        now = _now()
-        tid = str(final_task.caller_task_id or "").strip()
-        visited: set[str] = set()
-        while tid and tid not in visited:
-            visited.add(tid)
-            waiter = self.tasks.get(tid)
-            if waiter is None:
-                break
-            if waiter.status == TaskStatus.suspended:
-                waiter.status = TaskStatus.completed
-                waiter.waiting_for_task_id = None
-                waiter.worker_id = None
-                waiter.lease_expires_at = None
-                waiter.updated_at = now
-                waiter.result = dict(waiter.result or {})
-                waiter.result["_output_chain_completed_by"] = final_task.task_id
-                self._event_task_snapshot("task_completed", waiter)
-                if waiter.task_id != entry_task.task_id:
-                    # [AutoC 2026-06-08] Why: 中间 output chain 节点不会再次经过 complete_task 的 finally。
-                    # How: 在标记非入口等待者完成后主动调用统一 child session 清理逻辑，入口延后到最终恢复后清理。
-                    # Purpose: fresh output chain 子会话不会泄漏，也不提前删除入口回调需要的 child_session_id。
-                    self._cleanup_task_child_session_if_needed(waiter)
-            if waiter.task_id == entry_task.task_id:
-                break
-            tid = str(waiter.caller_task_id or "").strip()
-
     def _route_ask_to_caller_locked(self, task: Task, result: dict[str, Any]) -> None:
-        """Route ask directly to the immediate caller without following output declarations."""
-        # [AutoC 2026-06-08] Why: ask 表示当前节点需要直接上游补充信息，不是可继续加工的 finish 产物。
-        # How: 使用 child_ask resume payload 恢复 caller；无 caller 时按旧式用户输出收束分支。
-        # Purpose: qa ask -> review、review ask -> coder、coder ask -> user 的逐级打回语义成立。
-        # [AutoC 2026-06-09] Why: 旧代码对有 caller 的 ask 跳过了 branch finalization，
-        # 如果 ask task 同时有 branch_session_id，会导致孤立 branch session。
-        # How: 无论是否有 caller，都先 finalize branch（幂等，无 branch 时 no-op）。
-        # Purpose: 避免 output chain 中 ask 路径遗留未收束的 branch session。
+        """Route ask directly to the immediate caller."""
         self._finalize_branch_task_locked(task, merge=True)
         self._resume_caller_or_output_locked(task, {
             "type": "child_ask",
@@ -961,71 +721,12 @@ class TaskRouterMixin:
             "action_type": "ask",
         }, result, action_type="ask")
 
-    def _route_reject_to_source_locked(self, task: Task, result: dict[str, Any]) -> None:
-        """Route reject from an output chain node back to the chain entry."""
-        # [AutoC 2026-06-10] Why: reject 表示 output chain 下游拒绝了上游的输出。
-        # How: 穿透回链入口 task，清理中间 waiter，用 output_rejected resume 恢复入口。
-        # Purpose: 入口节点收到明确的「输出被拒绝」语义，而非模糊的 child_ask。
-        entry_id = str(task.output_chain_entry_task_id or "").strip()
-        entry = self.tasks.get(entry_id) if entry_id else None
-        if entry is None:
-            # 不在 output chain 中（不应发生），降级为 ask 路由
-            return self._route_ask_to_caller_locked(task, result)
-        reject_reason = str(result.get("text") or "").strip()
-        # Try to extract finish tool_call_id from entry task's runtime state.
-        # [AutoC 2026-06-10] Why: ai_step must format the reject as the matching
-        # finish tool's result, especially in native mode. How: read the persisted
-        # runtime tool_call_log from the suspended entry task and keep the latest
-        # finish call_id. Purpose: output_rejected can preserve provider tool_call
-        # pairing instead of creating an orphan tool result.
-        _entry_result = entry.result if isinstance(entry.result, dict) else {}
-        _rt_state = _entry_result.get("_runtime_state") if isinstance(_entry_result.get("_runtime_state"), dict) else {}
-        _tool_log = _rt_state.get("tool_call_log") if isinstance(_rt_state.get("tool_call_log"), list) else []
-        _finish_call_id = ""
-        for _log_entry in reversed(_tool_log):
-            if isinstance(_log_entry, dict) and _log_entry.get("name") == "finish":
-                _finish_call_id = str(_log_entry.get("call_id") or "")
-                break
-
-        resume_data = {
-            "type": "output_rejected",
-            "child_node_id": str(task.node_id or task.tool_name or ""),
-            "result": result,
-            "action_type": "reject",
-            "reject_reason": reject_reason,
-            "_finish_tool_call_id": _finish_call_id,
-        }
-        # 恢复入口 task 本身（不是入口的 caller），让入口节点重新执行。
-        if entry.status == TaskStatus.suspended:
-            # [AutoC 2026-06-10] Why: _complete_output_chain_waiters_locked marks
-            # every suspended waiter up to and including entry as completed. How:
-            # switch entry to pending before calling it, so only intermediate
-            # output-chain waiters are completed. Purpose: reject can resume the
-            # original entry task instead of completing it by accident.
-            entry.status = TaskStatus.pending
-            entry.waiting_for_task_id = None
-            entry.worker_id = None
-            entry.lease_expires_at = None
-            entry.updated_at = _now()
-            entry.input["resume_data"] = resume_data
-            entry.input["_last_child_action_type"] = "reject"
-            entry.input["context_ref"] = str(entry.result.get("context_ref") or entry.input.get("context_ref") or "")
-            self._complete_output_chain_waiters_locked(final_task=task, entry_task=entry)
-            self._event_task_snapshot("task_resumed", entry)
-        else:
-            # entry 不在 suspended 状态，降级为普通 fail
-            self._finalize_branch_task_locked(task, merge=True)
-            self._route_fail_locked(task, {"error": f"output chain reject but entry not suspended: {reject_reason}"})
-
     def _route_finish_to_caller_or_user_locked(self, task: Task, result: dict[str, Any]) -> None:
-        """Preserve the old finish behavior for nodes without output declarations."""
-        # [AutoC 2026-06-08] Why: output chain 必须向后兼容，没有 output 的节点不能改变行为。
-        # How: 在旧式离开链路时才 finalize branch，再调用原有 caller/outbound 分发函数。
-        # Purpose: 普通 finish、异步 dispatch 回调和系统任务继续使用原路由。
+        """Finalize branch and deliver finish result to caller or user."""
         self._finalize_branch_task_locked(task, merge=True)
         self._resume_caller_or_output_locked(
             task,
-            self._output_chain_resume_data(task, result, action_type="finish"),
+            self._build_child_result_resume_data(task, result, action_type="finish"),
             result,
             action_type="finish",
         )
@@ -1166,7 +867,6 @@ class TaskRouterMixin:
         fallback_result: dict[str, Any],
         *,
         action_type: str = "",
-        delivery_task: Task | None = None,
     ) -> None:
         """尝试恢复 caller 节点。如果没有 caller，把 fallback_result 输出给用户。"""
         # 优先尝试直接唤醒 suspended 的 caller
@@ -1227,28 +927,15 @@ class TaskRouterMixin:
         # 原先 `if text or atts:` 导致空文本 finish 不发事件，
         # Bot 侧 trigger 和 status_msg（含 stream_delta 累积的原始标记预览）永远无法清理。
         # 去掉守卫后，Bot 侧 send_reply 会跳过 Discord 发送但正常执行清理收尾。
-        # Keep execution IDs for audit/stream matching. The reply owner is the
-        # chain entry, even when a later reviewer delivers the final result.
-        producer = delivery_task or task
-        # [2026-09-14] Why: output-chain 投递方可能不经 LLM 直接透传 finish
-        # （如输出链转发入口节点答复），其 result 没有 response_info，而源头
-        # 任务的 result 带着回退审计（fallback notices）。原先只取
-        # producer.result 会丢掉 provenance，Discord 的回复说明 embed 永不触发。
-        # How: producer 自身有 response_info 时以投递方为准；为空且被路由的
-        # 源头任务（task）不是同一对象时，回退取源头的 response_info。
-        # Purpose: 链条转发的回复在所有适配器上保留回退/渠道审计可见性。
-        _response_info = producer.result.get("response_info")
-        if not _response_info and task is not producer:
-            _response_info = task.result.get("response_info")
         self.append_outbound_message(
             session_id=self._route_session_id_for_task_locked(task), text=text,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
-            node_id=producer.node_id,
+            node_id=task.node_id,
             reply_node_id=task.node_id,
             action_type=action_type,
-            llm_request_id=str(producer.result.get("llm_request_id") or "").strip(),
-            task_id=producer.task_id,
-            response_info=_response_info,
+            llm_request_id=str(task.result.get("llm_request_id") or "").strip(),
+            task_id=task.task_id,
+            response_info=task.result.get("response_info"),
         )
 
 

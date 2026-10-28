@@ -18,11 +18,6 @@ ACTION_ASK = "ask"
 ACTION_FAIL = "fail"
 ACTION_CANCELLED = "cancelled"
 ACTION_PREEMPTED = "preempted"
-# [AutoC 2026-06-10] Why: output chain quality gates need to reject an upstream
-# finish without pretending to ask for user clarification. How: add a terminal
-# action name that serializes like finish/ask. Purpose: downstream chain nodes
-# can explicitly send the entry node back for revision.
-ACTION_REJECT = "reject"
 
 
 @dataclass
@@ -33,13 +28,12 @@ class TaskAction:
       - dispatch:   委派给另一个节点（AI 或 Tool）
       - finish:     任务完成，把结果交回去（Supervisor 根据 caller 决定交给谁）
       - ask:        请求上游补充信息；Phase 0 暂按 finish 路由
-      - reject:     拒绝上游输出（仅用于 output chain 下游节点打回上游）
       - fail:       执行失败
       - cancelled:  被取消
       - preempted:  被软打断（上下文已保存）
     """
 
-    action: str  # dispatch | finish | ask | fail | cancelled | preempted | reject
+    action: str  # dispatch | finish | ask | fail | cancelled | preempted
     node_id: str = ""  # 产出此动作的节点 id
 
     # dispatch 时填写
@@ -80,14 +74,11 @@ class TaskAction:
             d["dispatch_input"] = dict(self.dispatch_input)
             if self.dispatch_batch:
                 d["dispatch_batch"] = list(self.dispatch_batch)
-        elif self.action in (ACTION_FINISH, ACTION_ASK, ACTION_REJECT):
+        elif self.action in (ACTION_FINISH, ACTION_ASK):
             # [AutoC 2026-05-31] Why: ask carries the same result payload shape as
             # finish in Phase 0. How: serialize both actions through the same
             # branch. Purpose: supervisors can receive action="ask" without losing
             # text fields.
-            # [AutoC 2026-06-10] Why: reject returns the same text payload
-            # as finish and ask. How: include ACTION_REJECT in this serialization
-            # branch. Purpose: supervisor receives the reject reason intact.
             d["result"] = dict(self.result)
         elif self.action == ACTION_FAIL:
             d["error"] = self.error

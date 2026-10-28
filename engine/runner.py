@@ -214,7 +214,7 @@ def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]
         info = _fallback_node_info(node_id)
         kind = str(decl.get("kind") or "node").strip()
         node_type = str(decl.get("type") or "ai").strip().lower()
-        if kind == "node" and node_type in {"ai", "tool", "script"}:
+        if kind == "node" and node_type in {"ai", "tool"}:
             name = str(decl.get("name") or node_id).strip() or node_id
             description = str(decl.get("description") or "").strip() or name
             info = {"id": node_id, "name": name, "description": description}
@@ -246,7 +246,7 @@ def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]
     if isinstance(data, dict):
         kind = str(data.get("kind") or "node").strip()
         node_type = str(data.get("type") or "ai").strip().lower()
-        if kind == "node" and node_type in {"ai", "tool", "script"}:
+        if kind == "node" and node_type in {"ai", "tool"}:
             name = str(data.get("name") or node_id).strip() or node_id
             description = str(data.get("description") or "").strip() or name
             info = {
@@ -898,22 +898,6 @@ async def _handle_task(
             print(f"[engine] task {task_id} ORPHANED - shutdown interrupted complete POST", flush=True)
 
 
-_TASK_ACTION_FIELDS = set(TaskAction.__dataclass_fields__)
-
-
-def _task_action_from_dict(data: dict[str, Any], *, node_id: str) -> TaskAction:
-    """Convert a script-produced TaskAction dictionary into the runtime object."""
-    # [AutoC 2026-06-09] Why: script_step intentionally returns plain dicts so it
-    # can stay independent from runner internals, while the rest of runner records
-    # TaskAction objects. How: filter unknown keys and supply node_id when omitted.
-    # Purpose: script nodes share the existing event, transcript, and completion
-    # logic without special casing every later use of action.action or to_dict().
-    raw = data if isinstance(data, dict) else {}
-    kwargs = {key: value for key, value in raw.items() if key in _TASK_ACTION_FIELDS}
-    kwargs.setdefault("node_id", node_id)
-    return TaskAction(**kwargs)
-
-
 def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     """Build task_context from input_data, bridging supervisor flags.
 
@@ -1221,10 +1205,6 @@ async def _run_node_task(
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,
         "node_name": node.name,
-        # [AutoC 2026-06-09] Why: output chain tasks (quality check etc.) should
-        # not create separate child progress in the frontend. How: pass the
-        # _output_chain flag from task input so event_router can merge into main.
-        "_output_chain": bool(input_data.get("_output_chain")),
         "node_type": node.type,
     })
 
@@ -1362,33 +1342,16 @@ async def _run_node_task(
     _bridge_patterns = _signals_cfg.get("bridge_patterns")
     install_event_bridge(_sig_bus, patterns=_bridge_patterns)
 
-    if node.type == "script":
-        # [AutoC 2026-06-09] Why: script nodes are deterministic runner-level logic,
-        # not model calls. How: execute the inline Python through script_step and
-        # adapt its TaskAction dictionary into the object used by downstream runner
-        # bookkeeping. Purpose: finish and ask results follow existing supervisor
-        # routing while avoiding run_ai_node entirely.
-        from .script_step import run_script_node
-
-        script_action = await run_script_node(
-            rctx=rctx,
-            node=node,
-            text=instruction,
-            attachments=input_attachments or [],
-            input_data=input_data,
-        )
-        action = _task_action_from_dict(script_action, node_id=node.id)
-    else:
-        action = await run_ai_node(
-            rctx=rctx, provider=provider, registry=registry, node=node,
-            instruction=instruction,
-            history=history, run_id=task_id, context_ref=context_ref,
-            resume_data=resume_data_raw,
-            downstream_info=ds_info,
-            switch_info=sw_info,
-            streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
-            attachments=input_attachments,
-        )
+    action = await run_ai_node(
+        rctx=rctx, provider=provider, registry=registry, node=node,
+        instruction=instruction,
+        history=history, run_id=task_id, context_ref=context_ref,
+        resume_data=resume_data_raw,
+        downstream_info=ds_info,
+        switch_info=sw_info,
+        streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
+        attachments=input_attachments,
+    )
 
     # Child Session 隔离（Phase B）：将 child_session_id 写入 task result，
     # 供 supervisor 侧 _route_completed_task_locked 和调试/监控使用。
@@ -1399,7 +1362,6 @@ async def _run_node_task(
         "task_id": task_id, "node_id": node.id, "node_name": node.name,
         "action": action.action,
         "source_inbound_seq": source_inbound_seq,
-        "_output_chain": bool(input_data.get("_output_chain")),
         "node_type": node.type,
     })
 

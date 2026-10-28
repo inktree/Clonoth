@@ -80,15 +80,6 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             content = "Downstream node needs more information."
         return [{"role": "user", "content": content}]
 
-    # v2: output_rejected (output chain downstream rejected upstream finish)
-    if rtype == "output_rejected":
-        # [AutoC 2026-06-10] Why: reject must present as the finish tool's result
-        # through the real formatter pipeline (native/fake-native/json). How: return
-        # empty here; ai_step handles output_rejected by injecting a properly
-        # formatted tool result via the node's formatter. Purpose: API-level
-        # tool_call_id pairing stays correct across all tool_mode variants.
-        return []
-
     # v2: child_failed
     if rtype == "child_failed":
         from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
@@ -289,122 +280,6 @@ def collect_resume_attachments(
     return collected
 
 
-def _apply_output_rejected(
-    *,
-    messages: list[dict[str, Any]],
-    resume_data: dict[str, Any],
-    formatter: Any,
-    node: Any,
-    rctx: Any,
-) -> None:
-    """Inject a QA rejection into the resumed message history.
-
-    Why: output_rejected resume is a message-repair concern, not loop mechanics.
-    How: detect implicit (hybrid free prose) versus explicit finish rejections;
-    either append a user-role reject line or replace the paired finish
-    tool_result, persisting both to ConversationStore. Purpose: run_ai_node
-    keeps only the resume entry point.
-    """
-    _rej_result = resume_data.get("result") if isinstance(resume_data.get("result"), dict) else {}
-    _rej_from = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
-    _rej_reason = str(resume_data.get("reject_reason") or _rej_result.get("text") or "").strip()
-    _rej_line = f"reject by {_rej_from}: {_rej_reason}" if _rej_from else f"reject: {_rej_reason}"
-    _finish_call_id = str(resume_data.get("_finish_tool_call_id") or "").strip()
-    _finish_result_idx = -1
-
-    # [AutoC 2026-08-06] 判断是否为隐式 finish（hybrid free prose）。
-    # hybrid 模式下 tool_call_log 可能残留被 guard reject 的 finish 调用 id，
-    # 但实际 JSONL/messages 里没有 finish tool_call，不能走显式分支。
-    # 检测方式：在 messages 里找不到对应的 finish assistant tool_call。
-    _is_implicit_finish = True
-    if _finish_call_id:
-        for _m in reversed(messages):
-            if _m.get("role") != "assistant":
-                continue
-            for _tc in (_m.get("tool_calls") or []):
-                if not isinstance(_tc, dict):
-                    continue
-                _fn = _tc.get("function") if isinstance(_tc.get("function"), dict) else {}
-                _tc_id = str(_tc.get("id") or "").strip()
-                _tc_name = str(_tc.get("name") or _fn.get("name") or "")
-                if _tc_name == "finish" and _tc_id == _finish_call_id:
-                    _is_implicit_finish = False
-                    break
-            if not _is_implicit_finish:
-                break
-
-    logger.info("output_rejected: from=%s reason=%s fcid=%r implicit=%s msg_count=%d",
-             _rej_from, _rej_reason[:80], _finish_call_id, _is_implicit_finish, len(messages))
-
-    if _is_implicit_finish:
-        # Hybrid 模式隐式 finish 或无 finish call_id：
-        # 以 user 角色注入 reject，追加到 messages 末尾。
-        # reject 作为当前指令应该在动态上下文（背景信息）之后。
-        _rej_user_msg = {"role": "user", "content": _rej_line}
-        set_message_meta(_rej_user_msg, MessageMeta(
-            message_type="output_rejected",
-        ))
-        messages.append(_rej_user_msg)
-        logger.info("output_rejected(implicit): appended user reject msg at idx=%d",
-                    len(messages) - 1)
-        _store = getattr(rctx, 'conversation_store', None)
-        _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-        if _store:
-            try:
-                _store.append(_target_sid, Message(
-                    id=str(uuid4()),
-                    role="user",
-                    content=_rej_line,
-                    message_type="output_rejected",
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                ))
-            except Exception as _wr_exc:
-                logger.warning("output_rejected(implicit): append failed sid=%s: %s",
-                            _target_sid, _wr_exc)
-    else:
-        # 显式 finish：找到对应的 tool_result 并替换内容。
-        if _finish_call_id:
-            for _idx in range(len(messages) - 1, -1, -1):
-                _m = messages[_idx]
-                if _m.get("role") != "tool":
-                    continue
-                if str(_m.get("tool_call_id") or "").strip() != _finish_call_id:
-                    continue
-                if str(_m.get("name") or "").strip() != "finish":
-                    continue
-                _finish_result_idx = _idx
-                break
-        _rej_parsed = ParsedToolCall(
-            id=_finish_call_id,
-            name="finish",
-            arguments={},
-        )
-        _rej_msg = formatter.format_tool_result(_rej_parsed, _rej_line)
-        set_message_meta(_rej_msg, MessageMeta(
-            tool_mode=getattr(node, 'tool_mode', 'fake-native'),
-            message_type="tool_result",
-        ))
-        if _finish_result_idx >= 0:
-            _old_msg_id = str(messages[_finish_result_idx].get("id") or "").strip()
-            messages[_finish_result_idx] = _rej_msg
-            logger.info("output_rejected(explicit): replaced tool_result at idx=%d fcid=%s",
-                     _finish_result_idx, _finish_call_id)
-            _store = getattr(rctx, 'conversation_store', None)
-            _target_sid = getattr(rctx, 'child_session_id', '') or rctx.session_id
-            if _old_msg_id and _store:
-                try:
-                    _store.update_message(_target_sid, _old_msg_id, _rej_msg)
-                except Exception as _upd_exc:
-                    logger.warning("output_rejected: update_message failed sid=%s msg=%s: %s",
-                                _target_sid, _old_msg_id, _upd_exc)
-            elif not _old_msg_id:
-                logger.warning("output_rejected: msg id missing, cannot persist reject to JSONL")
-        else:
-            messages.append(_rej_msg)
-            logger.info("output_rejected(explicit): appended orphan tool_result fcid=%s",
-                     _finish_call_id)
-
-
 async def _emit_compact_done(
     *,
     resume_data: dict[str, Any],
@@ -443,20 +318,8 @@ async def apply_resume_messages(
     node: Any,
     rctx: Any,
 ) -> None:
-    """Append resume messages and run output_rejected / compact_done handling.
-
-    Why: run_ai_node should own the resume decision (when to resume), not the
-    repair logic (how each resume type mutates messages). How: extend the
-    message list with rebuilt resume messages and dispatch the two special
-    resume types by name. Purpose: keep the entry function slim while resume
-    semantics stay in the resume module.
-    """
+    """Append resume messages and run compact_done handling."""
     messages.extend(_build_resume_messages(resume_data))
     _rtype = str(resume_data.get("type") or "")
-    if _rtype == "output_rejected":
-        _apply_output_rejected(
-            messages=messages, resume_data=resume_data,
-            formatter=formatter, node=node, rctx=rctx,
-        )
-    elif _rtype == "compact_done":
+    if _rtype == "compact_done":
         await _emit_compact_done(resume_data=resume_data, node=node, rctx=rctx)

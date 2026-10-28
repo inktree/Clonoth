@@ -35,18 +35,13 @@ class MemoryAccess:
 @dataclass
 class Node:
     id: str
-    type: str  # "ai" | "tool" | "script"
+    type: str  # "ai" | "tool"
     name: str = ""
     description: str = ""
     model: str = ""          # 模型名称，空 = 使用全局默认
     api_key: str = ""        # 可选独立 API key（支持 $ENV{} 语法）
     base_url: str = ""       # 可选独立 base URL（支持 $ENV{} 语法）
     prompt: str | list = ""  # system prompt：字符串模式或 block 列表模式
-    # [AutoC 2026-06-09] Why: script nodes need deterministic inline Python without invoking an LLM.
-    # How: store the YAML script body verbatim and keep execution timeout on the node model.
-    # Purpose: runner can execute type=script nodes directly while preserving existing AI node fields.
-    script: str = ""
-    script_timeout_sec: float = 30.0
     tool_access: ToolAccess = field(default_factory=ToolAccess)
     skill_access: SkillAccess = field(default_factory=SkillAccess)
     memory_access: MemoryAccess = field(default_factory=MemoryAccess)
@@ -56,10 +51,6 @@ class Node:
     # hybrid output_mode: 纯文本输出不再 reject 重试，直接作为隐式 finish 投递给用户。
     # tool_only = 现有行为（强制 finish）；hybrid = 允许纯文本直接投递。
     output_mode: str = "tool_only"  # "tool_only" | "hybrid"
-    # [AutoC 2026-06-08] Why: output chain 是 Supervisor 侧 finish 后路由声明，不进入节点 prompt。
-    # How: 节点 YAML 可配置 output 为目标 node_id 或 __source__，load_node 只解析并保留原始声明。
-    # Purpose: 让节点保持纯处理单元，后续路由统一由 Supervisor 决定。
-    output: str = ""
     # [provider-registry 2026-05-03] provider 是 registry key，空字符串表示使用默认 provider。
     # 原因：provider 列表已插件化；做法：不在类型注释中列死内置名称；目的：新增 provider 无需改 Node 定义。
     provider: str = ""
@@ -117,7 +108,7 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     if str(data.get("kind") or "node").strip() != "node":
         return None
     node_type = str(data.get("type") or "ai").strip().lower()
-    if node_type not in {"ai", "tool", "script"}:
+    if node_type not in {"ai", "tool"}:
         return None
 
     # prompt：字符串→字符串模式，列表→block 列表模式
@@ -128,18 +119,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         prompt = raw_prompt.strip()
     else:
         prompt = ""
-
-    # [AutoC 2026-06-09] Why: YAML may carry arbitrary values, but script execution expects source text.
-    # How: accept only string script bodies and parse a positive numeric timeout with a safe default.
-    # Purpose: invalid script metadata cannot crash node loading or leak into extra configuration.
-    raw_script = data.get("script")
-    script = raw_script if isinstance(raw_script, str) else ""
-    try:
-        script_timeout_sec = float(data.get("script_timeout_sec", 30.0))
-    except Exception:
-        script_timeout_sec = 30.0
-    if script_timeout_sec <= 0:
-        script_timeout_sec = 30.0
 
     # model：直接值或 $ENV{} 引用
     raw_model = str(data.get("model") or "").strip()
@@ -225,12 +204,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "hybrid").strip().lower()
     output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
 
-    # [AutoC 2026-06-08] Why: Supervisor 需要从节点声明读取 finish 后的 output chain 目标。
-    # How: 解析 YAML 中的 output 字段并保留去空白后的字符串，允许普通 node_id 或 __source__。
-    # Purpose: 无 output 字段时保持空字符串，从而完全保留旧路由行为。
-    raw_output = str(data.get("output") or "").strip()
-    output = raw_output
-
     # provider — 节点 yaml 可指定 provider 类型
     raw_provider = str(data.get("provider") or "").strip().lower()
     # [provider-registry 2026-05-03] 从 registry 动态校验 provider 名称。
@@ -277,8 +250,8 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     _KNOWN_KEYS = {
         "kind", "id", "type", "name", "description", "model", "api_key",
         "base_url", "prompt", "tool_access", "skills", "memories",
-        "tool_mode", "output_mode", "output", "provider", "provider_options",
-        "delegate_targets", "persistent", "script", "script_timeout_sec",
+        "tool_mode", "output_mode", "provider", "provider_options",
+        "delegate_targets", "persistent",
         "control_tools",
     }
     extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
@@ -292,14 +265,11 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         api_key=api_key,
         base_url=base_url,
         prompt=prompt,
-        script=script,
-        script_timeout_sec=script_timeout_sec,
         tool_access=ta,
         skill_access=sa,
         memory_access=ma,
         tool_mode=tool_mode,
         output_mode=output_mode,
-        output=output,
         provider=provider,
         provider_options=provider_options,
         delegate_targets=delegate_targets,

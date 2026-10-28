@@ -148,15 +148,6 @@ class Task(BaseModel):
     updated_at: datetime
     lease_expires_at: datetime | None = None
     result: dict[str, Any] = Field(default_factory=dict)
-    # [AutoC 2026-06-08] Why: output chain 需要在多个同步下游 task 之间保留入口和原始调用方。
-    # How: 在 Task 快照中持久化 entry/source/path/depth 元数据，旧快照缺字段时由默认值补齐。
-    # Purpose: Supervisor 能检测循环和深度，并在 __source__ 处把最终结果穿透回原始 caller。
-    output_chain_entry_task_id: str | None = None
-    output_chain_source_task_id: str | None = None
-    output_chain_source_session_id: str | None = None
-    output_chain_source_dispatch_origin: dict[str, Any] = Field(default_factory=dict)
-    output_chain_path: list[str] = Field(default_factory=list)
-    output_chain_depth: int = 0
     # [AutoC 2026-06-04] Runtime-only task activity tracking. Not persisted.
     # Updated by supervisor when transient events (stream_delta, tool_call_*,
     # approval_*) arrive. Read by GET /v1/admin/tasks/active.

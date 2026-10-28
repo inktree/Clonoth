@@ -202,34 +202,36 @@ def _truncate(text: str, limit: int = 2000) -> str:
     return text
 
 
-def _split_long_text(text: str, limit: int = 2000) -> list[str]:
-    """把超长文本按段落/句子边界切成多条消息，避免直接截断丢内容。
-
-    [2026-10-06 fix] Why: 模型忘写 [SPLIT] 标记时，长回复会被 _truncate 硬砍掉
-    后半段，Discord 端只能看到带 "..." 的半截内容。How: 优先按空行、再按单换行、
-    再按中文句末标点、最后按空格寻找切点，逐段切分。Purpose: 长回复完整送达，
-    不再依赖模型主动加标记。
-    """
-    if len(text) <= limit:
-        return [text]
+def _split_long_text(text: str, limit: int = 1900) -> list[str]:
+    """按自然边界切分，保留缩进，并在跨消息时闭合、重开代码围栏。"""
     chunks: list[str] = []
     remaining = text
+    # Reserve room for a newline and closing fence, including custom limits.
+    budget = limit - 4
     while len(remaining) > limit:
-        window = remaining[:limit]
+        window = remaining[:budget]
         cut = window.rfind("\n\n")
-        if cut < limit // 2:
+        if cut < budget // 2:
             cut = window.rfind("\n")
-        if cut < limit // 2:
+        if cut < budget // 2:
             for punct in ("。", "！", "？", "；", "…", ".", "!", "?"):
                 pos = window.rfind(punct)
                 if pos > cut:
                     cut = pos + 1
-        if cut < limit // 2:
+        if cut < budget // 2:
             cut = window.rfind(" ")
         if cut <= 0:
-            cut = limit
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
+            cut = budget
+        chunk = remaining[:cut]
+        remaining = remaining[cut:].lstrip("\r\n")
+        opening_fence = None
+        for line in chunk.splitlines():
+            if line.lstrip(" \t").startswith("```"):
+                opening_fence = line if opening_fence is None else None
+        if opening_fence is not None:
+            chunk += "\n```"
+            remaining = opening_fence + "\n" + remaining
+        chunks.append(chunk)
     if remaining:
         chunks.append(remaining)
     return chunks
@@ -243,43 +245,37 @@ async def _send_split_text(
     reply_to: discord.Message | None = None,
     files: list[discord.File] | None = None,
 ) -> list[discord.Message]:
-    """发送文本到频道，支持 [SPLIT] 分段和 2000 字符截断。"""
+    """统一处理代码块外的分段标记和超长文本，不截断内容。"""
+    parts = [""]
+    # Keep fenced code opaque, including an unfinished final code block.
+    for index, section in enumerate(re.split(r"(```[\s\S]*?(?:```|$))", text)):
+        if index % 2:
+            parts[-1] += section
+        else:
+            logical_parts = section.replace("[LEFT]", rt.split_signal).split(rt.split_signal)
+            parts[-1] += logical_parts[0]
+            parts.extend(logical_parts[1:])
+    chunks = [
+        chunk
+        for part in parts if part.strip()
+        for chunk in _split_long_text(part.strip("\r\n"), limit=1900)
+    ]
+    if not chunks and files:
+        chunks = [""]
     sent: list[discord.Message] = []
-    if rt.split_signal in text:
-        parts = [p.strip() for p in text.split(rt.split_signal) if p.strip()]
-        for i, part in enumerate(parts):
-            part = _truncate(part)
-            split_files = files if (i == 0 and files) else None
-            if i == 0 and reply_to:
-                sent.append(await reply_to.reply(content=part, files=split_files or [], suppress_embeds=True))
-            else:
-                sent.append(await channel.send(content=part, files=split_files or [], suppress_embeds=True))
-            if i < len(parts) - 1:
-                next_len = len(parts[i + 1])
-                delay = min(0.8 + next_len / 80, 3.5)
-                try:
-                    async with channel.typing():
-                        await asyncio.sleep(delay)
-                except Exception:
+    for i, chunk in enumerate(chunks):
+        chunk_files = files if i == 0 and files else []
+        if i == 0 and reply_to:
+            sent.append(await reply_to.reply(content=chunk, files=chunk_files, suppress_embeds=True))
+        else:
+            sent.append(await channel.send(content=chunk, files=chunk_files, suppress_embeds=True))
+        if i < len(chunks) - 1:
+            delay = min(0.8 + len(chunks[i + 1]) / 80, 3.5)
+            try:
+                async with channel.typing():
                     await asyncio.sleep(delay)
-    else:
-        # [2026-10-06 fix] 无 [SPLIT] 标记时按长度自动分段，避免超长回复被截断丢内容。
-        chunks = _split_long_text(text)
-        for i, chunk in enumerate(chunks):
-            if len(chunk) > 2000:
-                chunk = _truncate(chunk)
-            chunk_files = files if (i == 0 and files) else None
-            if i == 0 and reply_to:
-                sent.append(await reply_to.reply(content=chunk, files=chunk_files or [], suppress_embeds=True))
-            else:
-                sent.append(await channel.send(content=chunk, files=chunk_files or [], suppress_embeds=True))
-            if i < len(chunks) - 1:
-                delay = min(0.8 + len(chunks[i + 1]) / 80, 3.5)
-                try:
-                    async with channel.typing():
-                        await asyncio.sleep(delay)
-                except Exception:
-                    await asyncio.sleep(delay)
+            except Exception:
+                await asyncio.sleep(delay)
     return sent
 
 
@@ -483,7 +479,8 @@ def _extract_tts_segments(text: str) -> tuple[str, list[dict[str, str]]]:
     segments: list[dict[str, str]] = []
 
     def _replace(match: re.Match[str]) -> str:
-        segment = (match.group("html_text") or match.group("legacy_text") or "").strip()
+        segment = match.group("html_text") or match.group("legacy_text") or ""
+        segment = re.sub(r"\[SPLIT\]|\[LEFT\]", " ", segment).strip()
         if segment:
             item = {"text": segment}
             item.update(_parse_tts_attributes(match.group("attrs") or ""))
@@ -491,9 +488,6 @@ def _extract_tts_segments(text: str) -> tuple[str, list[dict[str, str]]]:
         return ""
 
     display_text = _TTS_SEGMENT_RE.sub(_replace, text or "")
-    display_text = re.sub(r"[ \t]{2,}", " ", display_text)
-    display_text = re.sub(r"[ \t]+\n", "\n", display_text)
-    display_text = re.sub(r"\n[ \t]+", "\n", display_text)
     display_text = re.sub(r"\n{3,}", "\n\n", display_text).strip()
     return display_text, segments
 
