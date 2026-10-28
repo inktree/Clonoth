@@ -100,12 +100,32 @@ def main() -> None:
     _supervisor_log_f = open(_supervisor_log_path, "a", encoding="utf-8", buffering=1)
 
     def _log(msg: str) -> None:
-        """写 supervisor 日志（不写终端）。"""
+        """写 supervisor 日志并同步输出到终端。"""
+        print(msg, flush=True)
         try:
             _supervisor_log_f.write(msg + "\n")
             _supervisor_log_f.flush()
         except Exception:
             pass
+
+    def _kill_port_occupant(port: int) -> None:
+        """跨平台释放占用指定 TCP 端口的旧进程。"""
+        if sys.platform == "win32":
+            res = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            my_pid = os.getpid()
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+                    pid = int(parts[4])
+                    if pid > 0 and pid != my_pid:
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, check=False)
+                        _log(f"[supervisor] 已清理占用端口 {port} 的旧进程 PID={pid}")
+        else:
+            fuser = subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5, check=False)
+            _log(f"[supervisor] fuser -k 结果: rc={fuser.returncode} stdout={fuser.stdout.decode().strip()}")
 
     # 在做任何状态变更之前，先检查端口是否可用
     # [2026-06-06] Why: during restart, the old process may not have released the
@@ -143,12 +163,7 @@ def main() -> None:
         if not _port_ready:
             _log(f"[supervisor] 端口 {args.host}:{args.port} 等待 10s 仍未释放，尝试强制清理")
             try:
-                import subprocess as _sp
-                _fuser = _sp.run(
-                    ["fuser", "-k", f"{args.port}/tcp"],
-                    capture_output=True, timeout=5,
-                )
-                _log(f"[supervisor] fuser -k 结果: rc={_fuser.returncode} stdout={_fuser.stdout.decode().strip()}")
+                _kill_port_occupant(args.port)
                 time.sleep(1)
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
                     _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -159,7 +174,7 @@ def main() -> None:
 
     if not _port_ready:
         _log(f"[supervisor] 端口 {args.host}:{args.port} 无法使用，退出")
-        return
+        sys.exit(1)
 
     # Replace args.port with the resolved port for all downstream usage
     args.port = _resolved_port

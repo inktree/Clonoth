@@ -55,11 +55,22 @@ def _ensure_port_free(port: int, max_wait: int = 5) -> None:
                 return
         except OSError:
             if attempt == max_wait - 2:
-                # Second-to-last attempt: try fuser -k
-                print(f"[launcher] port {port} still occupied, running fuser -k", flush=True)
+                print(f"[launcher] port {port} still occupied, cleaning up occupant", flush=True)
                 try:
-                    subprocess.call(["fuser", "-k", f"{port}/tcp"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if sys.platform == "win32":
+                        res = subprocess.run(
+                            ["netstat", "-ano", "-p", "TCP"],
+                            capture_output=True, text=True, timeout=5, check=False,
+                        )
+                        for line in res.stdout.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+                                pid = int(parts[4])
+                                if pid > 0 and pid != os.getpid():
+                                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, check=False)
+                    else:
+                        subprocess.call(["fuser", "-k", f"{port}/tcp"],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
             time.sleep(1)

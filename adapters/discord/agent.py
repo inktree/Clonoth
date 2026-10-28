@@ -29,12 +29,23 @@ logger = logging.getLogger("discord_bot")
 
 
 def _kill_port_holder(port: int) -> None:
-    """尝试杀掉占用指定端口的进程。
-
-    用于解决服务器重启后旧 bot 进程残留占端口的问题。
-    只杀 python3.11 进程，避免误杀其他服务。
-    """
+    """尝试杀掉占用指定端口的旧进程。"""
     try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "TCP"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+                    pid = int(parts[4])
+                    if pid > 0 and pid != os.getpid():
+                        print(f"[bridge] 杀掉占用端口 {port} 的旧进程 pid={pid}")
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5, check=False)
+                        time.sleep(0.5)
+                        return
+            return
         result = subprocess.run(
             ["ss", "-tlnp", f"sport = :{port}"],
             capture_output=True, text=True, timeout=5,
@@ -298,7 +309,7 @@ async def _start_bridge(rt: Any) -> None:
             print(f"[bridge] Discord Bridge Server: http://127.0.0.1:{rt.bridge_port}")
             return
         except OSError as exc:
-            if exc.errno != 98:  # EADDRINUSE
+            if exc.errno not in (98, 10048):  # EADDRINUSE (Linux=98, Windows=10048)
                 raise
             print(f"[bridge] 端口 {rt.bridge_port} 被占用 (attempt {attempt + 1}/3)，尝试清理旧进程...")
             _kill_port_holder(rt.bridge_port)
