@@ -136,6 +136,10 @@ def _build_messages_for_provider(
 ) -> list[dict[str, Any]]:
     """Build the message view that should be handed to the provider."""
     messages = [{k: v for k, v in message.items() if k != "response_info"} for message in messages]
+    non_dynamic = [message for message in messages if not message.get("_dynamic")]
+    prefill = non_dynamic[-1] if non_dynamic else None
+    if not (prefill and prefill.get("role") == "assistant" and not prefill.get("tool_calls")):
+        messages = non_dynamic + [message for message in messages if message.get("_dynamic")]
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
     if provider_name in {"openai-responses", "gemini", "gemini-vertex", "gemini-aistudio"} and formatter_mode in {"native", "fake-native"}:
