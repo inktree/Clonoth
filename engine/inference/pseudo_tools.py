@@ -194,7 +194,9 @@ def refresh_dispatch_to_spec(ls: Any) -> bool:
 
     Returns True if ls.openai_tools was updated, False if unchanged (preserving prompt cache).
     """
-    if ls._cache_warm_fork:
+    if ls._cache_warm_fork or ls.node.tool_mode == "json":
+        return False
+    if ls.formatter is not None and ls.formatter.mode == "json":
         return False
 
     from ..node import load_node
