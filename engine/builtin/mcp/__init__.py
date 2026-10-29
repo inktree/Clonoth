@@ -180,11 +180,14 @@ _BRIDGE: dict[str, Any] = {
     "hooks": None,
     "disposers": [],
     "lock": None,
+    "init_done": None,
 }
 
 
 def _start_engine_bridge(tools_face: Any, ctx: Any) -> None:
     if _BRIDGE["started"]:
+        if ctx is not None and _BRIDGE.get("hooks") is None:
+            _BRIDGE["hooks"] = getattr(ctx, "hooks", None)
         return
     try:
         loop = asyncio.get_running_loop()
@@ -193,12 +196,25 @@ def _start_engine_bridge(tools_face: Any, ctx: Any) -> None:
         return
     _BRIDGE["started"] = True
     _BRIDGE["hooks"] = getattr(ctx, "hooks", None)
+    _BRIDGE["init_done"] = asyncio.Event()
     loop.create_task(_bridge_loop(tools_face))
+
+
+async def wait_mcp_initial_discovery() -> None:
+    """Wait for the first MCP tool discovery pass on this worker if the bridge is active."""
+    init_done = _BRIDGE.get("init_done")
+    if init_done is not None and not init_done.is_set():
+        await init_done.wait()
 
 
 async def _bridge_loop(registry: Any) -> None:
     ws = Path(getattr(registry, "workspace_root"))
-    await refresh_mcp_tools(registry)
+    try:
+        await refresh_mcp_tools(registry)
+    finally:
+        init_done = _BRIDGE.get("init_done")
+        if init_done is not None:
+            init_done.set()
     last_mtime = _config_mtime(ws)
     while True:
         await asyncio.sleep(_WATCH_INTERVAL_SEC)

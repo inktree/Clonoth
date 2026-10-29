@@ -635,8 +635,9 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
         remote_count = await registry.load_remote_tools(supervisor_url)
         if remote_count:
             print(f"[engine] loaded {remote_count} remote tools", flush=True)
-        # [AutoC 2026-08-27] MCP 工具预载移除：发现职责归 engine/builtin/mcp 插件，
-        # 其后台桥在首个 AI 任务启动时做首次发现（首个任务可能赶不上，第二个起可见）。
+        from engine.builtin.mcp import _start_engine_bridge, wait_mcp_initial_discovery
+        _start_engine_bridge(registry, None)
+        await wait_mcp_initial_discovery()
 
         # Direction 1: graceful shutdown via signal handling
         stop_event = asyncio.Event()
