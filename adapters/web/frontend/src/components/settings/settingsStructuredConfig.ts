@@ -190,7 +190,7 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
 
 // ==================== Runtime Config ====================
 
-function normalizeRuntimeToolMode(value: string, fallback: RuntimeToolMode = 'json'): RuntimeToolMode {
+function normalizeRuntimeToolMode(value: string, fallback: RuntimeToolMode = 'native'): RuntimeToolMode {
   return value === 'native' || value === 'fake-native' || value === 'json' ? value : fallback;
 }
 
@@ -209,7 +209,7 @@ export function parseRuntimeConfig(raw: string): RuntimeConfigFormState {
     retry_max_retries: retry.max_retries === undefined ? '' : String(retry.max_retries),
     compact_threshold_tokens: compact.threshold_tokens === undefined ? '' : String(compact.threshold_tokens),
     compact_keep_recent: compact.keep_recent === undefined ? '' : String(compact.keep_recent),
-    tool_mode: normalizeRuntimeToolMode(str(engine.tool_mode, 'json')),
+    tool_mode: normalizeRuntimeToolMode(str(engine.tool_mode, 'native')),
     output_mode: normalizeOutputMode(str(engine.output_mode, 'hybrid')),
   };
 }

@@ -21,7 +21,7 @@ const EMPTY_RUNTIME_FORM: RuntimeConfigFormState = {
   retry_max_retries: '',
   compact_threshold_tokens: '',
   compact_keep_recent: '',
-  tool_mode: 'json',
+  tool_mode: 'native',
   output_mode: 'hybrid',
 };
 

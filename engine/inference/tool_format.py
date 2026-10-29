@@ -1095,16 +1095,14 @@ def repair_tool_result_pairing_with_stats(
         if parsed is None:
             return dict(message)
         result_name, output = parsed
-        if _normalize_tool_mode(pending_tool_mode) != "native":
-            return dict(message)
 
-        # [2026-05-07] 修复旧 fake-native 文本结果与 native assistant.finish 的配对。
+        # [2026-05-07] 修复旧 fake-native 文本结果与结构化 assistant.tool_calls 的配对。
         # 原因：早期存储会把 `Tool result for "finish": completed` 写成 user 文本，
-        # 但它紧跟 native assistant.finish 时本质上是该 tool_call 的结果。
+        # 但它紧跟带结构化 tool_calls 的 assistant 时本质上是该 tool_call 的结果。
         # 做法：转换为 role=tool，并沿用原输出文本而不是强行改写为 ok。
-        # 目的：兼容旧历史，同时保持 provider 原生工具协议一致。
+        # 目的：兼容旧历史与跨 tool_mode 切换，同时保持 provider 原生工具协议一致。
         meta = _message_meta(message)
-        meta["tool_mode"] = "native"
+        meta["tool_mode"] = _normalize_tool_mode(pending_tool_mode)
         meta["message_type"] = "tool_result"
         return {
             "role": "tool",
