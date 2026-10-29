@@ -273,6 +273,8 @@ def refresh_dispatch_to_spec(ls: Any) -> bool:
     """
     if getattr(ls, "_cache_warm_fork", False):
         return False
+    if getattr(getattr(ls, "formatter", None), "mode", "") == "json" or getattr(ls.node, "tool_mode", "native") == "json":
+        return False
 
     from ..node import load_node
     from ..runner import _collect_node_info

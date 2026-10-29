@@ -172,6 +172,22 @@ def test_unified_dispatch_to_spec_and_dynamic_refresh(tmp_path: Path) -> None:
     # Calling refresh again without disk changes must return False (preserving cache)
     assert refresh_dispatch_to_spec(ls) is False
 
+    # In tool_mode="json", ls.openai_tools is cleared to [] after inject_tool_definitions;
+    # refresh_dispatch_to_spec must return False without appending native dispatch_to spec
+    # or clobbering ls.allowed_pseudo_tools.
+    parent.tool_mode = "json"
+    json_ls = SimpleNamespace(
+        rctx=SimpleNamespace(workspace_root=tmp_path),
+        node=parent,
+        formatter=SimpleNamespace(mode="json"),
+        openai_tools=[],
+        allowed_pseudo_tools={"dispatch_to", "intermediate_reply", "spawn_worker", "manage_workers"},
+    )
+    assert refresh_dispatch_to_spec(json_ls) is False
+    assert json_ls.openai_tools == []
+    assert "intermediate_reply" in json_ls.allowed_pseudo_tools
+    assert "spawn_worker" in json_ls.allowed_pseudo_tools
+
 
 def test_spawn_worker_cache_warm_fork_persists_exact_parent_prefix(tmp_path: Path) -> None:
     """spawn_worker(context_mode='fork') saves the parent's exact pre-assistant messages and tools snapshot for 100% cache hit."""
