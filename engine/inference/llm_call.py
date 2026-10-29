@@ -183,17 +183,9 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
-    _formatted, _budget_stats = bound_tool_history(
-        _formatted, total_budget=get_history_tool_budget(ls.runtime_cfg)
-    )
-    if _budget_stats.get("compressed_count"):
-        log.info(
-            "tool history bounded: %d results compressed, %d -> %d chars (budget %d)",
-            _budget_stats["compressed_count"],
-            _budget_stats["before_chars"],
-            _budget_stats["after_chars"],
-            _budget_stats["budget"],
-        )
+    # [2026-10-26] Disabled bound_tool_history in-place truncation of historical tool results:
+    # single-step tool outputs are already capped at creation time by tool_trace.max_inline_chars,
+    # and mutating mid-history tool messages on every step invalidates the Prefix KV Cache.
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
 
     # [AutoC 2026-08-24] before_llm_call：请求级消息变换点。

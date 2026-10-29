@@ -1173,6 +1173,8 @@ async def run_ai_node(
         )
 
     # ---- 构建工具列表 ----
+    from engine.builtin.mcp import wait_mcp_initial_discovery
+    await wait_mcp_initial_discovery()
     _allowed_real_tools, _node_openai_tools = build_node_tool_specs(
         registry=registry, node=node,
         downstream_info=downstream_info, switch_info=switch_info,
