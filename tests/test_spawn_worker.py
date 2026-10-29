@@ -181,7 +181,6 @@ def test_unified_dispatch_to_spec_and_dynamic_refresh(tmp_path: Path) -> None:
     ls = SimpleNamespace(
         rctx=SimpleNamespace(workspace_root=tmp_path),
         node=parent,
-        formatter=None,
         openai_tools=specs,
         allowed_pseudo_tools=allowed_pseudo_names(specs, parent),
         _cache_warm_fork=False,
@@ -201,7 +200,6 @@ def test_unified_dispatch_to_spec_and_dynamic_refresh(tmp_path: Path) -> None:
     json_ls = SimpleNamespace(
         rctx=SimpleNamespace(workspace_root=tmp_path),
         node=parent,
-        formatter=SimpleNamespace(mode="json"),
         openai_tools=[],
         allowed_pseudo_tools={"dispatch_to", "intermediate_reply", "spawn_worker", "manage_workers"},
         _cache_warm_fork=False,

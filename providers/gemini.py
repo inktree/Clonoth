@@ -235,7 +235,7 @@ class GeminiProvider(BaseProvider):
                             _clean_parts = _filter_unpaired_fc_parts(
                                 _clean_parts, _next_tool_msgs, fallback_text=_extract_text(msg),
                             )
-                    if _clean_parts:
+                    if _clean_parts and not (_fc_idx == 0 and msg.get("tool_calls")):
                         _ensure_fc_thought_signature(_clean_parts)
                         contents.append({"role": "model", "parts": _clean_parts})
                         continue

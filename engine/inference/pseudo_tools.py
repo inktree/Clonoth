@@ -196,8 +196,6 @@ def refresh_dispatch_to_spec(ls: Any) -> bool:
     """
     if ls._cache_warm_fork or ls.node.tool_mode == "json":
         return False
-    if ls.formatter is not None and ls.formatter.mode == "json":
-        return False
 
     from ..node import load_node
     from ..runner import _collect_node_info

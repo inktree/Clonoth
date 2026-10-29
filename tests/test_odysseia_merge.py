@@ -779,3 +779,47 @@ def test_provider_thinking_templates_preserve_policy_and_request_isolation(kind,
         assert thinking == expected
         if thinking is not None:
             thinking.clear()
+
+
+def test_gemini_json_mode_history_rebuilds_function_call_when_switched_to_native():
+    from providers.gemini import GeminiProvider
+
+    messages = [
+        {"role": "user", "content": "Read README"},
+        {
+            "role": "assistant",
+            "content": "Checking README",
+            "tool_calls": [
+                {"id": "tc_json_1", "name": "read_file", "arguments": {"path": "README.md"}},
+            ],
+            "_meta": {
+                "tool_mode": "json",
+                "metadata": {
+                    "gemini": {
+                        "raw_parts": [
+                            {"text": "Checking README\n<<<TOOL_CALL>>>{\"name\":\"read_file\"}<<<END_TOOL_CALL>>>"},
+                        ],
+                    },
+                },
+            },
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "tc_json_1",
+            "name": "read_file",
+            "content": "{\"ok\": true}",
+        },
+        {"role": "user", "content": "Continue"},
+    ]
+    _, contents = GeminiProvider._convert_messages(messages)
+    assert contents[1]["parts"] == [
+        {"text": "Checking README"},
+        {
+            "functionCall": {"name": "read_file", "args": {"path": "README.md"}},
+            "thoughtSignature": "skip_thought_signature_validator",
+        },
+    ]
+    assert contents[2]["parts"] == [
+        {"functionResponse": {"name": "read_file", "response": {"ok": True}}},
+    ]
+

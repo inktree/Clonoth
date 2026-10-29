@@ -66,7 +66,8 @@ engine:
 
   model: ""
 
-  tool_mode: json                   # 全局默认工具模式，节点 yaml 可覆盖 (native | json | fake_native)
+  tool_mode: native                 # 全局默认工具模式，节点 yaml 可覆盖 (native | json | fake_native)
+  output_mode: hybrid
 
 providers:
   openai:
