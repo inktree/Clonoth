@@ -416,11 +416,11 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
         "_meta": {"tool_mode": "native"},
     })
     view = _build_messages_for_provider(str_msgs, formatter, provider)
-    assert view[:len(initial_view)] == initial_view
-    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "user", "assistant", "tool"]
+    assert view[:4] == initial_view[:4]
+    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "assistant", "tool", "user"]
     assert view[3]["content"] == "turn1_q"
-    assert view[4]["content"] == str_msgs[4]["content"]
-    assert view[6]["content"] == "file_body"
+    assert view[5]["content"] == "file_body"
+    assert view[6]["content"] == str_msgs[4]["content"]
     assert str_msgs[4].get("_dynamic") is True
 
     # Block mode with trailing assistant prefill (UAU / UAS): _dynamic must NOT be moved after assistant prefill
