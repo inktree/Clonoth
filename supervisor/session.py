@@ -198,37 +198,14 @@ class SessionMixin:
         )
 
         store = ConversationStore(self.workspace_root / "data" / "conversations")
-        fork_meta: dict[str, Any] = {"copied": 0, "base_count": 0, "base_last_id": ""}
-        try:
-            try:
-                fork_result = store.fork(parent, branch_session_id, include_system=True)
-            except TypeError:
-                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore.fork 签名。
-                # 原因：supervisor 层必须能在 engine store 还未完全升级时通过 py_compile
-                # 和本地运行。做法：手动复制父 session 的全部消息，等价实现 include_system=True。
-                # 目的：不修改 engine 层文件，也能得到 merge 所需的 branch 基准长度。
-                source_messages = list(store.load(parent))
-                if store.message_count(branch_session_id) == 0 and source_messages:
-                    store.append_batch(branch_session_id, source_messages)
-                    fork_result = {
-                        "copied": len(source_messages),
-                        "base_count": len(source_messages),
-                        "base_last_id": getattr(source_messages[-1], "id", "") if source_messages else "",
-                    }
-                else:
-                    branch_count = store.message_count(branch_session_id)
-                    fork_result = {"copied": 0, "base_count": branch_count, "base_last_id": ""}
-            if isinstance(fork_result, dict):
-                fork_meta.update({
-                    "copied": int(fork_result.get("copied") or 0),
-                    "base_count": int(fork_result.get("base_count") or 0),
-                    "base_last_id": str(fork_result.get("base_last_id") or ""),
-                })
-            else:
-                copied = int(fork_result or 0)
-                fork_meta.update({"copied": copied, "base_count": copied})
-        except Exception as exc:
-            fork_meta["error"] = str(exc)
+        parent_messages = list(store.load(parent))
+        if parent_messages:
+            store.append_batch(branch_session_id, parent_messages)
+        fork_meta: dict[str, Any] = {
+            "copied": len(parent_messages),
+            "base_count": len(parent_messages),
+            "base_last_id": parent_messages[-1].id if parent_messages else "",
+        }
 
         self.eventlog.append(
             session_id=parent,
@@ -250,9 +227,10 @@ class SessionMixin:
         branch_session_id: str,
         base_count: int,
         *,
+        base_last_id: str = "",
         event_type: str = "branch_merged",
-    ) -> int:
-        """Incrementally merge an entry branch tail into its parent ConversationStore."""
+    ) -> int | None:
+        """Merge after the fork anchor; return the count, or None on IO failure."""
         from engine.conversation_store import ConversationStore
 
         parent = str(parent_session_id or "").strip()
@@ -262,19 +240,14 @@ class SessionMixin:
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         count = 0
         try:
-            merge_fn = getattr(store, "merge", None)
-            if callable(merge_fn):
-                count = int(merge_fn(parent, branch, base_count=int(base_count or 0)) or 0)
-            else:
-                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore 无 merge 方法的情况。
-                # 原因：本次任务只允许改 supervisor 层，目标树里的 engine store 可能仍是旧版。
-                # 做法：读取 branch 中 fork 基准之后的消息并批量追加到 parent。
-                # 目的：保持新 supervisor 在旧 store 上也能完成分支回写。
-                branch_messages = list(store.load(branch))
-                tail = branch_messages[int(base_count or 0):]
-                if tail:
-                    store.append_batch(parent, tail)
-                count = len(tail)
+            branch_messages = list(store.load(branch))
+            idx = None
+            if base_last_id:
+                idx = next((i for i, message in enumerate(branch_messages) if message.id == base_last_id), None)
+            tail = branch_messages[idx + 1:] if idx is not None else branch_messages[int(base_count or 0):]
+            if tail:
+                store.append_batch(parent, tail)
+            count = len(tail)
         except Exception as exc:
             self.eventlog.append(
                 session_id=parent,
@@ -284,11 +257,12 @@ class SessionMixin:
                     "parent_session_id": parent,
                     "branch_session_id": branch,
                     "base_count": int(base_count or 0),
+                    "base_last_id": base_last_id,
                     "error": str(exc),
                 },
                 transient=True,
             )
-            return 0
+            return None
 
         self.eventlog.append(
             session_id=parent,
@@ -298,6 +272,7 @@ class SessionMixin:
                 "parent_session_id": parent,
                 "branch_session_id": branch,
                 "base_count": int(base_count or 0),
+                "base_last_id": base_last_id,
                 "merged_count": count,
             },
             transient=True,

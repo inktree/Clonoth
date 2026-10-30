@@ -646,3 +646,213 @@ def test_gemini_json_mode_history_rebuilds_function_call_when_switched_to_native
         {"functionResponse": {"name": "read_file", "response": {"ok": True}}},
     ]
 
+
+
+@pytest.fixture
+def branch_anchor_state(tmp_path):
+    from engine.conversation_store import ConversationStore, Message
+    from supervisor.eventlog import EventLog
+    from supervisor.policy import PolicyEngine
+    from supervisor.state import SupervisorState
+
+    state = SupervisorState(
+        workspace_root=tmp_path,
+        eventlog=EventLog(tmp_path / "events.jsonl", run_id="branch-anchor"),
+        policy=PolicyEngine(workspace_root=tmp_path),
+    )
+    parent = state.get_or_create_session(channel="discord_guild", conversation_key="discord:anchor-test")
+    store = ConversationStore(tmp_path / "data" / "conversations")
+    history = [Message(id="system-history", role="system", content="stored system")]
+    history.extend(
+        Message(id=f"history-{i}", role="user", content=f"past task {i}", source_task_id=f"history-task-{i}")
+        for i in range(5)
+    )
+    store.append_batch(parent, history)
+    return state, parent, history
+
+
+def _anchor_store(state):
+    from engine.conversation_store import ConversationStore
+    return ConversationStore(state.workspace_root / "data" / "conversations")
+
+
+def _anchor_task(state, parent, branch, fork_meta):
+    from supervisor.types import Task, TaskKind, TaskStatus
+    now = datetime.now(timezone.utc)
+    task = Task(
+        task_id="anchor-entry", session_id=branch, kind=TaskKind.node, node_id="entry",
+        status=TaskStatus.running, created_at=now, updated_at=now,
+        input={"parent_session_id": parent, "branch_session_id": branch,
+               "base_count": fork_meta["base_count"], "base_last_id": fork_meta["base_last_id"]},
+    )
+    state.tasks[task.task_id] = task
+    return task
+
+
+def _anchor_delta():
+    from engine.conversation_store import Message
+    return [
+        Message(id="turn-user", role="user", source_task_id="anchor-entry",
+                content=[{"type": "text", "text": "current input"},
+                         {"type": "image_url", "image_url": {"url": "https://example.invalid/image.png"}}]),
+        Message(id="turn-assistant", role="assistant", content="checking", source_task_id="anchor-entry",
+                meta={"provider": "test", "metadata": {"signature": "preserve"}},
+                tool_calls=[{"id": "call-current", "type": "function", "function": {"name": "search", "arguments": "{}"}}]),
+        Message(id="turn-tool", role="tool", content="found", source_task_id="anchor-entry",
+                tool_call_id="call-current", name="search"),
+    ]
+
+
+def test_entry_branch_fork_copies_complete_history_and_anchor(branch_anchor_state):
+    state, parent, history = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 901)
+    assert meta == {"copied": len(history), "base_count": len(history), "base_last_id": history[-1].id}
+    assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in history]
+
+
+@pytest.mark.parametrize("shorten_prefix", [False, True])
+def test_branch_anchor_merge_preserves_all_new_messages(branch_anchor_state, shorten_prefix):
+    state, parent, history = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 902)
+    delta = _anchor_delta()
+    store = _anchor_store(state)
+    store.append_batch(branch, delta)
+    if shorten_prefix:
+        # The anchor becomes index zero, while the old base_count exceeds file length.
+        store.replace_all(branch, [history[-1]] + delta)
+    count = state._merge_branch_locked(parent, branch, meta["base_count"], base_last_id=meta["base_last_id"])
+    assert count == len(delta)
+    assert [m.to_dict() for m in _anchor_store(state).load(parent)] == [m.to_dict() for m in history + delta]
+
+
+@pytest.mark.parametrize("anchor", ["", "not-present"])
+def test_branch_anchor_merge_retains_count_fallback(branch_anchor_state, anchor):
+    state, parent, history = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 903)
+    delta = _anchor_delta()
+    _anchor_store(state).append_batch(branch, delta)
+    assert state._merge_branch_locked(parent, branch, meta["base_count"], base_last_id=anchor) == len(delta)
+    assert [m.id for m in _anchor_store(state).load(parent)] == [m.id for m in history + delta]
+
+
+@pytest.mark.parametrize("shorten_prefix", [False, True])
+def test_branch_compact_sync_uses_exact_parent_prefix(branch_anchor_state, shorten_prefix):
+    from engine.conversation_store import Message
+    state, parent, history = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 904)
+    task = _anchor_task(state, parent, branch, meta)
+    delta = _anchor_delta()
+    store = _anchor_store(state)
+    store.append_batch(branch, delta)
+    if shorten_prefix:
+        store.replace_all(branch, [history[-1]] + delta)
+    # A parent-retained record absent from the fork detects count-only prefix reconstruction.
+    new_prefix = [
+        Message(id="canonical-summary", role="user", content="compact summary", message_type="summary",
+                source_task_id="compact_summary", meta={"compressed_task_ids": ["history-task-0"]}),
+        Message(id="parent-other-branch", role="assistant", content="another committed turn", source_task_id="other-entry"),
+    ]
+    store.replace_all(parent, new_prefix)
+    state._sync_compact_to_branches(parent, new_prefix)
+    branch_messages = _anchor_store(state).load(branch)
+    assert [m.to_dict() for m in branch_messages[:len(new_prefix)]] == [m.to_dict() for m in _anchor_store(state).load(parent)]
+    assert [m.to_dict() for m in branch_messages[len(new_prefix):]] == [m.to_dict() for m in delta]
+    assert task.input["base_count"] == len(new_prefix)
+    assert task.input["base_last_id"] == new_prefix[-1].id
+    assert state._merge_branch_locked(parent, branch, task.input["base_count"], base_last_id=task.input["base_last_id"]) == len(delta)
+    assert [m.to_dict() for m in _anchor_store(state).load(parent)] == [m.to_dict() for m in new_prefix + delta]
+
+
+def test_parent_compact_then_branch_finalize_preserves_tail(branch_anchor_state):
+    from supervisor.types import TaskStatus
+    state, parent, _ = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 905)
+    task = _anchor_task(state, parent, branch, meta)
+    delta = _anchor_delta()
+    _anchor_store(state).append_batch(branch, delta)
+    result = state._apply_compact_via_conv_store_locked(parent, "retained history", keep_recent=1, threshold_tokens=0)
+    assert result["after"] < result["before"]
+    prefix = list(_anchor_store(state).load(parent))
+    synced = _anchor_store(state).load(branch)
+    assert [m.to_dict() for m in synced[:len(prefix)]] == [m.to_dict() for m in prefix]
+    assert task.input["base_count"] == len(prefix) and task.input["base_last_id"] == prefix[-1].id
+    task.status = TaskStatus.completed
+    assert state._finalize_branch_task_locked(task, merge=True) == parent
+    assert [m.to_dict() for m in _anchor_store(state).load(parent)] == [m.to_dict() for m in prefix + delta]
+    assert branch not in state.sessions and task.input["_branch_finalized"]
+
+
+def test_branch_checkpoint_advances_anchor_before_finalize(branch_anchor_state):
+    from engine.conversation_store import Message
+    from supervisor.types import TaskStatus
+    state, parent, history = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 906)
+    task = _anchor_task(state, parent, branch, meta)
+    delta = _anchor_delta()
+    _anchor_store(state).replace_all(branch, [history[-1]] + delta)
+    assert state._checkpoint_branch_task_locked(task) == len(delta)
+    assert task.input["base_count"] == meta["base_count"] + len(delta)
+    assert task.input["base_last_id"] == delta[-1].id
+    assert state._checkpoint_branch_task_locked(task) == 0
+    late = Message(id="after-checkpoint", role="assistant", content="late", source_task_id=task.task_id)
+    _anchor_store(state).append(branch, late)
+    assert state._checkpoint_branch_task_locked(task) == 1
+    assert task.input["base_last_id"] == late.id
+    final = Message(id="after-second-checkpoint", role="assistant", content="final", source_task_id=task.task_id)
+    _anchor_store(state).append(branch, final)
+    task.status = TaskStatus.completed
+    assert state._finalize_branch_task_locked(task, merge=True) == parent
+    merged = _anchor_store(state).load(parent)
+    assert [m.id for m in merged] == [m.id for m in history + delta + [late, final]]
+    assert len({m.id for m in merged}) == len(merged)
+
+
+def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state, caplog):
+    from engine.conversation_store import Message
+    state, parent, _ = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 907)
+    task = _anchor_task(state, parent, branch, meta)
+    shortened = [Message(id="replacement-without-anchor", role="user", content="unknown prefix")]
+    store = _anchor_store(state)
+    store.replace_all(branch, shortened)
+    prefix = [Message(id="parent-summary", role="user", content="summary")]
+    state._sync_entry_branch_compact_locked(store, branch, prefix, base_count=meta["base_count"], tasks=[task])
+    assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in shortened]
+    assert task.input["base_last_id"] == meta["base_last_id"]
+    assert "anchor" in caplog.text and "exceeds" in caplog.text
+
+
+def test_branch_merge_io_failure_does_not_finalize(branch_anchor_state, monkeypatch):
+    from engine.conversation_store import ConversationStore
+    from supervisor.types import TaskStatus
+    state, parent, _ = branch_anchor_state
+    branch, meta = state._create_entry_branch_locked(parent, 908)
+    task = _anchor_task(state, parent, branch, meta)
+    _anchor_store(state).append_batch(branch, _anchor_delta())
+
+    def fail_append(self, session_id, messages):
+        raise OSError("parent append failed")
+
+    monkeypatch.setattr(ConversationStore, "append_batch", fail_append)
+    assert state._merge_branch_locked(parent, branch, meta["base_count"], base_last_id=meta["base_last_id"]) is None
+    task.status = TaskStatus.completed
+    assert state._finalize_branch_task_locked(task, merge=True) == parent
+    assert not task.input.get("_branch_finalized") and branch in state.sessions
+
+
+
+def test_empty_parent_branch_sync_keeps_current_turn(branch_anchor_state):
+    from engine.conversation_store import Message
+    state, _, _ = branch_anchor_state
+    parent = state.get_or_create_session(channel="discord_guild", conversation_key="discord:empty-anchor")
+    branch, meta = state._create_entry_branch_locked(parent, 909)
+    assert meta == {"copied": 0, "base_count": 0, "base_last_id": ""}
+    assert _anchor_store(state).load(branch) == []
+    task = _anchor_task(state, parent, branch, meta)
+    delta = _anchor_delta()
+    _anchor_store(state).append_batch(branch, delta)
+    prefix = [Message(id="new-parent-prefix", role="user", content="parent summary", message_type="summary")]
+    _anchor_store(state).replace_all(parent, prefix)
+    state._sync_compact_to_branches(parent, prefix)
+    assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in prefix + delta]
+    assert task.input["base_count"] == 1 and task.input["base_last_id"] == prefix[0].id
