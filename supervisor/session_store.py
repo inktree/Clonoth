@@ -30,7 +30,7 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ._helpers import SessionInfo, _now
 
@@ -268,19 +268,19 @@ class SessionStore:
             self._flush()
 
     def remove_session(self, session_id: str) -> None:
-        """从 sessions.json 中物理删除一个 session 条目。
+        self.remove_sessions((session_id,))
 
-        [AutoC 2026-05-30] Why: branch 和 fresh/fork child session 完成后只标记 reset
-        不删除，导致 sessions.json 无限膨胀（18000+ 条目）。
-        How: 从 registry 中 pop 并 flush。
-        Purpose: 立即释放已完成 branch 和已过期 child 的注册记录。
-        """
-        if session_id in self._registry:
-            entry = self._registry.pop(session_id)
+    def remove_sessions(self, session_ids: Iterable[str]) -> None:
+        """Physically remove sessions with one flush, restoring entries on failure."""
+        removed: dict[str, dict[str, Any]] = {}
+        for sid in session_ids:
+            if sid in self._registry:
+                removed[sid] = self._registry.pop(sid)
+        if removed:
             try:
                 self._flush()
             except Exception:
-                self._registry[session_id] = entry
+                self._registry.update(removed)
                 raise
 
     def on_child_session_created(

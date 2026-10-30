@@ -275,6 +275,7 @@ class SessionMixin:
         # 是 branch。做法：删除 parent_children[branch] 下的所有 JSONL、映射和 registry 标记。
         # 目的：merge 后不会留下只能由已删除 branch 访问的悬挂上下文。
         derived_children = list(self.parent_children.pop(branch, set()))
+        removed_session_ids: list[str] = []
         for child_sid in derived_children:
             if self._is_entry_branch_session_locked(child_sid, parent_session_id=branch):
                 self._cleanup_branch_locked(child_sid)
@@ -288,7 +289,7 @@ class SessionMixin:
             # [AutoC 2026-05-30] Why: branch 派生 child session 在 branch merge 后
             # 不应继续留在 sessions.json。How: 物理删除 registry 条目而不是标记 reset。
             # Purpose: 防止临时 child 记录随 branch 清理后继续堆积。
-            self._session_store.remove_session(child_sid)
+            removed_session_ids.append(child_sid)
 
         # [Fork/Merge 2026-05-12] 删除 branch 前取消仍挂在该运行 session 下的派生任务。
         # 原因：异步 dispatch 可能让 root entry 已结束但 branch 下仍有 pending/running 子任务。
@@ -326,8 +327,9 @@ class SessionMixin:
                 children.discard(branch)
         # [AutoC 2026-05-30] Why: branch merge 完成后应立即从 sessions.json 物理删除，
         # 而不是仅标记 reset，否则注册记录无限堆积。
-        # How: 用 remove_session 代替 on_session_reset。
-        self._session_store.remove_session(branch)
+        # How: 批量删除 branch 与普通 child，统一落盘一次。
+        removed_session_ids.append(branch)
+        self._session_store.remove_sessions(removed_session_ids)
         self.eventlog.append(
             session_id=parent or branch,
             component="supervisor",
