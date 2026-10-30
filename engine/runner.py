@@ -69,12 +69,9 @@ def _provider_init_kwargs(
         fallback_env_url = os.environ.get("GEMINI_BASE_URL", "") if provider_name.startswith("gemini") else ""
         resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or fallback_env_key or api_key
         resolved_base_url = rp.base_url or os.environ.get(f"{env_prefix}_BASE_URL", "") or fallback_env_url or None
-    rp_po = getattr(rp, "provider_options", None)
-    effective_po = (
-        _merge_provider_options(provider_options, rp_po)
-        if isinstance(rp_po, dict) and rp_po
-        else dict(provider_options or {})
-    )
+    effective_po = dict(rp.provider_options or {})
+    if provider_options:
+        effective_po.update(provider_options)
     # Priority for sticky_session: explicit provider_options (session_override > node > runtime)
     # > config.yaml provider section (_provider_sticky_session).
     sticky_cfg = effective_po.get("sticky_session")

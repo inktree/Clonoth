@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from engine.compact import (
     count_real_task_segments,
-    invalidate_stale_usage,
     is_compact_circuit_open,
     is_snipped_message,
-    microcompact_messages,
-    microcompact_store,
     record_compact_failure,
     should_compact,
 )
@@ -156,98 +152,8 @@ def _compact_target_session_id(ls: Any) -> str:
 
 
 async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
-    """Run first-step microcompact and proactive snip cleanup.
-
-    Why: these operations reduce stale context before the next model call. How:
-    copy the old first-iteration logic from ai_step.py into this helper. Purpose:
-    preserve the old trigger timing while keeping CompactChecker readable.
-    """
-    modified = False
-    _messages, cleared = microcompact_messages(ls.messages)
-    if cleared:
-        invalidate_stale_usage(ls.messages)
-        ls.last_prompt_tokens = None
-        logger.info("microcompact: cleared %d tool_results", cleared)
-        modified = True
-        store = getattr(ls.rctx, "conversation_store", None)
-        if store:
-            try:
-                snip_sid = _compact_target_session_id(ls)
-                if snip_sid:
-                    persisted, st_cleared = microcompact_store(store.load(snip_sid))
-                    if st_cleared > 0:
-                        store.replace_all(snip_sid, persisted)
-                branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
-                if branch_sid and branch_sid != snip_sid:
-                    b_persisted, b_cleared = microcompact_store(store.load(branch_sid))
-                    if b_cleared > 0:
-                        store.replace_all(branch_sid, b_persisted)
-            except Exception as mc_err:
-                logger.warning("microcompact persist failed: %s", mc_err)
-
-    try:
-        from engine.task_record import load_task_records, snip_history, snip_store
-
-        last_ts = None
-        for msg in reversed(ls.messages):
-            meta = msg.get("_meta", {})
-            if isinstance(meta, dict) and (meta.get("message_type") == "assistant" or msg.get("role") == "assistant"):
-                ts_str = meta.get("timestamp", "")
-                if ts_str:
-                    try:
-                        last_ts = datetime.fromisoformat(ts_str)
-                        if last_ts.tzinfo is None:
-                            last_ts = last_ts.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
-                break
-        if last_ts is not None:
-            gap_hours = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
-            if gap_hours >= 1.0:
-                proactive_max = max(int(gap_hours) * 2, 2)
-                # [AutoC 2026-05-13] Why: proactive L2 cleanup used to snip the
-                # branch copy when child_session_id/session_id pointed at a fork.
-                # How: use the same parent-first compact target helper as the
-                # threshold path. Purpose: all persisted snips affect the durable
-                # parent session.
-                snip_sid = _compact_target_session_id(ls)
-                snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
-                if snip_records:
-                    snipped, snip_count, snipped_ids = snip_history(
-                        ls.messages,
-                        snip_records,
-                        keep_recent_tasks=3,
-                        max_snip=proactive_max,
-                    )
-                    if snip_count > 0:
-                        invalidate_stale_usage(snipped)
-                        ls.messages = snipped
-                        ls.last_prompt_tokens = None
-                        ctx.messages = ls.messages
-                        store = getattr(ls.rctx, "conversation_store", None)
-                        if store:
-                            try:
-                                persisted = snip_store(store.load(snip_sid), snip_records, snipped_ids)
-                                invalidate_stale_usage(persisted)
-                                store.replace_all(snip_sid, persisted)
-                                branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
-                                if branch_sid and branch_sid != snip_sid:
-                                    branch_persisted = snip_store(store.load(branch_sid), snip_records, snipped_ids)
-                                    invalidate_stale_usage(branch_persisted)
-                                    store.replace_all(branch_sid, branch_persisted)
-                            except Exception as persist_error:
-                                logger.warning("proactive snip persist failed: %s", persist_error)
-                        logger.info(
-                            "proactive snip: replaced %d tasks (gap=%.1fh, max=%d)",
-                            snip_count,
-                            gap_hours,
-                            proactive_max,
-                        )
-                        modified = True
-    except Exception as snip_error:
-        logger.warning("proactive snip failed: %s", snip_error)
-
-    return modified
+    """Idle cleanup hook (microcompact and proactive snip disabled to preserve Prefix KV Cache)."""
+    return False
 
 
 async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
@@ -290,52 +196,6 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                 return None
     except Exception as _seg_err:
         logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
-
-    try:
-        from engine.task_record import (
-            load_task_records,
-            snip_history,
-            snip_store,
-        )
-
-        # [AutoC 2026-05-13] Why: L2 persisted snips must affect the parent
-        # ConversationStore, not an entry branch fork. How: reuse compact_sid for
-        # transcripts and store replacement. Purpose: the next fork starts from
-        # already-snipped durable history.
-        snip_sid = compact_sid
-        snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
-        if snip_records:
-            snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
-            if snip_count > 0:
-                invalidate_stale_usage(snipped)
-                ls.messages = snipped
-                ls.last_prompt_tokens = None
-                ctx.messages = ls.messages
-                store = getattr(ls.rctx, "conversation_store", None)
-                if store:
-                    try:
-                        stored = store.load(snip_sid)
-                        persisted = snip_store(stored, snip_records, snipped_ids)
-                        invalidate_stale_usage(persisted)
-                        store.replace_all(snip_sid, persisted)
-                        branch_sid = str(getattr(ls.rctx, "session_id", "") or "").strip()
-                        if branch_sid and branch_sid != snip_sid:
-                            branch_persisted = snip_store(store.load(branch_sid), snip_records, snipped_ids)
-                            invalidate_stale_usage(branch_persisted)
-                            store.replace_all(branch_sid, branch_persisted)
-                    except Exception as persist_error:
-                        logger.warning("failed to persist snipped history: %s", persist_error)
-                await ls.rctx.emit_event("snip_compact", {
-                    "node_id": ls.node.id,
-                    "step": ctx.step,
-                    "snipped_tasks": snip_count,
-                })
-                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", snip_count)
-                ls.compacted = True
-                ctx.extra["compact_modified"] = True
-                return None
-    except Exception as snip_error:
-        logger.warning("snip compact failed, falling through to LLM compact: %s", snip_error)
 
     ls.compacted = True
     try:

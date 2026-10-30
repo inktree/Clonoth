@@ -170,12 +170,16 @@ class TaskRouterMixin:
             parent_session_id,
             branch_session_id,
             base_count,
+            base_last_id=str(task.input.get("base_last_id") or ""),
             event_type="branch_checkpointed",
         )
         if merged_count is None:
             return 0
         if merged_count > 0:
             task.input["base_count"] = base_count + merged_count
+            from engine.conversation_store import ConversationStore
+            store = ConversationStore(self.workspace_root / "data" / "conversations")
+            task.input["base_last_id"] = store.load(branch_session_id)[-1].id
             task.input["_restart_checkpointed_count"] = (
                 int(task.input.get("_restart_checkpointed_count") or 0) + merged_count
             )
@@ -198,7 +202,10 @@ class TaskRouterMixin:
             task.input["_branch_skipped_merge"] = True
         if not _no_merge:
             base_count = int(task.input.get("base_count") or 0)
-            merged_count = self._merge_branch_locked(parent_session_id, branch_session_id, base_count)
+            merged_count = self._merge_branch_locked(
+                parent_session_id, branch_session_id, base_count,
+                base_last_id=str(task.input.get("base_last_id") or ""),
+            )
             if merged_count is None:
                 return parent_session_id
             # [2026-05-19] Merge branch transcript records into parent transcript.
@@ -1721,7 +1728,7 @@ class TaskRouterMixin:
         # uncompressed copy. How: after the parent rewrite succeeds, mirror a
         # simplified prefix compaction into active branch sessions. Purpose:
         # branch histories stay bounded while preserving branch-local tails.
-        self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
+        self._sync_compact_to_branches(target_session_id, new_messages)
         return result
 
     def _clone_compact_summary_message(self, summary_msg: Message) -> Message:
@@ -1746,7 +1753,7 @@ class TaskRouterMixin:
         )
 
     def _sync_compact_to_branches(
-        self, target_session_id: str, summary_msg: Any, to_keep: list[Any],
+        self, target_session_id: str, new_messages: list[Any],
     ) -> None:
         """Synchronize a successful parent compact into active branch sessions."""
         # [AutoC 2026-05-13] Why: already-forked branch sessions keep the old
@@ -1760,7 +1767,8 @@ class TaskRouterMixin:
         target = str(target_session_id or "").strip()
         if not target:
             return
-        keep_recent = len(to_keep)
+        summary_msg = new_messages[0]
+        keep_recent = len(new_messages) - 1
         store = ConversationStore(self.workspace_root / "data" / "conversations")
 
         entry_branches: dict[str, dict[str, Any]] = {}
@@ -1773,10 +1781,7 @@ class TaskRouterMixin:
             if parent_sid == target and branch_sid:
                 info = entry_branches.setdefault(branch_sid, {"tasks": [], "base_count": 0})
                 info["tasks"].append(task)
-                try:
-                    base_count = int(task.input.get("base_count") or 0)
-                except Exception:
-                    base_count = 0
+                base_count = int(task.input.get("base_count") or 0)
                 if base_count > int(info.get("base_count") or 0):
                     info["base_count"] = base_count
 
@@ -1788,8 +1793,7 @@ class TaskRouterMixin:
             self._sync_entry_branch_compact_locked(
                 store,
                 branch_sid,
-                summary_msg,
-                keep_recent=keep_recent,
+                new_messages,
                 base_count=int(info.get("base_count") or 0),
                 tasks=list(info.get("tasks") or []),
             )
@@ -1806,49 +1810,39 @@ class TaskRouterMixin:
         self,
         store: Any,
         branch_session_id: str,
-        summary_msg: Any,
+        new_messages: list[Any],
         *,
-        keep_recent: int,
         base_count: int,
         tasks: list[Task],
     ) -> None:
-        """Compact the forked parent prefix of one active entry branch."""
-        # [AutoC 2026-05-13] Why: entry branch merge uses base_count to append only
-        # branch-local tail messages back to the parent. How: replace only the
-        # forked prefix with summary + recent prefix messages, then update base_count
-        # on active tasks. Purpose: branch sync cannot lose or duplicate the branch
-        # tail during final merge.
+        """Install the exact parent prefix while preserving the branch-local tail."""
         branch = str(branch_session_id or "").strip()
-        if not branch or base_count <= 0:
+        if not branch:
             return
         try:
             branch_msgs = list(store.load(branch))
-            if len(branch_msgs) < base_count:
+            base_last_id = str(tasks[0].input.get("base_last_id") or "")
+            idx = None
+            if base_last_id:
+                idx = next((i for i, message in enumerate(branch_msgs) if message.id == base_last_id), None)
+            if idx is not None:
+                branch_tail = branch_msgs[idx + 1:]
+            elif len(branch_msgs) >= base_count:
+                branch_tail = branch_msgs[base_count:]
+            else:
                 log.warning(
-                    "compact branch sync skipped for %s: base_count=%d exceeds len=%d",
-                    branch,
-                    base_count,
-                    len(branch_msgs),
+                    "compact branch sync skipped for %s: anchor %s missing and base_count=%d exceeds len=%d",
+                    branch, base_last_id, base_count, len(branch_msgs),
                 )
                 return
-            if base_count <= keep_recent + 1:
-                return
-            branch_prefix = branch_msgs[:base_count]
-            branch_tail = branch_msgs[base_count:]
-            prefix_keep = branch_prefix[-keep_recent:] if keep_recent > 0 else []
-            branch_summary = self._clone_compact_summary_message(summary_msg)
-            new_base = [branch_summary] + prefix_keep
-            store.replace_all(branch, new_base + branch_tail)
+            store.replace_all(branch, list(new_messages) + branch_tail)
             for task in tasks:
-                task.input["base_count"] = len(new_base)
-                task.input["base_last_id"] = prefix_keep[-1].id if prefix_keep else branch_summary.id
+                task.input["base_count"] = len(new_messages)
+                task.input["base_last_id"] = new_messages[-1].id
                 task.updated_at = _now()
             log.info(
-                "compact branch sync: %s base %d → %d, preserved tail=%d",
-                branch,
-                base_count,
-                len(new_base),
-                len(branch_tail),
+                "compact branch sync: %s base %d -> %d, preserved tail=%d",
+                branch, base_count, len(new_messages), len(branch_tail),
             )
         except Exception as exc:
             log.warning("compact branch sync failed for %s: %s", branch, exc)
