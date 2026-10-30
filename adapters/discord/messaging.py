@@ -361,6 +361,8 @@ async def _transcribe_discord_audio_attachments(
     """把 Discord 音频附件转写为文本，并从入站附件中移除已转写音频。"""
     if not attachments or not getattr(rt, "discord_voice_input", True):
         return attachments, [], False
+    if not any(_is_audio_attachment(attachment) for attachment in attachments):
+        return list(attachments), [], False
 
     kept: list[dict[str, Any]] = []
     transcripts: list[str] = []
@@ -517,7 +519,12 @@ def _discord_voice_reply_allowed(rt: Any, input_modality: str, has_tts_segments:
     return bool(has_tts_segments)
 
 
-async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation_key: str) -> Path | None:
+async def _synthesize_discord_tts(
+    rt: Any,
+    segment: dict[str, str],
+    conversation_key: str,
+    client: httpx.AsyncClient,
+) -> Path | None:
     """调用 Supervisor 的统一 TTS 接口，并保留模型为该段指定的合成参数。"""
     spoken = (segment.get("text") or "").strip()
     if not spoken:
@@ -541,10 +548,9 @@ async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation
     if instruction:
         body["instruction"] = instruction
     try:
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            response = await client.post(f"{rt.base_url.rstrip('/')}/v1/audio/synthesize", json=body, headers={"Authorization": f"Bearer {rt.clonoth_client._resolve_admin_token()}"})
-            response.raise_for_status()
-            payload = response.json()
+        response = await client.post(f"{rt.base_url.rstrip('/')}/v1/audio/synthesize", json=body, headers={"Authorization": f"Bearer {rt.clonoth_client._resolve_admin_token()}"})
+        response.raise_for_status()
+        payload = response.json()
     except Exception as exc:
         logger.warning("Discord TTS synthesize failed: %s", exc)
         return None
@@ -558,19 +564,22 @@ async def _synthesize_discord_tts(rt: Any, segment: dict[str, str], conversation
 
 async def _send_discord_tts_segments(rt: Any, channel: Any, conversation_key: str, segments: list[dict[str, str]]) -> bool:
     """逐段合成并发送 Discord 语音附件，返回是否成功落地。"""
+    if not segments:
+        return False
     sent = False
-    for index, segment in enumerate(segments, start=1):
-        path: Path | None = None
-        try:
-            path = await _synthesize_discord_tts(rt, segment, conversation_key)
-            if path is None or not path.exists():
-                continue
-            await channel.send(file=discord.File(str(path), filename=path.name), suppress_embeds=True)
-            sent = True
-        except Exception as exc:
-            logger.warning("send Discord TTS audio failed: segment=%s error=%s", index, exc)
-        finally:
-            _delete_audio_file_quietly(rt, path)
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        for index, segment in enumerate(segments, start=1):
+            path: Path | None = None
+            try:
+                path = await _synthesize_discord_tts(rt, segment, conversation_key, client)
+                if path is None or not path.exists():
+                    continue
+                await channel.send(file=discord.File(str(path), filename=path.name), suppress_embeds=True)
+                sent = True
+            except Exception as exc:
+                logger.warning("send Discord TTS audio failed: segment=%s error=%s", index, exc)
+            finally:
+                _delete_audio_file_quietly(rt, path)
     return sent
 
 

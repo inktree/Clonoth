@@ -218,7 +218,7 @@ class UsageStore:
                 "SELECT * FROM llm_usage_logs WHERE ts >= ? AND ts <= ? ORDER BY ts DESC, id DESC",
                 (start.timestamp() if start else 0, now.timestamp()))]
         overrides = self.get_overrides()
-        pricing = {r["model"]: self.resolve_pricing(r["model"], overrides) for r in rows}
+        pricing = {model: self.resolve_pricing(model, overrides) for model in {r["model"] for r in rows}}
 
         def aggregate(records):
             count = len(records)
