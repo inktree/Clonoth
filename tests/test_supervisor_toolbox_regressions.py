@@ -1,5 +1,10 @@
 """Regression coverage for scheduler isolation and tool metadata/upserts."""
 import asyncio
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -10,7 +15,11 @@ import pytest
 from supervisor import scheduler
 from supervisor.task_router import TaskRouterMixin
 from toolbox.builtins import schedules
-from toolbox.builtins.apply_diff import _find_and_replace
+from toolbox.builtins.apply_diff import _find_and_replace, apply_diff
+from toolbox.builtins.read_file import _read_single_file_sync
+from toolbox.builtins.search_in_files import _do_replace_sync
+from toolbox.context import ToolContext
+from engine.tool_step import result_to_raw
 from toolbox.registry import ToolRegistry
 
 
@@ -616,7 +625,6 @@ def test_delete_session_does_not_report_success_on_history_delete_failure(superv
     assert state.conversation_map["test:delete-failure"] == sid
 
 
-
 def test_parallel_running_task_queries_commit_one_failure(supervisor_state):
     from concurrent.futures import ThreadPoolExecutor
     from supervisor.types import TaskStatus
@@ -681,3 +689,230 @@ def test_delete_session_removes_descendants_before_parent_on_failure(supervisor_
     monkeypatch.setattr(ConversationStore, "delete", delete)
     assert state.delete_session(root)
     assert not {root, child, nested}.intersection(state._session_store._registry)
+
+
+def test_grep_replace_supports_dollar_capture_groups_and_literal_mode(tmp_path: Path) -> None:
+    f1 = tmp_path / "regex_cap.txt"
+    f1.write_text("foo_123 and bar_456", encoding="utf-8")
+    rx1 = re.compile(r"([a-z]+)_(\d+)")
+    res1 = _do_replace_sync(tmp_path, rx1, "$2:$1", "regex_cap.txt", 10, 1_000_000, tmp_path, is_regex=True)
+    assert res1["ok"] is True
+    assert f1.read_text(encoding="utf-8") == "123:foo and 456:bar"
+
+    # Literal mode (is_regex=False): backslashes and $1 in replace_str are kept verbatim
+    f2 = tmp_path / "literal.txt"
+    f2.write_text("hello world", encoding="utf-8")
+    rx2 = re.compile(re.escape("world"))
+    res2 = _do_replace_sync(tmp_path, rx2, r"\\1 $1", "literal.txt", 10, 1_000_000, tmp_path, is_regex=False)
+    assert res2["ok"] is True
+    assert f2.read_text(encoding="utf-8") == r"hello \\1 $1"
+
+
+def test_read_file_oversized_supports_start_line_streaming_and_head_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rf_mod = sys.modules["toolbox.builtins.read_file"]
+
+    # Lower threshold to 2 KB for fast unit testing
+    monkeypatch.setattr(rf_mod, "_MAX_TEXT_FILE_BYTES", 2048)
+    big_file = tmp_path / "big.txt"
+    lines = [f"line_{i:04d}_" + ("x" * 30) for i in range(1, 201)]
+    big_file.write_text("\n".join(lines), encoding="utf-8")
+    assert big_file.stat().st_size > 2048
+
+    # 1. Without startLine/endLine -> 50-line head preview + hint mentioning startLine
+    r_head, mm = _read_single_file_sync(big_file, "big.txt", None, None, tmp_path)
+    assert mm is None
+    assert r_head["success"] is True
+    assert r_head["oversized"] is True
+    assert r_head["startLine"] == 1
+    assert r_head["endLine"] == 50
+    assert "line_0001_" in r_head["content"]
+    assert "line_0050_" in r_head["content"]
+    assert "line_0051_" not in r_head["content"]
+    assert "startLine=51" in r_head["hint"]
+    assert "execute_command" in r_head["hint"]
+
+    # 2. With explicit startLine=120, endLine=130 -> streams lines 120..130 and stops early without scanning to line 200
+    r_mid, _ = _read_single_file_sync(big_file, "big.txt", 120, 130, tmp_path)
+    assert r_mid["success"] is True
+    assert r_mid["oversized"] is True
+    assert r_mid["startLine"] == 120
+    assert r_mid["endLine"] == 130
+    assert r_mid["lineCount"] == 11
+    assert "line_0120_" in r_mid["content"]
+    assert "line_0130_" in r_mid["content"]
+    assert "line_0131_" not in r_mid["content"]
+    assert "startLine=131" in r_mid["hint"]
+
+    # 3. Scan limit guard when startLine exceeds _MAX_OVERSIZED_SCAN_CHARS
+    monkeypatch.setattr(rf_mod, "_MAX_OVERSIZED_SCAN_CHARS", 1000)
+    r_deep, _ = _read_single_file_sync(big_file, "big.txt", 150, 160, tmp_path)
+    assert r_deep["success"] is False
+    assert "streaming scan limit" in r_deep["error"]
+
+
+def test_apply_diff_multi_match_shift_tracks_actual_replaced_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ad_mod = sys.modules["toolbox.builtins.apply_diff"]
+
+    async def _noop_guard(ctx: Any, op: str, params: dict[str, Any]) -> tuple[dict[str, Any], None]:
+        return {}, None
+
+    monkeypatch.setattr(ad_mod, "request_guard", _noop_guard)
+
+    f = tmp_path / "code.py"
+    # "target" appears on line 2 and line 5; "marker" appears on line 3 and line 7
+    f.write_text(
+        "line1\n"
+        "target\n"
+        "marker\n"
+        "line4\n"
+        "target\n"
+        "line6\n"
+        "marker\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        supervisor_url="http://127.0.0.1:1",
+        session_id="s1",
+        run_id="r1",
+        worker_id="w1",
+        workspace_root=tmp_path,
+        http=None,  # type: ignore[arg-type]
+        registry=None,  # type: ignore[arg-type]
+    )
+    # Diff 0 replaces the SECOND "target" (at line 5) with 3 lines (+2 lines shift ONLY after line 5).
+    # Diff 1 targets the FIRST "marker" at original line 3 (which is BEFORE line 5, so its line number is still 3, NOT shifted to 5!).
+    res = asyncio.run(apply_diff(
+        {
+            "path": "code.py",
+            "diffs": [
+                {"search": "target", "replace": "t_a\nt_b\nt_c", "start_line": 5},
+                {"search": "marker", "replace": "FIRST_MARKER", "start_line": 3},
+            ],
+        },
+        ctx,
+    ))
+    assert res["ok"] is True
+    lines = f.read_text(encoding="utf-8").splitlines()
+    # Line 3 ("marker") should be replaced with FIRST_MARKER, while the second "marker" at the end remains "marker"
+    assert lines[2] == "FIRST_MARKER"
+    assert lines[-1] == "marker"
+
+
+@pytest.mark.parametrize("result,spec,expected", [
+    pytest.param(
+        {"_display": {"format": "markdown", "raw": "**ready**"}}, None,
+        ("markdown", "**ready**"), id="display_directive",
+    ),
+    pytest.param(
+        {"answer": 42}, {"result_format": "text"},
+        ("text", "{'answer': 42}"), id="spec_result_format",
+    ),
+    pytest.param(
+        {"data": {"results": [
+            {"success": True, "type": "text", "path": "a.py", "content": "print(1)"},
+            {"success": True, "type": "multimodal", "path": "b.png", "mimeType": "image/png", "size": 12},
+            {"success": True, "type": "binary", "path": "c.bin", "size": 3},
+            {"success": False, "path": "missing", "error": "not found"},
+        ]}}, None,
+        ("text", "── a.py ──\nprint(1)\n── b.png ── [image: image/png, 12 bytes]\n"
+         "── c.bin ── [binary: 3 bytes]\n── missing ── ERROR: not found"),
+        id="read_file_batch",
+    ),
+    pytest.param(
+        {"data": {"results": [{"file": "a.py", "line": 7, "match": "one\ntwo", "context": "before\nafter"}],
+                  "count": 1, "truncated": True}}, None,
+        ("text", "1 results found (truncated):\n\na.py:7 | one\\ntwo\n  before\n  after"),
+        id="search_matches",
+    ),
+    pytest.param(
+        {"data": {"filesModified": 1, "totalReplacements": 2,
+                  "results": [{"file": "a.py", "replacements": 2}]}}, None,
+        ("text", "1 files modified, 2 replacements total\na.py: 2 replacements"),
+        id="search_replace",
+    ),
+    pytest.param(
+        {"data": {"totalFiles": 1, "totalDirs": 1, "results": [
+            {"path": ".", "success": True, "fileCount": 1, "dirCount": 1,
+             "entries": [{"name": "src", "type": "directory"}, {"name": "a.py", "type": "file"}]},
+            {"path": "private", "success": False, "error": "denied", "entries": []},
+        ]}}, None,
+        ("text", "── . ── (1 files, 1 dirs)\n  📁 src/\n  📄 a.py\n\n"
+         "── private ── ERROR: denied\n\nTotal: 1 files, 1 dirs"),
+        id="list_dir_tree",
+    ),
+    pytest.param(
+        {"returncode": 0, "output": "done"}, None,
+        ("text", "returncode=0\ndone"), id="command_output",
+    ),
+    pytest.param(
+        {"data": {"file": "a.py", "diffCount": 1, "appliedCount": 0, "failedCount": 1}}, None,
+        ("text", "apply_diff on a.py: 0 applied, 1 rejected"), id="apply_diff_summary",
+    ),
+    pytest.param(
+        {"ok": True, "path": "a.py", "bytes": 0}, None,
+        ("text", "File written: a.py"), id="write_file_summary",
+    ),
+    pytest.param(
+        {"result": {"content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "path": "data/pic.png"},
+            {"type": "resource", "resource": {"uri": "file:///a.py"}},
+        ]}}, None,
+        ("text", "hello\n[image: data/pic.png]\n[resource: file:///a.py]"), id="mcp_content_parts",
+    ),
+    pytest.param(
+        {"data": {"attachments": [{"path": "data/pic.png"}], "description": "  produced  "},
+         "attachments": ["data/pic.png", {"path": "data/sound.wav"}], "message": "secondary"}, None,
+        ("text", "produced\nAttachments:\n- data/pic.png\n- data/sound.wav"), id="attachment_result",
+    ),
+    pytest.param(
+        {"text": "first", "description": "second"}, None,
+        ("text", "first"), id="primary_text_result",
+    ),
+    ({'text': '', 'message': 'not selected'}, None, ('text', '')),
+    ({'_display': '', 'text': 'not selected'}, None, ('text', '')),
+    ({'data': {'results': [], 'count': 0, 'truncated': False}}, None, ('text', '0 results found:')),
+    ({'data': {'results': [], 'totalFiles': 0, 'totalDirs': 0}}, None, ('text', 'Total: 0 files, 0 dirs')),
+    ({'returncode': 0, 'output': ''}, None, ('text', 'returncode=0\n')),
+    ({'data': {'filesModified': 0, 'totalReplacements': 0}}, None, ('text', '0 files modified, 0 replacements total')),
+    ({'content': [{'type': 'text', 'text': ''}]}, None, ('text', '')),
+    ({'_format': 'command_output', 'returncode': 2, 'output': 'bad'}, None, ('text', 'returncode=2\nbad')),
+    ({'_format': 'text', 'message': 'hello'}, None, ('text', 'hello')),
+    ({'_display': {'text': 'hello', 'format': 'html'}}, None, ('html', 'hello')),
+    ({'_display': {'raw': '', 'text': 'not selected'}}, None, ('text', '')),
+    ({'_format': 'missing', 'text': 'fallback'}, None, ('text', 'fallback')),
+    ({'data': {'path': 'old.txt'}}, None, ('text', 'File written: old.txt')),
+    ({'data': {'path': 'old.txt', 'applied': 2, 'rejected': 0}}, None, ('text', 'apply_diff on old.txt: 2 applied, 0 rejected')),
+    ({'content': [{'type': 'image', 'mime_type': 'image/png', 'data': 'abcd'}]}, None, ('text', '[image: image/png, 4 base64 chars]')),
+    (None, {"result_format": 'text'}, ('text', 'None')),
+    ([1, 2], {"result_format": 'text'}, ('text', '[1, 2]')),
+    ([1, 2], {"result_format": 'json'}, ('json', '[\n  1,\n  2\n]')),
+    ({'returncode': 0, 'output': 'done'}, {"result_format": 'command_output'}, ('text', 'returncode=0\ndone')),
+    ({'text': 'fallback'}, {"result_format": 'missing'}, ('text', 'fallback')),
+    ({"_format": "json", "text": "do not use plain text"}, None, ("json", json.dumps({"_format": "json", "text": "do not use plain text"}, ensure_ascii=False, indent=2))),
+    ({"_format": "json", "text": "do not use plain text"}, {"result_format": "text"}, ("json", json.dumps({"_format": "json", "text": "do not use plain text"}, ensure_ascii=False, indent=2))),
+    ({"data": {"result": "canonical result"}, "_display": "other text", "_format": "json"}, {"result_format": "json"}, ("text", "canonical result")),
+    ({"data": {"result": ""}, "_display": "other text", "_format": "json"}, {"result_format": "json"}, ("text", "")),
+    ({"content": [{"type": "resource", "resource": {"text": "hello"}}]}, None, ("text", json.dumps({"type": "resource", "resource": {"text": "hello"}}, ensure_ascii=False, indent=2))),
+])
+def test_default_formatter_outputs(result, spec, expected):
+    assert result_to_raw("external_tool", result, tool_spec=spec) == expected
+
+
+@pytest.mark.parametrize("result", [
+    {'data': {'results': []}},
+    {'content': []},
+    {'data': {'path': 'a.py', 'unrelated': True}},
+    {'ok': False, 'path': 'a.py', 'bytes': 1},
+    {'data': {'results': [{'file': 'a.py', 'line': 1}], 'count': 1, 'truncated': False}},
+    {'data': {'results': [{'entries': [{'name': 'x', 'type': 'unknown'}]}], 'totalFiles': 0, 'totalDirs': 0}},
+    {'content': [{'type': 'unrecognized', 'text': 'not a supported MCP part'}]},
+    {'data': {'results': [{'success': True, 'path': 'a.py', 'type': []}]}},
+    {'content': [{'type': []}]},
+    {'data': {'results': [{'entries': [{'name': 'x', 'type': []}]}], 'totalFiles': 0, 'totalDirs': 0}},
+    'plain',
+])
+def test_unrecognized_structures_fall_back_to_json(result):
+    format_, text = result_to_raw("external_tool", result)
+    assert format_ == "json"
+    assert json.loads(text) == result
