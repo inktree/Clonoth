@@ -1,5 +1,9 @@
 """Regression coverage for scheduler isolation and tool metadata/upserts."""
 import asyncio
+import re
+import sys
+from pathlib import Path
+from typing import Any
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -10,7 +14,10 @@ import pytest
 from supervisor import scheduler
 from supervisor.task_router import TaskRouterMixin
 from toolbox.builtins import schedules
-from toolbox.builtins.apply_diff import _find_and_replace
+from toolbox.builtins.apply_diff import apply_diff, _find_and_replace
+from toolbox.builtins.read_file import _read_single_file_sync
+from toolbox.builtins.search_in_files import _do_replace_sync
+from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
 
@@ -362,3 +369,97 @@ def test_manage_schedule_and_tool_wrappers_preserve_crud_and_metadata(tmp_path, 
     assert reg.get_spec("example")["pure"] is True
     assert reg.get_spec("example")["async_mode"] is True
     assert asyncio.run(manage_tool({"action": "reload"}, ctx))["ok"]
+
+
+def test_grep_replace_supports_dollar_capture_groups_and_literal_mode(tmp_path: Path) -> None:
+    f1 = tmp_path / "regex_cap.txt"
+    f1.write_text("foo_123 and bar_456", encoding="utf-8")
+    rx1 = re.compile(r"([a-z]+)_(\d+)")
+    res1 = _do_replace_sync(tmp_path, rx1, "$2:$1", "regex_cap.txt", 10, 1_000_000, tmp_path, is_regex=True)
+    assert res1["ok"] is True
+    assert f1.read_text(encoding="utf-8") == "123:foo and 456:bar"
+
+    f2 = tmp_path / "literal.txt"
+    f2.write_text("hello world", encoding="utf-8")
+    rx2 = re.compile(re.escape("world"))
+    res2 = _do_replace_sync(tmp_path, rx2, r"\\1 $1", "literal.txt", 10, 1_000_000, tmp_path, is_regex=False)
+    assert res2["ok"] is True
+    assert f2.read_text(encoding="utf-8") == r"hello \\1 $1"
+
+
+def test_read_file_oversized_supports_start_line_streaming_and_head_preview(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rf_mod = sys.modules["toolbox.builtins.read_file"]
+
+    monkeypatch.setattr(rf_mod, "_MAX_TEXT_FILE_BYTES", 2048)
+    big_file = tmp_path / "big.txt"
+    lines = [f"line_{i:04d}_" + ("x" * 30) for i in range(1, 201)]
+    big_file.write_text("\n".join(lines), encoding="utf-8")
+    assert big_file.stat().st_size > 2048
+
+    r_head, mm = _read_single_file_sync(big_file, "big.txt", None, None, tmp_path)
+    assert mm is None
+    assert r_head["success"] is True
+    assert r_head["oversized"] is True
+    assert r_head["startLine"] == 1
+    assert r_head["endLine"] == 50
+    assert "line_0001_" in r_head["content"]
+    assert "line_0050_" in r_head["content"]
+    assert "line_0051_" not in r_head["content"]
+
+    r_mid, _ = _read_single_file_sync(big_file, "big.txt", 120, 130, tmp_path)
+    assert r_mid["success"] is True
+    assert r_mid["oversized"] is True
+    assert r_mid["startLine"] == 120
+    assert r_mid["endLine"] == 130
+    assert r_mid["lineCount"] == 11
+    assert "line_0120_" in r_mid["content"]
+    assert "line_0130_" in r_mid["content"]
+    assert "line_0131_" not in r_mid["content"]
+
+    monkeypatch.setattr(rf_mod, "_MAX_OVERSIZED_SCAN_CHARS", 1000)
+    r_deep, _ = _read_single_file_sync(big_file, "big.txt", 150, 160, tmp_path)
+    assert r_deep["success"] is False
+
+
+def test_apply_diff_multi_match_shift_tracks_actual_replaced_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ad_mod = sys.modules["toolbox.builtins.apply_diff"]
+
+    async def _noop_guard(ctx: Any, op: str, params: dict[str, Any]) -> tuple[dict[str, Any], None]:
+        return {}, None
+
+    monkeypatch.setattr(ad_mod, "request_guard", _noop_guard)
+
+    f = tmp_path / "code.py"
+    f.write_text(
+        "line1\n"
+        "target\n"
+        "marker\n"
+        "line4\n"
+        "target\n"
+        "line6\n"
+        "marker\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(
+        supervisor_url="http://127.0.0.1:1",
+        session_id="s1",
+        run_id="r1",
+        worker_id="w1",
+        workspace_root=tmp_path,
+        http=None,  # type: ignore[arg-type]
+        registry=None,  # type: ignore[arg-type]
+    )
+    res = asyncio.run(apply_diff(
+        {
+            "path": "code.py",
+            "diffs": [
+                {"search": "target", "replace": "t_a\nt_b\nt_c", "start_line": 5},
+                {"search": "marker", "replace": "FIRST_MARKER", "start_line": 3},
+            ],
+        },
+        ctx,
+    ))
+    assert res["ok"] is True
+    lines = f.read_text(encoding="utf-8").splitlines()
+    assert lines[2] == "FIRST_MARKER"
+    assert lines[-1] == "marker"

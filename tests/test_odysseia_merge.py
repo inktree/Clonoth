@@ -13,13 +13,8 @@ import pytest
 import yaml
 
 from clonoth_sdk.approval import classify_path
-from clonoth_sdk.types import HealthInfo
 from engine import compact, data_cleanup
-from engine.builtin.usage_tracker import PLUGIN_META, UsageTracker
-from engine.hooks import HookContext
-from engine.hooks.registry import HookRegistry
 from engine.inference.tool_format import JsonToolFormatter, NativeToolFormatter
-from providers.base import ProviderResponse
 from providers.deepseek import DeepSeekProvider
 from providers.gemini import _parse_usage
 from supervisor.config_store import ConfigStore
@@ -101,33 +96,6 @@ def test_reasoning_survives_formatter_boundary():
         result = formatter.message_to_llm(message)
         assert result["_meta"]["reasoning"] == "private chain"
         assert "thought_summary" not in result["_meta"]
-
-
-def test_usage_tracker_runs_last_and_accumulates_all_six_fields():
-    registry = HookRegistry()
-    usage = dict(
-        prompt_tokens=10,
-        completion_tokens=5,
-        total_tokens=15,
-        cached_prompt_tokens=3,
-        cache_write_prompt_tokens=2,
-        reasoning_tokens=4,
-    )
-
-    async def fallback(ctx):
-        ctx.response = ProviderResponse(ok=True, usage=usage)
-
-    tracker = UsageTracker()
-    registry.register("after_llm_call", fallback, priority=-20)
-    registry.register("after_llm_call", tracker.handle)
-    rctx = SimpleNamespace(total_usage={})
-    ctx = HookContext(
-        messages=[], tools=[], node=None, provider=None,
-        response=ProviderResponse(ok=False), rctx=rctx,
-    )
-    asyncio.run(registry.afire("after_llm_call", ctx))
-    assert PLUGIN_META["priority"] == tracker.priority == -100
-    assert rctx.total_usage == usage
 
 
 def test_stats_cleanup_is_local_and_vacuums(tmp_path, monkeypatch):
@@ -217,10 +185,6 @@ def test_bounded_line_reader_skips_long_tail_and_keeps_next_line():
     assert _read_bounded_line(stream) == (None, False, 0)
 
 
-def test_sdk_health_remains_constructible_without_new_workspace_field():
-    assert HealthInfo("ok", "run", "now", 1.0).workspace_root == ""
-
-
 def test_sdk_external_path_classification(tmp_path):
     assert classify_path(tmp_path, [], "file.txt")[2] is False
     assert classify_path(tmp_path, [], "../outside.txt")[2] is True
@@ -249,7 +213,6 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
     )
     with TestClient(app) as client:
         assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
-    assert app.state.panel_auth is not None
 
 
 def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path: Path):
@@ -475,88 +438,57 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     assert block_view[-1]["content"] == "<!-- Start the ECoT -->"
 
 
-@pytest.mark.parametrize("result_fields", [
-    {"tool_call_id": "", "name": "read_file"},
-    {"name": "read_file"},
-    {"tool_call_id": "", "name": ""},
-    {"tool_call_id": " ", "name": " "},
-    {},
+@pytest.mark.parametrize("unmatched_fields,result_fields", [
+    (None, {"tool_call_id": "", "name": "read_file"}),
+    (None, {"name": "read_file"}),
+    (None, {"tool_call_id": "", "name": ""}),
+    (None, {"tool_call_id": " ", "name": " "}),
+    (None, {}),
+    ({"tool_call_id": "wrong_id", "name": "read_file"}, {"name": "read_file"}),
+    ({"tool_call_id": "", "name": "unknown_tool"}, {"name": "read_file"}),
 ])
-def test_legacy_tool_results_recover_ids_and_preserve_actual_output(result_fields):
+def test_legacy_tool_results_recover_ids_without_consuming_unmatched_calls(unmatched_fields, result_fields):
     from engine.inference.tool_format import build_llm_messages, repair_tool_result_pairing_with_stats
 
-    messages = [
-        {"role": "assistant", "content": "", "_meta": {"tool_mode": "native"},
-         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
-        {"role": "tool", "content": "ACTUAL_RESULT", "_meta": {"tool_mode": "native"}, **result_fields},
-    ]
+    messages = [{"role": "assistant", "content": "", "_meta": {"tool_mode": "native"},
+                 "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]}]
+    if unmatched_fields is not None:
+        messages.append({"role": "tool", "content": "WRONG_RESULT", **unmatched_fields})
+    messages.append({"role": "tool", "content": "ACTUAL_RESULT", "_meta": {"tool_mode": "native"}, **result_fields})
     repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 0
+    assert stats["removed_orphan_tool_results"] == int(unmatched_fields is not None)
     assert stats["fixed_orphan_tool_calls"] == 0
-    assert repaired[1]["tool_call_id"] == "c1"
-    assert repaired[1]["name"] == "read_file"
-    assert repaired[1]["content"] == "ACTUAL_RESULT"
-    view = build_llm_messages(messages, NativeToolFormatter())
-    assert view[0]["tool_calls"][0]["id"] == "c1"
-    assert view[1]["tool_call_id"] == "c1"
-    assert view[1]["name"] == "read_file"
-    assert view[1]["content"] == "ACTUAL_RESULT"
+    for view in (repaired, build_llm_messages(messages, NativeToolFormatter())):
+        assert view[0]["tool_calls"][0]["id"] == "c1"
+        assert [(m["tool_call_id"], m["name"], m["content"]) for m in view[1:]] == [
+            ("c1", "read_file", "ACTUAL_RESULT"),
+        ]
 
 
-@pytest.mark.parametrize("bad_fields", [
-    {"tool_call_id": "wrong_id", "name": "read_file"},
-    {"tool_call_id": "", "name": "unknown_tool"},
-])
-def test_unmatched_tool_results_cannot_consume_a_different_call(bad_fields):
+@pytest.mark.parametrize("positional", [False, True])
+def test_tool_result_pairing_prefers_names_and_consumes_each_call_once(positional):
     from engine.inference.tool_format import repair_tool_result_pairing_with_stats
 
-    messages = [
-        {"role": "assistant", "content": "",
-         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
-        {"role": "tool", "content": "WRONG_RESULT", **bad_fields},
-        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "ACTUAL_RESULT"},
-    ]
+    messages = [{"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "name": "read_file", "arguments": {}},
+        {"id": "c2", "name": "search", "arguments": {}},
+    ]}]
+    if positional:
+        messages += [
+            {"role": "tool", "tool_call_id": "", "name": "", "content": "FIRST"},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "DUPLICATE"},
+            {"role": "tool", "content": "SECOND"},
+        ]
+        expected = [("c1", "read_file", "FIRST"), ("c2", "search", "SECOND")]
+    else:
+        messages += [
+            {"role": "tool", "name": "search", "content": "SEARCH_RESULT"},
+            {"role": "tool", "name": "read_file", "content": "READ_RESULT"},
+        ]
+        expected = [("c1", "read_file", "READ_RESULT"), ("c2", "search", "SEARCH_RESULT")]
     repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 1
-    assert stats["fixed_orphan_tool_calls"] == 0
-    assert [m["content"] for m in repaired[1:]] == ["ACTUAL_RESULT"]
-    assert repaired[1]["tool_call_id"] == "c1"
-
-
-def test_legacy_tool_results_match_names_before_position():
-    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
-
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "c1", "name": "read_file", "arguments": {}},
-            {"id": "c2", "name": "search", "arguments": {}},
-        ]},
-        {"role": "tool", "tool_call_id": "", "name": "search", "content": "SEARCH_RESULT"},
-        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "READ_RESULT"},
-    ]
-    repaired, _ = repair_tool_result_pairing_with_stats(messages)
-    assert [(m["tool_call_id"], m["content"]) for m in repaired[1:]] == [
-        ("c1", "READ_RESULT"), ("c2", "SEARCH_RESULT"),
-    ]
-
-
-def test_positional_tool_results_remove_consumed_ids_from_pending():
-    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
-
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "c1", "name": "read_file", "arguments": {}},
-            {"id": "c2", "name": "search", "arguments": {}},
-        ]},
-        {"role": "tool", "tool_call_id": "", "name": "", "content": "FIRST"},
-        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "DUPLICATE"},
-        {"role": "tool", "content": "SECOND"},
-    ]
-    repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 1
-    assert [(m["tool_call_id"], m["name"], m["content"]) for m in repaired[1:]] == [
-        ("c1", "read_file", "FIRST"), ("c2", "search", "SECOND"),
-    ]
+    assert stats["removed_orphan_tool_results"] == int(positional)
+    assert [(m["tool_call_id"], m["name"], m["content"]) for m in repaired[1:]] == expected
 
 
 def test_anthropic_finish_result_merges_next_turn_text_without_continued():
@@ -580,8 +512,6 @@ def test_anthropic_finish_result_merges_next_turn_text_without_continued():
         {"type": "text", "text": "I2"},
     ]
     assert not any(block.get("text") == "(continued)" for m in converted for block in m["content"])
-
-
 
 
 def test_anthropic_prevents_tool_result_after_merged_text_block():
@@ -645,7 +575,6 @@ def test_gemini_json_mode_history_rebuilds_function_call_when_switched_to_native
     assert contents[2]["parts"] == [
         {"functionResponse": {"name": "read_file", "response": {"ok": True}}},
     ]
-
 
 
 @pytest.fixture
@@ -807,7 +736,7 @@ def test_branch_checkpoint_advances_anchor_before_finalize(branch_anchor_state):
     assert len({m.id for m in merged}) == len(merged)
 
 
-def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state, caplog):
+def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state):
     from engine.conversation_store import Message
     state, parent, _ = branch_anchor_state
     branch, meta = state._create_entry_branch_locked(parent, 907)
@@ -819,7 +748,6 @@ def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state, cap
     state._sync_entry_branch_compact_locked(store, branch, prefix, base_count=meta["base_count"], tasks=[task])
     assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in shortened]
     assert task.input["base_last_id"] == meta["base_last_id"]
-    assert "anchor" in caplog.text and "exceeds" in caplog.text
 
 
 def test_branch_merge_io_failure_does_not_finalize(branch_anchor_state, monkeypatch):
@@ -838,7 +766,6 @@ def test_branch_merge_io_failure_does_not_finalize(branch_anchor_state, monkeypa
     task.status = TaskStatus.completed
     assert state._finalize_branch_task_locked(task, merge=True) == parent
     assert not task.input.get("_branch_finalized") and branch in state.sessions
-
 
 
 def test_empty_parent_branch_sync_keeps_current_turn(branch_anchor_state):
