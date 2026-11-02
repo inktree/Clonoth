@@ -237,7 +237,12 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
             })
             # P0 Task 内核化：记录工具调用摘要
             _args_str = str(tc.arguments or {})[:200]
-            ls.rctx.tool_call_log.append({"name": tc.name, "legacy_name": resolve_legacy_action_alias(tc.name, tc.arguments or {}) or "", "args_summary": _args_str})
+            _cons_name, _eff_act = resolve_effective_action(tc.name, tc.arguments or {})
+            ls.rctx.tool_call_log.append({
+                "name": tc.name,
+                "action": f"{_cons_name}:{_eff_act}" if _eff_act else _cons_name,
+                "args_summary": _args_str,
+            })
 
     # 将 LLM 的工具调用决策追加到对话历史
     _assistant_msg = ls.formatter.build_assistant_message(resp, resp.text or "", resp.tool_calls)
