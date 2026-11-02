@@ -25,30 +25,12 @@ import logging
 from typing import Any
 
 from engine.hooks.types import Handler, HookContext, HookResult
+from engine.inference.pseudo_tools import resolve_effective_action
 
 log = logging.getLogger(__name__)
 
 _SYSTEM_NODES = frozenset({"system.dream", "system.memory_extractor"})
 _ROUTABLE_TOOLS = frozenset({"manage_memory", "save_memory", "delete_memory", "list_memories"})
-
-
-def _resolve_memory_tool_action(tool_name: str, tool_args: dict[str, Any]) -> str:
-    if tool_name == "save_memory":
-        return "upsert"
-    if tool_name == "delete_memory":
-        return "delete"
-    if tool_name == "list_memories":
-        return "list"
-    act = str(tool_args.get("action") or "").strip().lower()
-    if not act:
-        return "upsert" if tool_args.get("content") is not None else "list"
-    if act in ("save", "create", "update"):
-        return "upsert"
-    if act in ("get", "read"):
-        return "list"
-    if act == "remove":
-        return "delete"
-    return act
 
 
 class DreamMemoryRouter(Handler):
@@ -62,7 +44,7 @@ class DreamMemoryRouter(Handler):
         node = ctx.node
         if node is None:
             return None
-        node_id = str(getattr(node, "id", "") or "").strip()
+        node_id = str(node.id or "").strip()
         if node_id not in _SYSTEM_NODES:
             return None
 
@@ -70,7 +52,7 @@ class DreamMemoryRouter(Handler):
         tool_call = ctx.tool_call
         if tool_call is None:
             return None
-        tool_name = str(getattr(tool_call, "name", "") or "").strip()
+        tool_name = str(tool_call.name or "").strip()
         if tool_name not in _ROUTABLE_TOOLS:
             return None
 
@@ -83,14 +65,14 @@ class DreamMemoryRouter(Handler):
         rctx = ctx.rctx
         if rctx is None:
             return None
-        task_context = getattr(rctx, "task_context", None) or {}
+        task_context = rctx.task_context or {}
 
         # --- Route resolution ---
         target_ns = ""
         target_ws = ""
 
         # Mode 1: Dream route table (supports exact 'book/id' key and book key)
-        eff_action = _resolve_memory_tool_action(tool_name, tool_args)
+        _, eff_action = resolve_effective_action(tool_name, tool_args)
         memory_route: dict[str, Any] = task_context.get("_memory_route") or {}
         if memory_route:
             book = str(tool_args.get("book") or "default").strip()

@@ -675,25 +675,6 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return result
 
 
-_LEGACY_TO_CONSOLIDATED: dict[str, str] = {
-    "read_image": "read_media",
-    "read_video": "read_media",
-    "list_schedules": "manage_schedule",
-    "create_schedule": "manage_schedule",
-    "delete_schedule": "manage_schedule",
-    "list_mcp_clients": "manage_mcp_client",
-    "create_or_update_mcp_client": "manage_mcp_client",
-    "delete_mcp_client": "manage_mcp_client",
-    "list_skills": "manage_skill",
-    "create_or_update_skill": "manage_skill",
-    "delete_skill": "manage_skill",
-    "list_memories": "manage_memory",
-    "save_memory": "manage_memory",
-    "delete_memory": "manage_memory",
-    "create_or_update_tool": "manage_tool",
-    "reload_tools": "manage_tool",
-}
-
 _LEGACY_TO_CONSOLIDATED_ACTION: dict[str, tuple[str, str]] = {
     "list_schedules": ("manage_schedule", "list"),
     "create_schedule": ("manage_schedule", "upsert"),
@@ -709,6 +690,12 @@ _LEGACY_TO_CONSOLIDATED_ACTION: dict[str, tuple[str, str]] = {
     "delete_memory": ("manage_memory", "delete"),
     "create_or_update_tool": ("manage_tool", "upsert"),
     "reload_tools": ("manage_tool", "reload"),
+}
+
+_LEGACY_TO_CONSOLIDATED: dict[str, str] = {
+    "read_image": "read_media",
+    "read_video": "read_media",
+    **{k: v[0] for k, v in _LEGACY_TO_CONSOLIDATED_ACTION.items()},
 }
 
 
@@ -743,14 +730,6 @@ def resolve_effective_action(tool_name: str, args: dict[str, Any] | None = None)
         elif act == "remove":
             act = "delete"
         return cons_name, act
-    if cons_name == "manage_memory":
-        if not act:
-            act = "upsert" if a.get("content") is not None else "list"
-        elif act in ("save", "create", "update"):
-            act = "upsert"
-        elif act == "remove":
-            act = "delete"
-        return cons_name, act
     if cons_name == "manage_schedule":
         if not act:
             act = "upsert" if (a.get("id") and any(a.get(k) is not None for k in ("cron", "text", "command", "type", "enabled", "once"))) else "list"
@@ -780,15 +759,6 @@ def resolve_effective_action(tool_name: str, args: dict[str, Any] | None = None)
     if act:
         return cons_name, act
     return cons_name, None
-
-
-def resolve_legacy_action_alias(tool_name: str, args: dict[str, Any] | None = None) -> str | None:
-    """Map a consolidated tool call (name + arguments) to its specific legacy tool name if applicable."""
-    cons_name, act = resolve_effective_action(tool_name, args)
-    for leg, (c_name, c_act) in _LEGACY_TO_CONSOLIDATED_ACTION.items():
-        if c_name == cons_name and c_act == act:
-            return leg
-    return None
 
 
 def _parse_node_action_rules(node: "Node") -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
