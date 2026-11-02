@@ -123,6 +123,7 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"name": "delete_mcp_client", "decision": "auto", "reason": "内部 write_file 审批 data/mcp_clients.yaml"},
                 {"name": "manage_mcp_client", "decision": "auto", "reason": "list只读，upsert/delete内部 write_file 审批 data/mcp_clients.yaml"},
                 {"name": "manage_tool", "decision": "auto", "reason": "reload只读，upsert内部 write_file 审批 tools/**"},
+                {"name": "search_web", "decision": "auto", "reason": "只读网页搜索与正文抓取"},
                 {"name": "read_media", "decision": "auto", "reason": "只读媒体分析"},
                 {"name": "read_image", "decision": "auto", "reason": "只读图像分析"},
                 {"name": "read_video", "decision": "auto", "reason": "只读视频分析"},
