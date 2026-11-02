@@ -916,3 +916,153 @@ def test_unrecognized_structures_fall_back_to_json(result):
     format_, text = result_to_raw("external_tool", result)
     assert format_ == "json"
     assert json.loads(text) == result
+
+
+@pytest.mark.parametrize("mode,allow,deny,expected", [
+    ("all", [], ["manage_memory:!list"], ["list"]),
+    ("allowlist", ["manage_memory:list"], [], ["list"]),
+    ("allowlist", ["manage_memory:!upsert,delete"], [], ["list"]),
+    ("allowlist", ["list_memories"], [], ["list"]),
+    ("all", [], ["save_memory", "delete_memory"], ["list"]),
+    ("all", [], ["manage_memory:delete"], ["list", "upsert"]),
+    ("allowlist", ["manage_memory"], ["delete_memory"], ["list", "upsert"]),
+])
+def test_manage_memory_action_permissions_prune_schema_and_enforce_synonyms(mode, allow, deny, expected):
+    import copy
+    from engine.builtin.knowledge_inject import PLUGIN_META
+    from engine.inference.ai_step import _is_pure_tool_call
+    from engine.inference.pseudo_tools import build_node_tool_specs, is_tool_action_allowed
+    from engine.node import Node, ToolAccess
+
+    spec = next(spec for spec in PLUGIN_META["tools"] if spec["name"] == "manage_memory")
+    original = copy.deepcopy(spec["input_schema"])
+    node = Node(id="reader", type="ai", control_tools="none", tool_access=ToolAccess(
+        mode=mode, allow=allow, deny=deny,
+    ))
+    allowed_names, visible = build_node_tool_specs(registry=SimpleNamespace(list_specs=lambda: [spec]), node=node)
+    assert "manage_memory" in allowed_names
+    assert visible[0]["function"]["parameters"]["properties"]["action"]["enum"] == expected
+    assert spec["input_schema"] == original
+    for action, canonical in [("list", "list"), ("get", "list"), ("read", "list"),
+                              ("upsert", "upsert"), ("save", "upsert"), ("create", "upsert"),
+                              ("update", "upsert"), ("delete", "delete"), ("remove", "delete")]:
+        assert is_tool_action_allowed(node, "manage_memory", {"action": action}) == (canonical in expected)
+    assert is_tool_action_allowed(node, "manage_memory", {}) == ("list" in expected)
+    assert is_tool_action_allowed(node, "manage_memory", {"content": "write"}) == ("upsert" in expected)
+    for legacy, action in [("list_memories", "list"), ("save_memory", "upsert"), ("delete_memory", "delete")]:
+        assert is_tool_action_allowed(node, legacy, {}) == (action in expected)
+    assert _is_pure_tool_call("manage_memory", {"action": "list"}, spec)
+    assert _is_pure_tool_call("manage_memory", {}, spec)
+    assert not _is_pure_tool_call("manage_memory", {"action": "delete"}, spec)
+    assert not _is_pure_tool_call("manage_memory", {"content": "write"}, spec)
+    assert _is_pure_tool_call("read_file", {}, None)
+    assert _is_pure_tool_call("custom_reader", {}, {"pure": True})
+
+
+@pytest.mark.parametrize("prompt,estimate,threshold,source,effective", [
+    (80000, 12000, 160000, "provider_reported", 80000),
+    (0, 40000, 100000, "char_estimate", 40000),
+    (-1, 200000, 160000, "char_estimate", 200000),
+])
+def test_get_context_window_exposes_token_metrics_and_does_not_limit_calls(tmp_path, monkeypatch, prompt, estimate, threshold, source, effective):
+    from toolbox.builtins import tasks
+    import httpx
+
+    cfg = {} if threshold == 160000 else {"engine": {"compact": {"threshold_tokens": threshold}}}
+    monkeypatch.setattr(tasks, "load_runtime_config", lambda root: cfg)
+    urls = []
+    def respond(request):
+        urls.append(str(request.url))
+        return httpx.Response(200, json={"prompt_tokens": prompt, "estimated_tokens": estimate, "message_count": 12})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            ctx = SimpleNamespace(http=http, supervisor_url="http://supervisor", workspace_root=tmp_path,
+                                  route_session_id=lambda: "parent", task_id="same-task")
+            for _ in range(4):
+                result = await tasks.get_context_window({}, ctx)
+                assert result["ok"]
+                data = result["data"]
+                assert data["effective_tokens"] == effective
+                assert data["source"] == source
+                assert data["compact_threshold"] == threshold
+                assert data["utilization_percent"] == pytest.approx(effective / threshold * 100)
+                assert data["remaining_tokens"] == max(0, threshold - effective)
+                assert data["message_count"] == 12
+                for text in [f"{effective:,}", f"{threshold:,}", source, "messages=12", f"prompt_tokens={prompt}"]:
+                    assert text in data["result"]
+    asyncio.run(run())
+    assert urls == ["http://supervisor/v1/sessions/parent/context_usage"] * 4
+
+
+def test_manage_memory_dispatch_and_cache_invalidation(tmp_path):
+    from engine.builtin import knowledge_inject as memory
+    _LEGACY_TOOL_ALIASES = ToolRegistry._LEGACY_ALIAS_MAP
+
+    ctx = SimpleNamespace(workspace_root=tmp_path, node_id="main", caller_node_id="", node_extra={}, _node_id="main", _node_extra={}, workspace_name="")
+    async def run():
+        assert (await memory.manage_memory({"action": "create", "book": "test", "id": "entry", "content": "remember"}, ctx))["ok"]
+        result = await memory.manage_memory({"action": "read", "book": "test", "id": "entry"}, ctx)
+        assert result["data"]["entries"][0]["content"] == "remember"
+        memory._hit_cache["entry"] = "now"
+        assert (await memory.manage_memory({"action": "remove", "book": "test", "id": "entry"}, ctx))["ok"]
+        assert "entry" not in memory._hit_cache
+        assert not (await memory.manage_memory({"action": "unknown"}, ctx))["ok"]
+    asyncio.run(run())
+    public = {spec["name"] for spec in memory.PLUGIN_META["tools"]}
+    assert "manage_memory" in public
+    assert not public.intersection({"save_memory", "list_memories", "delete_memory"})
+    assert _LEGACY_TOOL_ALIASES["save_memory"] == ("manage_memory", "upsert")
+    assert _LEGACY_TOOL_ALIASES["list_memories"] == ("manage_memory", "list")
+    assert _LEGACY_TOOL_ALIASES["delete_memory"] == ("manage_memory", "delete")
+
+
+@pytest.mark.parametrize("name,args,blocked", [
+    ("manage_memory", {"action": "upsert", "content": "write"}, True),
+    ("manage_memory", {"action": "delete", "id": "entry"}, True),
+    ("manage_memory", {"content": "implicit write"}, True),
+    ("save_memory", {"content": "legacy write"}, True),
+    ("delete_memory", {"id": "entry"}, True),
+    ("manage_memory", {"action": "list"}, False),
+])
+def test_ai_step_rejects_ungranted_memory_actions_before_execution(monkeypatch, name, args, blocked):
+    from engine.inference import ai_step
+    from engine.inference.tool_format import NativeToolFormatter
+    from engine.node import Node, ToolAccess
+
+    node = Node(id="reader", type="ai", tool_access=ToolAccess(mode="allowlist", allow=["manage_memory:list"]))
+    ls = SimpleNamespace(node=node, messages=[], formatter=NativeToolFormatter(),
+        allowed_real_tools={"manage_memory", "save_memory", "list_memories", "delete_memory"},
+        allowed_pseudo_tools=set(), provider=SimpleNamespace(name="test"), last_usage={}, openai_tools=[],
+        rctx=SimpleNamespace(tool_call_log=[], response_info={}, current_llm_request_id=""),
+        _reasoning_started_iso="", _reasoning_ended_iso="")
+    tc = SimpleNamespace(id="call", name=name, arguments=args)
+    resp = SimpleNamespace(tool_calls=[tc], text="", provider_meta={}, reasoning="", thought_summary="", inline_data=[])
+    observed = []
+    sentinel = object()
+    async def stop_before_execution(point, context):
+        assert point == "before_tool_call"
+        observed.append(context.extra)
+        return SimpleNamespace(action=sentinel)
+    monkeypatch.setattr(ai_step.hook_registry, "afire", stop_before_execution)
+    monkeypatch.setattr(ai_step, "_shadow_write", lambda *a, **kw: None)
+    assert asyncio.run(ai_step._handle_tool_calls_inner(ls, resp, 0)) is sentinel
+    assert observed[0]["unauthorized_count"] == int(blocked)
+    assert len(observed[0]["real_tool_calls"]) == int(not blocked)
+    assert len(ls.rctx.tool_call_log) == int(not blocked)
+
+
+def test_legacy_manager_actions_cannot_override_authorized_alias(tmp_path):
+    from engine.inference.pseudo_tools import _filter_tool_specs, is_tool_action_allowed
+    from engine.node import Node, ToolAccess
+
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools")
+    for old, action in [("list_memories", "list"), ("save_memory", "upsert"), ("delete_memory", "delete")]:
+        name, args = registry._resolve_alias(old, {"action": "forged"})
+        assert name == "manage_memory" and args["action"] == action
+    node = Node(id="skill-reader", type="ai", tool_access=ToolAccess(mode="all", deny=["delete_skill"]))
+    spec = {"name": "manage_skill", "input_schema": {"properties": {"action": {"enum": ["list", "upsert", "delete"]}}}}
+    assert _filter_tool_specs(node, [spec])[0]["input_schema"]["properties"]["action"]["enum"] == ["list", "upsert"]
+    assert not is_tool_action_allowed(node, "manage_skill", {"action": "remove"})
+    assert not is_tool_action_allowed(node, "delete_skill", {})
+    assert not is_tool_action_allowed(node, "list_skills", {"action": "remove"})

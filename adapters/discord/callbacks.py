@@ -17,6 +17,7 @@ import discord  # type: ignore[import-untyped]
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
 from clonoth_sdk.types import Event
 
+from .context import register_transient_msg, unregister_transient_msg
 from .messaging import (
     _atts_to_discord_files,
     _extract_reactions,
@@ -277,11 +278,13 @@ class DiscordCallbacks:
             should_restart = True
             text = text.rstrip()[:-len(self.rt.restart_signal)].strip()
 
+        reaction_added = False
         if text:
             text, reacts = _extract_reactions(self.rt, text)
             for r in reacts:
                 try:
                     await msg.add_reaction(r.strip())
+                    reaction_added = True
                 except Exception:
                     pass
 
@@ -295,6 +298,7 @@ class DiscordCallbacks:
             )
 
         delivered = False
+        reply_delivered = False
         if text or attachments:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
             # [2026-10-19 fix] Why: DM replies were still sent with reply_to=msg,
@@ -315,6 +319,7 @@ class DiscordCallbacks:
             if not voice_sent and not delivered:
                 raise RuntimeError("discord tts segments delivery failed")
             if voice_sent:
+                reply_delivered = True
                 _record_bot_reply(
                     self.rt, channel_id, "", context_watermark=pd.get("_context_watermark"),
                 )
@@ -327,6 +332,12 @@ class DiscordCallbacks:
                 pass
         if main_state:
             await self._settle_log_msg(main_state, "✓ 完成")
+
+        if reaction_added and not reply_delivered:
+            wm = pd.get("_context_watermark")
+            if wm is not None and self.rt.session_state is not None:
+                watermarks = self.rt.session_state.last_ctx_seq
+                watermarks[channel_id] = max(watermarks.get(channel_id, -1), wm)
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)
@@ -356,32 +367,43 @@ class DiscordCallbacks:
         dc_files = _atts_to_discord_files(self.rt, attachments or [])
         voice_segments: list[dict[str, str]] = []
 
-        if text or dc_files:
-            if text:
-                text, reacts = _extract_reactions(self.rt, text)
-                for r in reacts:
-                    try:
-                        await msg.add_reaction(r.strip())
-                    except Exception:
-                        pass
-                text, voice_segments = prepare_discord_tts_reply(self.rt, text, str(pd.get("_discord_input_modality") or "text"))
-            if text or dc_files:
-                int_sent_id = None
-                # [2026-10-19 fix] Same DM rule for interim messages: no quoted reply.
-                int_reply_target = None if trigger.is_dm else msg
+        reaction_added = False
+        reply_delivered = False
+        if text:
+            text, reacts = _extract_reactions(self.rt, text)
+            for r in reacts:
                 try:
-                    int_sent = await _send_split_text(
-                        self.rt, msg.channel, text or "",
-                        reply_to=int_reply_target, files=dc_files or None,
-                    )
-                    if int_sent:
-                        int_sent_id = int_sent[0].id
+                    await msg.add_reaction(r.strip())
+                    reaction_added = True
                 except Exception:
                     pass
-                if text:
-                    _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
+            text, voice_segments = prepare_discord_tts_reply(self.rt, text, str(pd.get("_discord_input_modality") or "text"))
+        if text or dc_files:
+            int_reply_target = None if trigger.is_dm else msg
+            try:
+                int_sent = await _send_split_text(
+                    self.rt, msg.channel, text or "",
+                    reply_to=int_reply_target, files=dc_files or None,
+                )
+            except Exception:
+                logger.warning("Failed to send intermediate reply to channel %s", channel_id, exc_info=True)
+            else:
+                if int_sent:
+                    reply_delivered = True
+                    _record_bot_reply(
+                        self.rt, channel_id, text or "[附件]", msg_id=int_sent[0].id,
+                        context_watermark=pd.get("_context_watermark"),
+                    )
         if voice_segments:
-            await _send_discord_tts_segments(self.rt, msg.channel, trigger.conversation_key, voice_segments)
+            voice_sent = await _send_discord_tts_segments(self.rt, msg.channel, trigger.conversation_key, voice_segments)
+            if voice_sent:
+                reply_delivered = True
+                _record_bot_reply(self.rt, channel_id, "", context_watermark=pd.get("_context_watermark"))
+        if reaction_added and not reply_delivered:
+            wm = pd.get("_context_watermark")
+            if wm is not None and self.rt.session_state is not None:
+                watermarks = self.rt.session_state.last_ctx_seq
+                watermarks[channel_id] = max(watermarks.get(channel_id, -1), wm)
 
         logger.info("send_intermediate_reply ch=%s atts=%d", channel_id, len(dc_files))
 
@@ -443,6 +465,7 @@ class DiscordCallbacks:
             partial = (dot.get("text_preview", "") if dot else "").strip()
             if partial:
                 content = partial + "\n\n⚠️ 回复被截断，请求超时。"
+                unregister_transient_msg(self.rt, status_msg)
             else:
                 content = "⚠️ Agent 请求超时。"
             try:
@@ -508,7 +531,9 @@ class DiscordCallbacks:
                             if log_msg:
                                 await log_msg.edit(content=log_display)
                             else:
-                                state.platform_data["log_msg"] = await log_ch.send(log_display)
+                                _new_log_msg = await log_ch.send(log_display)
+                                register_transient_msg(self.rt, _new_log_msg)
+                                state.platform_data["log_msg"] = _new_log_msg
                     except Exception as e:
                         logger.error("update_progress log edit FAILED: %s", e)
             # 2) 触发频道：工具摘要 + free prose
@@ -559,6 +584,7 @@ class DiscordCallbacks:
         display = _format_progress_log(state.prefix, state.lines, dot_state=child_dot)
         try:
             sent = await log_ch.send(display)
+            register_transient_msg(self.rt, sent)
             state.platform_data["msg"] = sent
             self._mark_edited(task_key)
         except Exception as e:
@@ -664,6 +690,7 @@ class DiscordCallbacks:
             # importing agent.py and creating a circular dependency.
             view = self.rt.approval_view_factory(approval_id) if self.rt.approval_view_factory else None
             msg = await ch.send(desc, view=view)
+            register_transient_msg(self.rt, msg)
             if view is not None:
                 view._msg = msg
         except Exception as e:

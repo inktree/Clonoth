@@ -7,6 +7,7 @@ reading or mutating module-level globals.
 """
 from __future__ import annotations
 
+from collections import deque
 import datetime
 import re
 from pathlib import Path
@@ -185,6 +186,7 @@ def _build_context_text(
     reply_context: str = "",
     exclude_last: bool = False,
     is_dm: bool = False,
+    min_seq_override: int | None = None,
 ) -> str:
     """组装发送给 Clonoth 的完整文本。
 
@@ -200,7 +202,8 @@ def _build_context_text(
         history_entries = list(q)
     # Discord commits this snapshot after reply delivery, not inbound acceptance:
     # parallel branches must still see messages whose replies are in flight.
-    wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
+    wm = (min_seq_override if min_seq_override is not None else
+          rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1)
     history_entries = [e for e in history_entries if e.get("seq", -1) > wm]
     # 排除 Bot 自己的消息，避免群聊上下文中出现 Bot 回复
     history_entries = [e for e in history_entries if not e.get("is_bot")]
@@ -238,6 +241,59 @@ def _build_context_text(
     return "\n".join(parts)
 
 
+def register_transient_msg(rt: Any, msg: Any) -> None:
+    """登记 Bot 发送的临时状态卡/进度卡/审批卡 message_id，供引用构建时精确过滤。"""
+    msg_id = getattr(msg, "id", None)
+    if not isinstance(msg_id, int):
+        return
+    transient_ids = getattr(rt, "transient_msg_ids", None)
+    if transient_ids is None:
+        transient_ids = deque(maxlen=1000)
+        try:
+            setattr(rt, "transient_msg_ids", transient_ids)
+        except Exception:
+            return
+    if msg_id not in transient_ids:
+        transient_ids.append(msg_id)
+
+
+def unregister_transient_msg(rt: Any, msg: Any) -> None:
+    """当状态卡因超时保留了半截正文升级为有效回复时，从临时状态卡集合中移除。"""
+    msg_id = getattr(msg, "id", None)
+    if not isinstance(msg_id, int):
+        return
+    transient_ids = getattr(rt, "transient_msg_ids", None)
+    if transient_ids is not None:
+        try:
+            transient_ids.remove(msg_id)
+        except ValueError:
+            pass
+
+
+def _is_transient_bot_message(rt: Any, msg_id: int | None) -> bool:
+    """按精确 message_id 判断被引用消息是否为 Bot 临时状态卡/日志卡/审批卡。"""
+    if not isinstance(msg_id, int):
+        return False
+    transient_ids = getattr(rt, "transient_msg_ids", None)
+    if transient_ids is not None and msg_id in transient_ids:
+        return True
+    session_state = getattr(rt, "session_state", None)
+    if session_state is not None:
+        for trig in (getattr(session_state, "triggers", None) or {}).values():
+            pd = getattr(trig, "platform_data", None) or {}
+            if getattr(pd.get("status_msg"), "id", None) == msg_id:
+                return True
+        for ms in (getattr(session_state, "main_task_states", None) or {}).values():
+            pd = getattr(ms, "platform_data", None) or {}
+            if getattr(pd.get("log_msg"), "id", None) == msg_id or getattr(pd.get("msg"), "id", None) == msg_id:
+                return True
+        for cs in (getattr(session_state, "child_task_states", None) or {}).values():
+            pd = getattr(cs, "platform_data", None) or {}
+            if getattr(pd.get("msg"), "id", None) == msg_id:
+                return True
+    return False
+
+
 async def _build_reply_context(rt: Any, message: discord.Message) -> str:
     """提取被引用消息的作者、身份组、时间和正文。"""
     if not message.reference:
@@ -245,6 +301,7 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
     ref: discord.Message | None = None
     if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
         ref = message.reference.resolved
+    ref_id = getattr(message.reference, "message_id", None) or (getattr(ref, "id", None) if ref else None)
     if not ref and message.reference.message_id:
         q = _ensure_channel(rt, message.channel.id)
         for entry in reversed(q):
@@ -260,6 +317,9 @@ async def _build_reply_context(rt: Any, message: discord.Message) -> str:
         return ""
 
     author = ref.author
+    bot_user = getattr(rt.dc_client, "user", None)
+    if bot_user and author.id == bot_user.id and _is_transient_bot_message(rt, ref_id):
+        return ""
     identity = _format_identity(author, rt.key_roles)
     time_prefix = _format_time_prefix(ref.created_at)
     text = ""

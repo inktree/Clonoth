@@ -107,6 +107,10 @@ class MemoryExtractHandler:
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
+        inbound_mtype = str(task_input.get("inbound_message_type") or "").strip()
+        if inbound_mtype in ("dispatch_result", "async_tool_result"):
+            log.debug("memory_extract gate: blocked by inbound_message_type=%s", inbound_mtype)
+            return
         # [2026-06-04] Why: fresh child tasks are short-lived and disposable (session
         # cleaned within 24h), so extracting memory from them wastes CPU. However,
         # accumulate/persistent child nodes (like Smith) maintain long-lived sessions
@@ -403,12 +407,17 @@ class MemoryExtractHandler:
             # and fall back to pending payloads, then prefix the transcript with
             # the sorted data/memory/*.yaml stems. Purpose: prefer existing books
             # while still allowing the extractor to create a new semantic book.
+            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
-            mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
-            book_names = sorted(
-                p.stem for p in mem_dir.glob("*.yaml")
-            ) if mem_dir is not None and mem_dir.exists() else []
+            mem_root = workspace_root / "data" / "memory" if workspace_root is not None else None
+            book_stems: set[str] = set()
+            if mem_root is not None and mem_root.exists():
+                ns_dir = (mem_root / _source_nid) if _source_nid else mem_root
+                for scan_dir in (ns_dir, mem_root):
+                    if scan_dir.is_dir():
+                        book_stems.update(p.stem for p in scan_dir.glob("*.yaml"))
+            book_names = sorted(book_stems)
             book_list_header = ""
             if book_names:
                 book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"
@@ -418,7 +427,6 @@ class MemoryExtractHandler:
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
             # [AutoC 2026-08-28] Pass _memory_route_ns so dream_router hook
             # redirects save_memory writes to the source node's directory.
-            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
             _extra_input: dict[str, Any] = {}
             if _source_nid:
                 _extra_input["_memory_route_ns"] = _source_nid

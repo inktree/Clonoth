@@ -324,7 +324,7 @@ def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path
     assert "[Large skill" in skill_dynamic_text
     assert "- L1: # 第一章 调研" in skill_dynamic_text
     assert "[Long memory" in mem_dynamic_text
-    assert 'list_memories(book="tech", id="long_active_mem")' in mem_dynamic_text
+    assert 'manage_memory(action="list", book="tech", id="long_active_mem")' in mem_dynamic_text
 
     # Verify list_memories(id=...) returns full untruncated content
     ctx = SimpleNamespace(
@@ -1019,3 +1019,104 @@ def test_uploaded_image_reaches_native_provider_payload(prepared_image_message: 
         assert image.format == "JPEG"
         assert image.size == (24, 12)
 
+
+
+@pytest.mark.parametrize("use_flag", [True, False])
+def test_same_task_preempt_subsegments_preserve_tool_rounds(use_flag):
+    def msg(role, text, **fields):
+        meta = {"source_task_id": "one-task"}
+        if fields.pop("preempt", False):
+            if use_flag:
+                meta["preempt"] = True
+            else:
+                fields["message_type"] = "user_input"
+        return {"role": role, "content": text, "_meta": meta, **fields}
+
+    messages = [
+        msg("user", "initial"), msg("assistant", "completed first turn"),
+        msg("user", "second", preempt=True),
+        msg("assistant", "", tool_calls=[{"id": "call", "function": {"name": "read_file"}}]),
+        msg("user", "arrived during tool call", preempt=True),
+        msg("tool", "file contents", tool_call_id="call"),
+        msg("assistant", "completed second turn"),
+        msg("user", "third", preempt=True), msg("assistant", "final"),
+    ]
+    prefix, segments = compact.split_task_segments(messages)
+    assert prefix == []
+    assert [len(seg) for seg in segments] == [2, 5, 2]
+    assert [m for seg in segments for m in seg] == messages
+    assert compact.count_real_task_segments(messages) == 3
+    # Multiple inbound user messages alone are not completed turns.
+    assert len(compact.split_task_segments([messages[0], messages[2]])[1]) == 1
+
+
+def test_compact_token_estimates_use_completion_and_cjk():
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "中" * 20}) == 10
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "short", "_meta": {
+        "usage": {"completion_tokens": 900},
+    }}) == 900
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "a" * 40, "_meta": {
+        "usage": {"completion_tokens": True},
+    }}) == 20
+    assert compact.estimate_message_tokens({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "image"}},
+    ]}) == 1600
+
+
+def test_dream_hit_cache_prunes_orphans_even_with_empty_topology(tmp_path):
+    import json
+    from engine.builtin.dream import DreamHandler
+
+    path = tmp_path / "data" / "memory" / ".hit_cache.json"
+    path.parent.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps({"live": now, "orphan": now}), encoding="utf-8")
+    handler = DreamHandler()
+    assert json.loads(handler._load_hit_cache_json(tmp_path, valid_ids={"live"})) == {"live": now}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"live": now}
+    assert json.loads(handler._load_hit_cache_json(tmp_path, valid_ids=set())) == {}
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
+def test_builtin_node_fallback_outside_repository(tmp_path):
+    from engine.node import load_node
+
+    node = load_node(tmp_path, "system.memory_extractor")
+    assert node is not None
+    assert "manage_memory" in node.tool_access.allow
+
+
+
+def test_memory_extractor_scans_source_namespace_and_legacy_root(tmp_path):
+    from engine.builtin.memory_extract import MemoryExtractHandler
+
+    mem_root = tmp_path / "data" / "memory"
+    (mem_root / "source").mkdir(parents=True)
+    (mem_root / "other").mkdir()
+    for path in [mem_root / "shared.yaml", mem_root / "source" / "private.yaml",
+                 mem_root / "source" / "shared.yaml", mem_root / "other" / "hidden.yaml"]:
+        path.write_text("entries: []", encoding="utf-8")
+    handler = MemoryExtractHandler()
+    handler._memory_extract_pending["session"] = {
+        "transcript": "user preference", "task_count": 1, "_source_node_id": "source",
+    }
+    created = []
+    handler._fire_memory_extract_idle({"workspace_root": tmp_path, "acquire_lock": RLock(),
+        "create_task": lambda **kwargs: created.append(kwargs)}, "session")
+    assert len(created) == 1
+    instruction = created[0]["input_data"]["instruction"]
+    assert "private, shared" in instruction
+    assert "hidden" not in instruction
+    assert created[0]["input_data"]["_memory_route_ns"] == "source"
+
+
+@pytest.mark.parametrize("message_type", ["dispatch_result", "async_tool_result"])
+def test_memory_extractor_skips_internal_result_turns(message_type):
+    from engine.builtin.memory_extract import MemoryExtractHandler
+
+    handler = MemoryExtractHandler()
+    task = SimpleNamespace(result={"action": "finish"}, kind="node", input={"inbound_message_type": message_type})
+    # No routing/runtime callbacks are available: internal result turns must exit at the gate.
+    handler._maybe_trigger_memory_extract_locked(ctx={}, task=task)
+    assert not handler._memory_extract_pending
+    assert not handler._memory_extract_task_counts
