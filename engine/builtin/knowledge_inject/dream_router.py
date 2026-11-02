@@ -29,7 +29,26 @@ from engine.hooks.types import Handler, HookContext, HookResult
 log = logging.getLogger(__name__)
 
 _SYSTEM_NODES = frozenset({"system.dream", "system.memory_extractor"})
-_ROUTABLE_TOOLS = frozenset({"save_memory", "delete_memory", "list_memories"})
+_ROUTABLE_TOOLS = frozenset({"manage_memory", "save_memory", "delete_memory", "list_memories"})
+
+
+def _resolve_memory_tool_action(tool_name: str, tool_args: dict[str, Any]) -> str:
+    if tool_name == "save_memory":
+        return "upsert"
+    if tool_name == "delete_memory":
+        return "delete"
+    if tool_name == "list_memories":
+        return "list"
+    act = str(tool_args.get("action") or "").strip().lower()
+    if not act:
+        return "upsert" if tool_args.get("content") is not None else "list"
+    if act in ("save", "create", "update"):
+        return "upsert"
+    if act in ("get", "read"):
+        return "list"
+    if act == "remove":
+        return "delete"
+    return act
 
 
 class DreamMemoryRouter(Handler):
@@ -71,12 +90,13 @@ class DreamMemoryRouter(Handler):
         target_ws = ""
 
         # Mode 1: Dream route table (supports exact 'book/id' key and book key)
+        eff_action = _resolve_memory_tool_action(tool_name, tool_args)
         memory_route: dict[str, Any] = task_context.get("_memory_route") or {}
         if memory_route:
             book = str(tool_args.get("book") or "default").strip()
             mid = str(tool_args.get("id") or "").strip()
             target = None
-            if mid and tool_name in ("delete_memory", "list_memories"):
+            if mid and eff_action in ("delete", "list"):
                 target = memory_route.get(f"{book}/{mid}")
             if target is None:
                 target = memory_route.get(book)
@@ -88,7 +108,7 @@ class DreamMemoryRouter(Handler):
                     target = _first
             if target:
                 target_ns = str(target.get("ns") or "").strip()
-                if node_id == "system.dream" and tool_name == "save_memory":
+                if node_id == "system.dream" and eff_action == "upsert":
                     target_ws = ""
                 else:
                     target_ws = str(target.get("ws") or "").strip()
@@ -117,7 +137,7 @@ class DreamMemoryRouter(Handler):
             tool_ctx._node_extra = {}  # type: ignore[attr-defined]
 
         # Dream consolidates writes into the source namespace, not a temporary workspace.
-        if node_id == "system.dream" and tool_name == "save_memory":
+        if node_id == "system.dream" and eff_action == "upsert":
             target_ws = ""
         tool_ctx.workspace_name = target_ws.lstrip("@")
 
