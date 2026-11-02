@@ -188,8 +188,8 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
             _seg_count = count_real_task_segments(_stored_msgs)
             _snipped_stubs = sum(1 for m in _stored_msgs if is_snipped_message(m))
             _is_entry_branch = bool(
-                getattr(ls.rctx, "parent_session_id", "")
-                and not getattr(ls.rctx, "child_session_id", "")
+                ls.rctx.parent_session_id
+                and not ls.rctx.child_session_id
             )
             _min_segs = 1 if _is_entry_branch else 2
             if _seg_count < _min_segs and _snipped_stubs == 0:

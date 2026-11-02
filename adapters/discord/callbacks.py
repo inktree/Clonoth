@@ -298,7 +298,6 @@ class DiscordCallbacks:
             )
 
         delivered = False
-        reply_delivered = False
         if text or attachments:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
             # [2026-10-19 fix] Why: DM replies were still sent with reply_to=msg,
@@ -319,7 +318,7 @@ class DiscordCallbacks:
             if not voice_sent and not delivered:
                 raise RuntimeError("discord tts segments delivery failed")
             if voice_sent:
-                reply_delivered = True
+                delivered = True
                 _record_bot_reply(
                     self.rt, channel_id, "", context_watermark=pd.get("_context_watermark"),
                 )
@@ -333,7 +332,7 @@ class DiscordCallbacks:
         if main_state:
             await self._settle_log_msg(main_state, "✓ 完成")
 
-        if reaction_added and not reply_delivered:
+        if reaction_added and not delivered:
             wm = pd.get("_context_watermark")
             if wm is not None and self.rt.session_state is not None:
                 watermarks = self.rt.session_state.last_ctx_seq
@@ -348,6 +347,7 @@ class DiscordCallbacks:
             if self.rt.bot_restart_view_factory:
                 view = self.rt.bot_restart_view_factory(channel_id)
                 confirm_msg = await ch.send("🔄 **Bot 重启需要管理员确认**", view=view)
+                register_transient_msg(self.rt, confirm_msg)
                 view._msg = confirm_msg
             else:
                 asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id))

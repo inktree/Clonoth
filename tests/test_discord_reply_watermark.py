@@ -1,6 +1,7 @@
 """Channel context is consumed by delivered replies, not accepted inbounds."""
 import asyncio
 import runpy
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -19,6 +20,7 @@ from clonoth_sdk.types import Event
 def runtime():
     return SimpleNamespace(
         session_state=SessionState(), channel_history={}, history_seq_counter=0,
+        transient_msg_ids=deque(maxlen=1000),
         history_max_len=100, key_roles=set(), superusers=set(), restart_signal="<restart>",
         discord_voice_reply=False, discord_voice_reply_on_voice_input=False,
     )
@@ -305,31 +307,16 @@ def test_pure_reaction_commits_watermark_without_history(monkeypatch, intermedia
         assert rt.session_state.get_high_watermark(42) == 9
 
 
-@pytest.mark.parametrize("source", ["registered", "status", "log", "child"])
-def test_transient_bot_reference_is_filtered(monkeypatch, source):
+def test_transient_bot_reference_is_filtered_and_reversible(monkeypatch):
     rt = runtime()
     rt.dc_client = SimpleNamespace(user=SimpleNamespace(id=999))
     ref = SimpleNamespace(id=123, author=SimpleNamespace(id=999), content="⏳ 处理中...")
     monkeypatch.setattr(context.discord, "Message", SimpleNamespace)
-    if source == "registered":
-        context.register_transient_msg(rt, ref)
-    elif source == "status":
-        rt.session_state.triggers[1] = SimpleNamespace(platform_data={"status_msg": ref})
-    elif source == "log":
-        rt.session_state.main_task_states[1] = SimpleNamespace(platform_data={"log_msg": ref})
-    else:
-        rt.session_state.child_task_states["child"] = SimpleNamespace(platform_data={"msg": ref})
+    context.register_transient_msg(rt, ref)
     msg = SimpleNamespace(reference=SimpleNamespace(resolved=ref, message_id=123))
     assert asyncio.run(context._build_reply_context(rt, msg)) == ""
     assert not context._is_transient_bot_message(rt, 124)
-
-
-def test_transient_registration_is_bounded_and_reversible():
-    rt = runtime()
-    card = SimpleNamespace(id=123)
-    context.register_transient_msg(rt, card)
-    assert context._is_transient_bot_message(rt, 123)
-    context.unregister_transient_msg(rt, card)
+    context.unregister_transient_msg(rt, ref)
     assert not context._is_transient_bot_message(rt, 123)
     assert rt.transient_msg_ids.maxlen == 1000
 

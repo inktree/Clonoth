@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 
-from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec, is_tool_action_allowed, resolve_legacy_action_alias
+from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec, is_tool_action_allowed
 from .resume_builder import apply_resume_messages, collect_resume_attachments
 from .loop_state import _LoopState, _build_loop_state, _persist_ctx as _persist_ctx_base
 from .llm_call import _call_llm_with_retry, _build_failure_action, call_provider_once

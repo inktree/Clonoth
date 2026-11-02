@@ -7,7 +7,6 @@ reading or mutating module-level globals.
 """
 from __future__ import annotations
 
-from collections import deque
 import datetime
 import re
 from pathlib import Path
@@ -244,54 +243,20 @@ def _build_context_text(
 def register_transient_msg(rt: Any, msg: Any) -> None:
     """登记 Bot 发送的临时状态卡/进度卡/审批卡 message_id，供引用构建时精确过滤。"""
     msg_id = getattr(msg, "id", None)
-    if not isinstance(msg_id, int):
-        return
-    transient_ids = getattr(rt, "transient_msg_ids", None)
-    if transient_ids is None:
-        transient_ids = deque(maxlen=1000)
-        try:
-            setattr(rt, "transient_msg_ids", transient_ids)
-        except Exception:
-            return
-    if msg_id not in transient_ids:
-        transient_ids.append(msg_id)
+    if isinstance(msg_id, int) and msg_id not in rt.transient_msg_ids:
+        rt.transient_msg_ids.append(msg_id)
 
 
 def unregister_transient_msg(rt: Any, msg: Any) -> None:
     """当状态卡因超时保留了半截正文升级为有效回复时，从临时状态卡集合中移除。"""
     msg_id = getattr(msg, "id", None)
-    if not isinstance(msg_id, int):
-        return
-    transient_ids = getattr(rt, "transient_msg_ids", None)
-    if transient_ids is not None:
-        try:
-            transient_ids.remove(msg_id)
-        except ValueError:
-            pass
+    if isinstance(msg_id, int) and msg_id in rt.transient_msg_ids:
+        rt.transient_msg_ids.remove(msg_id)
 
 
 def _is_transient_bot_message(rt: Any, msg_id: int | None) -> bool:
     """按精确 message_id 判断被引用消息是否为 Bot 临时状态卡/日志卡/审批卡。"""
-    if not isinstance(msg_id, int):
-        return False
-    transient_ids = getattr(rt, "transient_msg_ids", None)
-    if transient_ids is not None and msg_id in transient_ids:
-        return True
-    session_state = getattr(rt, "session_state", None)
-    if session_state is not None:
-        for trig in (getattr(session_state, "triggers", None) or {}).values():
-            pd = getattr(trig, "platform_data", None) or {}
-            if getattr(pd.get("status_msg"), "id", None) == msg_id:
-                return True
-        for ms in (getattr(session_state, "main_task_states", None) or {}).values():
-            pd = getattr(ms, "platform_data", None) or {}
-            if getattr(pd.get("log_msg"), "id", None) == msg_id or getattr(pd.get("msg"), "id", None) == msg_id:
-                return True
-        for cs in (getattr(session_state, "child_task_states", None) or {}).values():
-            pd = getattr(cs, "platform_data", None) or {}
-            if getattr(pd.get("msg"), "id", None) == msg_id:
-                return True
-    return False
+    return isinstance(msg_id, int) and msg_id in rt.transient_msg_ids
 
 
 async def _build_reply_context(rt: Any, message: discord.Message) -> str:

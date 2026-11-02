@@ -213,7 +213,7 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         "preempt": True,
         "message_type": "user_input",
     }
-    _cur_tid = str(getattr(ls.rctx, "task_id", "") or "").strip()
+    _cur_tid = str(ls.rctx.task_id or "").strip()
     if _cur_tid:
         _in_mem_meta["source_task_id"] = _cur_tid
     if new_attachments:
