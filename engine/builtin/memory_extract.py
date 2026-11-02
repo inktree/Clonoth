@@ -158,9 +158,9 @@ class MemoryExtractHandler:
         # Why: a task that explicitly saved memory has already handled the turn.
         # How: preserve the old save_memory tool-name mutual exclusion. Purpose:
         # avoid duplicate memory entries from automatic extraction.
-        tool_names = (getattr(task, "result", None) or {}).get("_tool_names") or []
-        if "save_memory" in tool_names:
-            log.debug("memory_extract TRACE: BLOCKED by save_memory in tool_names")
+        tool_names = set((getattr(task, "result", None) or {}).get("_tool_names") or [])
+        if tool_names & {"save_memory", "delete_memory", "manage_memory:upsert", "manage_memory:delete"}:
+            log.debug("memory_extract TRACE: BLOCKED by memory write in tool_names")
             return
 
         # [Fork/Merge 2026-05-17] Why: completed entry tasks run on temporary
