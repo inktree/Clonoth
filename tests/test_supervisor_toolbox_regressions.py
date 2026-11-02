@@ -716,3 +716,30 @@ def test_read_file_schema_promotes_single_path_and_bounds_batches(tmp_path):
     assert props["startLine"]["type"] == props["endLine"]["type"] == "integer"
     assert (props["files"]["minItems"], props["files"]["maxItems"]) == (1, 8)
     assert "Deprecated" not in props["path"]["description"]
+
+@pytest.mark.parametrize("arguments,action", [
+    ({"query": "example"}, "search"),
+    ({"action": "search", "query": "example"}, "search"),
+    ({"action": "fetch", "urls": ["https://example.com"]}, "fetch"),
+    ({"urls": ["https://example.com"]}, "fetch"),
+    ({"urls": "https://example.com"}, "fetch"),
+    ({"action": "search", "urls": ["https://example.com"]}, "fetch"),
+])
+def test_search_web_discovery_purity_action_and_default_policy(tmp_path, arguments, action):
+    from engine.inference.ai_step import _is_pure_tool_call
+    from engine.inference.pseudo_tools import resolve_effective_action
+    from supervisor.policy import PolicyEngine
+    from supervisor.types import SafetyLevel
+
+    root = Path(__file__).resolve().parents[1]
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=root / "tools")
+    spec = registry.get_spec("search_web")
+    assert spec is not None and spec["name"] == "search_web"
+    assert spec["pure"] is True
+    schema = spec["input_schema"]["properties"]
+    assert schema["action"]["enum"] == ["search", "fetch"]
+    assert schema["engine"]["enum"] == ["auto", "tinyfish", "parallel", "exa"]
+    assert _is_pure_tool_call("search_web", arguments, spec) is True
+    assert resolve_effective_action("search_web", arguments) == ("search_web", action)
+    decision = PolicyEngine(workspace_root=tmp_path).evaluate_tool(name="search_web")
+    assert decision.safety_level == SafetyLevel.auto
