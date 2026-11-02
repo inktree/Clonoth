@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 
-from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec, is_tool_action_allowed
+from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec, resolve_effective_action, is_tool_action_allowed
 from .resume_builder import apply_resume_messages, collect_resume_attachments
 from .loop_state import _LoopState, _build_loop_state, _persist_ctx as _persist_ctx_base, _short
 from .llm_call import (
@@ -528,11 +528,8 @@ def _is_pure_tool_call(name: str, args: dict[str, Any], spec: dict[str, Any] | N
     if spec and (spec.get("pure") or spec.get("async_mode")):
         return True
     if name in _PURE_LIST_MANAGERS:
-        if name == "manage_memory":
-            return resolve_legacy_action_alias(name, args) == "list_memories"
-        act = str((args or {}).get("action") or "").strip().lower()
-        if act == "list" or (not act and not (args or {}).get("name") and not (args or {}).get("id")):
-            return True
+        _, eff_act = resolve_effective_action(name, args)
+        return eff_act == "list"
     if name in ("grep", "search_in_files"):
         return str((args or {}).get("mode") or "search").lower() != "replace"
     return name in ("list_skills", "list_memories", "list_mcp_clients", "list_dir", "read_file", "list_schedules", "get_context_window")
