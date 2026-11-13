@@ -201,8 +201,10 @@ def _conversation_message_to_compact_dict(message: Any) -> dict[str, Any]:
         meta.setdefault("message_type", message_type)
     if meta:
         compact_message["_meta"] = meta
-    if raw.get("ephemeral") or raw.get("_dynamic"):
+    from engine.conversation_store import is_dynamic_context
+    if raw.get("ephemeral") or is_dynamic_context(raw):
         compact_message["_dynamic"] = True
+        compact_message.setdefault("message_type", "dynamic_context")
     if isinstance(raw.get("tool_calls"), list) and raw.get("tool_calls"):
         compact_message["tool_calls"] = raw.get("tool_calls")
     if raw.get("tool_call_id"):

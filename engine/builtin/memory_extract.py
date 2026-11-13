@@ -1,6 +1,7 @@
 """Built-in supervisor hook handler for automatic memory extraction."""
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import get_bool, get_entry_node_id, get_int, get_str, load_runtime_config
+from engine.conversation_store import is_dynamic_context
 
 
 log = logging.getLogger(__name__)
@@ -314,6 +316,25 @@ class MemoryExtractHandler:
         # hook can redirect save_memory writes to the correct namespace.
         _entry_nid = get_entry_node_id(runtime_cfg)
         source_node_id = str(getattr(task, "node_id", "") or "").strip() or _entry_nid
+        source_ws = ""
+        sessions_path = workspace_root / "data" / "sessions.json"
+        if sessions_path.is_file():
+            try:
+                sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                log.warning("memory_extract: cannot resolve session workspace: %s", exc)
+                return None
+            session = sessions.get(session_id, {})
+            workspace = session.get("workspace")
+            ws_name = str(workspace.get("name") or "") if isinstance(workspace, dict) else ""
+            if ws_name.lstrip("@").startswith("vault_"):
+                return None
+            from engine.builtin.dream import _is_isolated_workspace
+
+            if _is_isolated_workspace(ws_name, channel=str(session.get("channel") or "")):
+                if not ws_name:
+                    return None
+                source_ws = ws_name
         return {
             "session_id": session_id,
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
@@ -323,6 +344,7 @@ class MemoryExtractHandler:
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
             "_source_node_id": source_node_id,
+            "_source_ws": source_ws,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -433,6 +455,9 @@ class MemoryExtractHandler:
             _extra_input: dict[str, Any] = {}
             if _source_nid:
                 _extra_input["_memory_route_ns"] = _source_nid
+            source_ws = pending_extract.get("_source_ws", "")
+            if source_ws:
+                _extra_input["_memory_route_ws"] = source_ws
             create_task(
                 session_id=sid,
                 session_generation=session_generation,
@@ -471,17 +496,20 @@ def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 1200
     parts: list[str] = []
     total = 0
     for msg in messages:
+        if is_dynamic_context(msg):
+            continue
         if isinstance(msg, dict):
             role = str(msg.get("role") or "")
             content: Any = msg.get("content", "")
             message_type = str(msg.get("message_type") or msg.get("type") or "")
             name = str(msg.get("name") or "")
         else:
-            role = str(getattr(msg, "role", "") or "")
-            content = getattr(msg, "content", "")
-            message_type = str(getattr(msg, "message_type", "") or "")
-            name = str(getattr(msg, "name", "") or "")
-        if role == "system":
+            role = msg.role
+            content = msg.content
+            message_type = msg.message_type
+            name = msg.name
+        meta = (msg.get("meta") or msg.get("_meta") or {}) if isinstance(msg, dict) else msg.meta
+        if role == "system" or message_type in ("retry_hint", "output_rejected") or meta.get("rejected_draft") or meta.get("is_rejection"):
             continue
         if isinstance(content, list):
             # Why: older session message dictionaries can contain multimodal
