@@ -274,6 +274,9 @@ def _finish_spec() -> dict:
     }
 
 
+DC_LIMIT = 1500
+
+
 def _reply_spec() -> dict:
     """Build the intermediate_reply pseudo-tool spec (non-terminating)."""
     return {
@@ -281,7 +284,8 @@ def _reply_spec() -> dict:
         "function": {
             "name": "intermediate_reply",
             "description": (
-                "Send an interim message to the user WITHOUT terminating this node.\n\n"
+                "Send an interim message to the user WITHOUT terminating this node.\n"
+                f"尽量使用短回复；长消息使用 `[SPLIT]` 拆分，单段超过 {DC_LIMIT} 字符会被打回重写。\n\n"
                 "The node keeps running after this call — you can continue calling tools "
                 "or do more work in subsequent turns.\n\n"
                 "The `text` parameter is the message content the user will read. "
@@ -299,7 +303,7 @@ def _reply_spec() -> dict:
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The message content the user will read.",
+                        "description": f"The message content the user will read. 长消息使用 `[SPLIT]` 拆分，每段不超过 {DC_LIMIT} 字符。",
                     },
                     "attachment_paths": {
                         "type": "array",

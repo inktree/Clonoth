@@ -38,6 +38,7 @@ def _message_to_turn_summary_dict(message: Message) -> dict[str, Any]:
 def _format_task_messages_for_turn_summary(messages: list[Message]) -> str:
     """Format task messages for system.turn_summarizer without control-tool plumbing."""
     from engine.inference.tool_format import repair_tool_result_pairing
+    from engine.conversation_store import is_dynamic_context
 
     # 与 LLM replay 共用配对修复，保留有效的 finish tool_call/tool_result。
     cleaned = repair_tool_result_pairing([
@@ -46,6 +47,9 @@ def _format_task_messages_for_turn_summary(messages: list[Message]) -> str:
 
     parts: list[str] = []
     for msg in cleaned:
+        meta = msg.get("_meta") or msg.get("meta") or {}
+        if is_dynamic_context(msg) or (msg.get("message_type") or meta.get("message_type")) in ("retry_hint", "output_rejected"):
+            continue
         content = msg.get("content") or ""
         if not isinstance(content, str):
             content = str(content)

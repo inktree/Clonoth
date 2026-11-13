@@ -9,6 +9,7 @@ See: data/session_conversation_store_design.md
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,22 @@ class MessageType:
     TOOL_RESULT = "tool_result"
     SYSTEM = "system"
     SUMMARY = "summary"
+    DYNAMIC_CONTEXT = "dynamic_context"
+
+
+def is_dynamic_context(message: Any) -> bool:
+    """Recognise runtime dictionaries and persisted dynamic-context messages."""
+    if isinstance(message, Message):
+        return message.message_type == MessageType.DYNAMIC_CONTEXT or bool(message.meta.get("_dynamic"))
+    if isinstance(message, dict):
+        meta = message.get("_meta") or message.get("meta") or {}
+        return bool(
+            message.get("_dynamic")
+            or message.get("message_type") == MessageType.DYNAMIC_CONTEXT
+            or meta.get("message_type") == MessageType.DYNAMIC_CONTEXT
+            or meta.get("_dynamic")
+        )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +259,39 @@ class ConversationStore:
         if messages:
             self.append_batch(session_id, messages)
 
+    def remove_messages(self, session_id: str, message_ids: set[str] | list[str]) -> int:
+        """Atomically remove targeted rows without truncating a large session's head."""
+        ids = set(message_ids)
+        path = self._data_dir / f"{session_id}.jsonl"
+        if not ids or not path.is_file():
+            return 0
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        removed = 0
+        try:
+            with open(path, "r", encoding="utf-8") as src, open(tmp, "w", encoding="utf-8") as dst:
+                for line in src:
+                    if line.strip():
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            row = None
+                        if isinstance(row, dict) and row.get("id") in ids:
+                            removed += 1
+                            continue
+                    dst.write(line)
+            if removed:
+                os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        if removed:
+            self.invalidate_cache(session_id)
+        return removed
+
+    def invalidate_cache(self, session_id: str) -> None:
+        """Discard a cached session before reloading persisted changes."""
+        self._cache.pop(session_id, None)
+
     # ── 查询 ──
 
     def message_count(self, session_id: str) -> int:
@@ -261,7 +311,7 @@ class ConversationStore:
         if not source_msgs:
             return 0
         # 过滤 system 消息——子节点有自己的 system prompt，不需要父节点的
-        non_system = [m for m in source_msgs if m.role != "system"]
+        non_system = [m for m in source_msgs if m.role != "system" and not is_dynamic_context(m)]
         if non_system:
             self.append_batch(target_session_id, non_system)
         return len(non_system)

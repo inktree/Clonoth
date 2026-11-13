@@ -417,11 +417,11 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
         "_meta": {"tool_mode": "native"},
     })
     view = _build_messages_for_provider(str_msgs, formatter, provider)
-    assert view[:4] == initial_view[:4]
-    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "assistant", "tool", "user"]
+    assert view[:5] == initial_view[:5]
+    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "user", "assistant", "tool"]
     assert view[3]["content"] == "turn1_q"
-    assert view[5]["content"] == "file_body"
-    assert view[6]["content"] == str_msgs[4]["content"]
+    assert view[4]["content"] == str_msgs[4]["content"]
+    assert view[6]["content"] == "file_body"
     assert str_msgs[4].get("_dynamic") is True
 
     # Block mode with trailing assistant prefill (UAU / UAS): _dynamic must NOT be moved after assistant prefill
@@ -1120,3 +1120,98 @@ def test_memory_extractor_skips_internal_result_turns(message_type):
     handler._maybe_trigger_memory_extract_locked(ctx={}, task=task)
     assert not handler._memory_extract_pending
     assert not handler._memory_extract_task_counts
+
+
+def test_provider_system_prefix_and_anthropic_top_level_cache():
+    from providers.anthropic import AnthropicProvider, _convert_messages
+    from providers.gemini import GeminiProvider
+
+    messages = [
+        {"role": "system", "content": "static system"},
+        {"role": "developer", "content": "static developer"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "system", "content": "historical system"},
+        {"role": "developer", "content": "historical developer"},
+    ]
+    system, gemini = GeminiProvider._convert_messages(messages)
+    assert system == "static system\n\nstatic developer"
+    assert [m["role"] for m in gemini] == ["user", "model", "user", "user"]
+    assert [m["parts"][0]["text"] for m in gemini] == [
+        "question", "answer", "historical system", "historical developer",
+    ]
+    system, anthropic = _convert_messages(messages)
+    assert system == "static system\n\nstatic developer"
+    assert [m["role"] for m in anthropic] == ["user", "assistant", "user"]
+    assert [block["text"] for block in anthropic[-1]["content"]] == [
+        "historical system", "historical developer",
+    ]
+    async def run():
+        async with httpx.AsyncClient() as http:
+            provider = AnthropicProvider(http=http, api_key="test", base_url=None, model="test")
+            assert provider._build_payload(messages)["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+            disabled = AnthropicProvider(http=http, api_key="test", base_url=None, model="test",
+                                         provider_options={"prompt_cache_ttl": "off"})
+            assert "cache_control" not in disabled._build_payload(messages)
+    asyncio.run(run())
+
+
+def test_discord_outbound_named_mentions_preserve_code():
+    import discord
+    from adapters.discord.messaging import _resolve_outbound_mentions
+
+    alice = discord.User(state=None, data={"id": "123456", "username": "alice",
+                                          "discriminator": "0", "avatar": None, "global_name": "昵称"})
+    channel = SimpleNamespace(id=42)
+    runtime = SimpleNamespace(channel_history={42: [{"message": SimpleNamespace(author=alice)}]})
+    text = "<@Alice> <@昵称[alice]> `<@Alice>` ```\n<@Alice>\n``` <@Unknown>"
+    assert _resolve_outbound_mentions(runtime, channel, text) == (
+        "<@123456> <@123456> `<@Alice>` ```\n<@Alice>\n``` @Unknown"
+    )
+
+
+@pytest.mark.parametrize("child_session_id,task_context,expected", [
+    ("", {}, True),
+    ("child", {}, False),
+    ("", {"caller_task_id": "parent"}, False),
+])
+def test_preempt_recognizes_only_top_level_user_tasks(child_session_id, task_context, expected):
+    from engine.builtin.preempt import is_user_entry_task
+
+    ls = SimpleNamespace(rctx=SimpleNamespace(child_session_id=child_session_id, task_context=task_context))
+    assert is_user_entry_task(ls) is expected
+
+
+def test_knowledge_scan_ignores_discord_quote_and_dream_isolates_private_workspaces(tmp_path):
+    from engine.builtin.knowledge_inject import _strip_discord_wrapper_for_scan, build_knowledge_messages
+    from engine.builtin.dream import _is_isolated_workspace
+
+    wrapped = "【当前消息引用】\nquoted bot response\n【当前用户指令】\nAlice: do the actual task"
+    assert _strip_discord_wrapper_for_scan(wrapped) == "Alice: do the actual task"
+    assert _is_isolated_workspace("@dm-123")
+    assert _is_isolated_workspace("@vault_sec")
+    assert _is_isolated_workspace("@ordinary", channel="discord_dm")
+    assert not _is_isolated_workspace("@ordinary", channel="discord_guild")
+    assert _is_isolated_workspace("", channel="discord_dm")
+
+    entries = [
+        {"kind": "skill", "id": "pairing", "strategy": "keyword", "content": "Pairing guide",
+         "keywords": ["pairing"], "compiled_keywords": ["pairing"]},
+        {"kind": "memory", "id": "preference", "book": "people", "strategy": "keyword",
+         "content": "Pairing preference", "keywords": ["pairing"], "compiled_keywords": ["pairing"]},
+    ]
+    _, skill_dynamic, _, memory_dynamic = build_knowledge_messages(
+        tmp_path, entries, instruction_text="pairing",
+    )
+    assert set(skill_dynamic[0]["_injected_hashes"]) == {"skill:pairing"}
+    assert set(memory_dynamic[0]["_injected_hashes"]) == {"memory:people/preference"}
+    history = [
+        {"role": "user", "content": message["content"], "message_type": "dynamic_context",
+         "_meta": {"injected_hashes": message["_injected_hashes"]}}
+        for message in (*skill_dynamic, *memory_dynamic)
+    ]
+    _, skill_dynamic, _, memory_dynamic = build_knowledge_messages(
+        tmp_path, entries, instruction_text="pairing", history=history,
+    )
+    assert not skill_dynamic
+    assert not memory_dynamic

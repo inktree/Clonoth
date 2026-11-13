@@ -188,6 +188,87 @@ def _current_message_media_text(message: discord.Message) -> str:
     return " ".join(parts).strip()
 
 
+_OUTBOUND_MENTION_OR_CODE_RE = re.compile(r"```[\s\S]*?```|``[^\r\n]+?``|`[^`\r\n]+`|<@!?(?!&)([^>\r\n]+)>")
+_BRACKET_IDENTITY_RE = re.compile(r"^(.+?)\[([^\[\]]+)\]$")
+
+
+def _sanitize_lookup_name(name: str, max_len: int = 32) -> str:
+    """Match the display-name format emitted by Discord context."""
+    name = name.replace("\n", " ").replace("\r", " ")
+    name = name.replace("[", "(").replace("]", ")").strip()
+    return name[:max_len] + "…" if len(name) > max_len else name
+
+
+def _iter_candidate_members(rt: Any, channel: Any) -> list[Any]:
+    """Prefer recent authors, then cached guild members, without duplicates."""
+    candidates: list[Any] = []
+    seen_ids: set[int] = set()
+    for entry in reversed(rt.channel_history.get(channel.id, [])):
+        message = entry["message"]
+        if message is None:
+            continue
+        author = message.author
+        if author.id not in seen_ids:
+            seen_ids.add(author.id)
+            candidates.append(author)
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        for member in channel.guild.members:
+            if member.id not in seen_ids:
+                seen_ids.add(member.id)
+                candidates.append(member)
+    return candidates
+
+
+def _match_member_id(candidates: list[Any], raw_target: str) -> int | None:
+    """Match account names before display names, including context identities."""
+    target = raw_target.strip().lstrip("@").strip()
+    bracket = _BRACKET_IDENTITY_RE.match(target)
+    if bracket:
+        uid = _match_member_id(candidates, bracket.group(2))
+        if uid is not None:
+            return uid
+        return _match_member_id(candidates, bracket.group(1))
+    target_lower = target.lower()
+    for member in candidates:
+        if target_lower in (member.name.lower(), _sanitize_lookup_name(member.name).lower()):
+            return member.id
+    for member in candidates:
+        names = (member.display_name, member.global_name)
+        if isinstance(member, discord.Member):
+            names += (member.nick,)
+        for name in names:
+            if name and target_lower in (name.lower(), _sanitize_lookup_name(name).lower()):
+                return member.id
+    return None
+
+
+def _resolve_outbound_mentions(rt: Any, channel: Any, text: str) -> str:
+    """Resolve named mentions at delivery only, leaving code and history intact."""
+    if "<@" not in text:
+        return text
+    candidates: list[Any] | None = None
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal candidates
+        target = match.group(1)
+        if target is None:
+            return match.group(0)
+        target = target.strip()
+        if target.isdigit():
+            return match.group(0)
+        if target.lower() in ("everyone", "here"):
+            return f"@{target}"
+        if candidates is None:
+            candidates = _iter_candidate_members(rt, channel)
+        uid = _match_member_id(candidates, target)
+        if uid is not None:
+            return f"<@{uid}>"
+        fallback = _BRACKET_IDENTITY_RE.sub(r"\1", target.lstrip("@"))
+        return f"@{fallback}"
+
+    return _OUTBOUND_MENTION_OR_CODE_RE.sub(replace, text)
+
+
 async def _send_split_text(
     rt: Any,
     channel: Any,
@@ -197,6 +278,7 @@ async def _send_split_text(
     files: list[discord.File] | None = None,
 ) -> list[discord.Message]:
     """统一处理代码块外的分段标记和超长文本，不截断内容。"""
+    text = _resolve_outbound_mentions(rt, channel, text)
     chunks = split_message_text(text, limit=1900, split_signal=rt.split_signal)
     if not chunks and files:
         chunks = [""]

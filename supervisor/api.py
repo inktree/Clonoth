@@ -159,8 +159,10 @@ def _conversation_message_to_compact_dict(message: Message) -> dict[str, Any]:
         meta.setdefault("message_type", message.message_type)
     if meta:
         result["_meta"] = meta
-    if message.ephemeral:
+    from engine.conversation_store import is_dynamic_context
+    if message.ephemeral or is_dynamic_context(message):
         result["_dynamic"] = True
+        result.setdefault("message_type", "dynamic_context")
     if message.tool_calls:
         result["tool_calls"] = message.tool_calls
     if message.tool_call_id:

@@ -79,6 +79,8 @@ def safe_subprocess_env() -> dict[str, str]:
         if ku.endswith("_API_KEY"):
             env.pop(k, None)
             continue
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
