@@ -539,7 +539,7 @@ def test_get_context_window_exposes_token_metrics_and_does_not_limit_calls(tmp_p
                 for text in [f"{effective:,}", f"{threshold:,}", source, "messages=12", f"prompt_tokens={prompt}"]:
                     assert text in data["result"]
     asyncio.run(run())
-    assert urls == ["http://supervisor/v1/sessions/parent/context_usage"] * 4
+    assert urls == ["http://supervisor/v1/sessions/parent/context_window"] * 4
 
 
 def test_manage_memory_dispatch_and_cache_invalidation(tmp_path):

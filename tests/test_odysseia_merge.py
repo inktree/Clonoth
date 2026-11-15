@@ -214,6 +214,30 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
     with TestClient(app) as client:
         assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
 
+    import httpx
+    from toolbox.builtins import tasks
+
+    active_session_id = state.get_or_create_session(channel="test", conversation_key="test:reset")
+
+    async def _call_context_window():
+        token = (data / ".admin_token").read_text(encoding="utf-8").strip()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://supervisor",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as http:
+            ctx = SimpleNamespace(
+                http=http,
+                supervisor_url="http://supervisor",
+                workspace_root=tmp_path,
+                route_session_id=lambda: active_session_id,
+                task_id="ctx-check",
+            )
+            return await tasks.get_context_window({}, ctx)
+
+    cw_res = asyncio.run(_call_context_window())
+    assert cw_res["ok"] and cw_res["data"]["prompt_tokens"] == 0
+
 
 def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path: Path):
     from types import SimpleNamespace
