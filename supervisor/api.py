@@ -294,7 +294,14 @@ def create_app(
     process_manager: ProcessManager | None,
     config_store: ConfigStore,
 ) -> FastAPI:
-    app = FastAPI(title="Clonoth Supervisor", version="0.1.0")
+    _enable_docs = os.environ.get("CLONOTH_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes"}
+    app = FastAPI(
+        title="Service",
+        version="0.1.0",
+        docs_url="/docs" if _enable_docs else None,
+        redoc_url="/redoc" if _enable_docs else None,
+        openapi_url="/openapi.json" if _enable_docs else None,
+    )
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
@@ -377,12 +384,19 @@ def create_app(
     )
 
     @app.get("/v1/health", response_model=HealthOut)
-    async def health() -> HealthOut:
+    async def health(request: Request) -> HealthOut:
         st: SupervisorState = app.state.state
         uptime = (_now() - st.started_at).total_seconds()
+        is_authed = False
+        try:
+            verify_admin_token(request)
+            is_authed = True
+        except HTTPException:
+            is_authed = app.state.panel_auth.permits(request)
         return HealthOut(
             run_id=st.eventlog.run_id, started_at=st.started_at,
-            uptime_seconds=uptime, workspace_root=str(st.workspace_root),
+            uptime_seconds=uptime,
+            workspace_root=str(st.workspace_root) if is_authed else "",
         )
 
     @app.get("/v1/admin/usage/stats")

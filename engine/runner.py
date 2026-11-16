@@ -699,13 +699,13 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             if _admin_token:
                 print("[engine] loaded admin token from shared file", flush=True)
 
-    _sup_headers: dict[str, str] = {"User-Agent": "Clonoth"}
+    _sup_headers: dict[str, str] = {}
     if _admin_token:
         _sup_headers["Authorization"] = f"Bearer {_admin_token}"
 
     async with (
         httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers=_sup_headers) as http,
-        httpx.AsyncClient(timeout=llm_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as llm_http,
+        httpx.AsyncClient(timeout=llm_timeout, trust_env=False) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
 
