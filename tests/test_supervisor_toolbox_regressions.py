@@ -1204,9 +1204,13 @@ def test_script_tools_use_utf8_and_surface_stderr(tmp_path, monkeypatch):
 
     monkeypatch.delenv("PYTHONUTF8", raising=False)
     monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "secret")
+    monkeypatch.setenv("CUSTOM_SECRET", "s")
     env = safe_subprocess_env()
     assert env["PYTHONUTF8"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
+    assert "CLONOTH_ADMIN_TOKEN" not in env
+    assert "CUSTOM_SECRET" not in env
     script = tmp_path / "unicode_tool.py"
     script.write_text(
         "import json, sys\n"

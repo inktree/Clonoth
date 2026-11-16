@@ -211,7 +211,12 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
         state=state, process_manager=None, config_store=ConfigStore(path=data / "config.yaml"),
     )
     with TestClient(app) as client:
-        assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
+        assert client.get("/v1/health").json()["workspace_root"] == ""
+        assert client.get("/openapi.json").status_code == 404
+        token = (data / ".admin_token").read_text(encoding="utf-8").strip()
+        assert client.get("/v1/health", headers={"Authorization": f"Bearer {token}"}).json()["workspace_root"] == str(tmp_path)
+    assert state.policy.evaluate_read_file(path="data/.admin_token").safety_level.value == "deny"
+    assert state.policy.evaluate_read_file(path="data/web_auth.json").safety_level.value == "deny"
 
     import httpx
     from toolbox.builtins import tasks
