@@ -95,25 +95,34 @@ async def _collect_attachments(
     rt: Any,
     message: discord.Message,
     conversation_key: str,
+    *,
+    extra_messages: list[discord.Message] | None = None,
 ) -> list[dict[str, Any]]:
-    """将消息及其引用中的附件保存到 data/attachments/，返回 Clonoth 附件列表。"""
+    """Save attachments from the current message and its ordered context sources."""
     result: list[dict[str, Any]] = []
-    all_atts = list(message.attachments)
-    if message.reference and message.reference.resolved and hasattr(message.reference.resolved, "attachments"):
-        all_atts.extend(message.reference.resolved.attachments)
+    candidates = [*(extra_messages or ()), message]
+    sources: list[discord.Message] = []
+    seen_messages: set[int] = set()
+    for src in candidates:
+        source_id = src.id
+        if source_id not in seen_messages:
+            seen_messages.add(source_id)
+            sources.append(src)
 
-    # --- 转发消息 (message_snapshots) 附件收集 ---
-    # Discord 转发消息的图片附件存储在 snapshot 内部，普通 message.attachments
-    # 为空，需要从 snapshot 额外提取，否则 agent 看不到转发消息里的图片。
-    for src in [message, (getattr(message.reference, "resolved", None) if message.reference else None)]:
-        if src is None:
-            continue
+    all_atts = []
+    seen_attachments: set[int] = set()
+    for src in sources:
+        source_atts = list(src.attachments)
         snaps = getattr(src, "message_snapshots", None)
-        if snaps and len(snaps) > 0:
+        if snaps:
             snap = snaps[0]
             snap_msg = getattr(snap, "message", snap)
-            snap_atts = getattr(snap_msg, "attachments", None) or getattr(snap, "attachments", None) or []
-            all_atts.extend(snap_atts)
+            source_atts.extend(getattr(snap_msg, "attachments", None) or getattr(snap, "attachments", None) or [])
+        for att in source_atts:
+            attachment_id = att.id
+            if attachment_id not in seen_attachments:
+                seen_attachments.add(attachment_id)
+                all_atts.append(att)
 
     logger.info("_collect_attachments: conv_key=%s, message.attachments=%d, all_atts=%d",
                 conversation_key, len(message.attachments), len(all_atts))

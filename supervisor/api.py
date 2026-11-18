@@ -902,7 +902,7 @@ def create_app(
             raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         save_path.write_bytes(content)
 
-        rel_path = str(save_path.relative_to(st.workspace_root))
+        rel_path = save_path.relative_to(st.workspace_root).as_posix()
         mime_type = file.content_type or "application/octet-stream"
         return {
             "path": rel_path,
