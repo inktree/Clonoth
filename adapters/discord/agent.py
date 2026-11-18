@@ -21,7 +21,10 @@ from aiohttp import web
 
 from clonoth_sdk import TriggerInfo
 
-from .context import _build_context_text, _build_reply_context, _ensure_channel, register_transient_msg
+from .context import (
+    _build_context_text, _build_reply_context, _ensure_channel, _ensure_thread_starter_history,
+    _resolve_reference_message, _unconsumed_history_messages, register_transient_msg,
+)
 from .messaging import _collect_attachments, _safe_restart, append_discord_reply_modality_hint
 
 
@@ -348,6 +351,8 @@ async def handle_agent(
     *,
     inbound_attachments: list[dict[str, Any]] | None = None,
     input_modality: str = "text",
+    ref_msg: discord.Message | None = None,
+    ref_resolved: bool = False,
 ) -> None:
     """入口：所有请求都走同一个 session，直接并发执行。"""
     conversation_key = f"discord:{channel_id}"
@@ -357,7 +362,11 @@ async def handle_agent(
 
     is_dm = isinstance(message.channel, (discord.DMChannel, discord.GroupChannel))
 
-    reply_context = await _build_reply_context(rt, message)
+    if not ref_resolved:
+        await _ensure_thread_starter_history(rt, message)
+        ref_msg = await _resolve_reference_message(rt, message)
+        ref_resolved = True
+    reply_context = await _build_reply_context(rt, message, ref_msg=ref_msg, ref_resolved=True)
     pre_q = _ensure_channel(rt, channel_id)
     new_wm = pre_q[-1].get("seq", -1) if pre_q else -1
     full_text = _build_context_text(
@@ -370,7 +379,11 @@ async def handle_agent(
     )
     full_text = append_discord_reply_modality_hint(rt, full_text, input_modality, is_dm)
     if inbound_attachments is None:
-        inbound_attachments = await _collect_attachments(rt, message, conversation_key)
+        extra_messages = [
+            *_unconsumed_history_messages(rt, channel_id, exclude_msg_id=message.id),
+            *([ref_msg] if ref_msg else []),
+        ]
+        inbound_attachments = await _collect_attachments(rt, message, conversation_key, extra_messages=extra_messages)
 
     # --- Preempt V2: 打断同 conversation 的 running task ---
     existing_sid = rt.session_state.get_session_id(conversation_key)

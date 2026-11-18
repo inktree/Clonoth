@@ -1244,3 +1244,131 @@ def test_knowledge_scan_ignores_discord_quote_and_dream_isolates_private_workspa
     )
     assert not skill_dynamic
     assert not memory_dynamic
+
+
+def test_discord_thread_starter_and_unresolved_reference_attachments(tmp_path, monkeypatch):
+    import discord
+    from adapters.discord.context import (
+        _build_context_text, _build_reply_context, _ensure_thread_starter_history,
+        _push_history, _resolve_reference_message, _unconsumed_history_messages,
+    )
+    from adapters.discord.messaging import _collect_attachments
+    from clonoth_sdk import SessionState
+
+    class Message(SimpleNamespace):
+        pass
+
+    class Thread(SimpleNamespace):
+        async def fetch_message(self, message_id):
+            self.fetches.append(message_id)
+            assert message_id == 1001
+            return starter_msg
+
+    monkeypatch.setattr(discord, "Message", Message)
+    monkeypatch.setattr(discord, "Thread", Thread)
+    reads = []
+    image_bytes = b"\x89PNG\r\n\x1a\nthread-starter-image"
+
+    async def read_image():
+        reads.append(2001)
+        return image_bytes
+
+    att_starter = SimpleNamespace(id=2001, filename="error.png", content_type="image/png", read=read_image)
+    author = SimpleNamespace(id=42, name="alice", display_name="Alice", bot=False)
+    ch = Thread(id=1001, parent_id=None, parent=None, fetches=[])
+    starter_msg = Message(
+        id=1001, channel=ch, guild=None, author=author, content="一楼报错如图",
+        created_at=datetime.now(timezone.utc), attachments=[att_starter], stickers=[], embeds=[], reference=None,
+    )
+    msg_2 = Message(
+        id=1002, channel=ch, guild=None, author=author, content="请帮我看一下",
+        created_at=datetime.now(timezone.utc), attachments=[], stickers=[], embeds=[], reference=None,
+    )
+    rt = SimpleNamespace(
+        workspace=tmp_path, clonoth_client=None, dc_client=SimpleNamespace(user=None),
+        channel_history={}, history_seq_counter=0, history_max_len=15, key_roles=set(),
+        superusers=set(), session_state=SessionState(), transient_msg_ids=[],
+    )
+
+    async def run():
+        _push_history(rt, ch.id, msg_2.content, message=msg_2)
+        await _ensure_thread_starter_history(rt, msg_2)
+        await _ensure_thread_starter_history(rt, msg_2)
+        assert ch.fetches == [1001]
+        assert [e["msg_id"] for e in rt.channel_history[ch.id]] == [1001, 1002]
+        text = _build_context_text(rt, ch.id, author, msg_2.content, exclude_last=True)
+        assert "【群聊上下文记录】" in text and "一楼报错如图" in text
+        attachments = await _collect_attachments(
+            rt, msg_2, "discord:1001",
+            extra_messages=_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_2.id),
+        )
+        assert len(attachments) == 1 and attachments[0]["type"] == "image"
+        assert attachments[0]["path"].startswith("data/attachments/")
+        assert "\\" not in attachments[0]["path"]
+        assert (tmp_path / attachments[0]["path"]).read_bytes() == image_bytes
+
+        msg_reply = Message(**{**vars(msg_2), "id": 1004, "reference": SimpleNamespace(
+            resolved=None, message_id=1001, fail_if_not_exists=False,
+        )})
+        ref_msg = await _resolve_reference_message(rt, msg_reply)
+        assert ref_msg is starter_msg and ch.fetches == [1001]
+        reply_context = await _build_reply_context(rt, msg_reply)
+        quoted = _build_context_text(rt, ch.id, author, msg_reply.content, reply_context=reply_context)
+        assert "【当前消息引用】" in quoted and "一楼报错如图" in reply_context
+        before = len(reads)
+        deduped = await _collect_attachments(rt, msg_reply, "discord:1001", extra_messages=[
+            *_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_reply.id), ref_msg,
+        ])
+        assert len(deduped) == 1 and len(reads) == before + 1
+
+        current_seq = rt.channel_history[ch.id][-1]["seq"]
+        rt.session_state.last_ctx_seq[ch.id] = current_seq
+        msg_3 = Message(**{**vars(msg_2), "id": 1003})
+        _push_history(rt, ch.id, msg_3.content, message=msg_3)
+        await _ensure_thread_starter_history(rt, msg_3)
+        assert await _collect_attachments(rt, msg_3, "discord:1001", extra_messages=
+            _unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_3.id)) == []
+        assert ch.fetches == [1001]
+        # Explicit replies remain readable after history eviction and consumption.
+        rt.channel_history[ch.id] = []
+        assert await _resolve_reference_message(rt, msg_reply) is starter_msg
+        assert ch.fetches == [1001, 1001]
+
+        rt.session_state = SessionState()
+        rt.channel_history[ch.id] = []
+        for i in range(rt.history_max_len):
+            msg_last = Message(**{**vars(msg_2), "id": 1100 + i})
+            _push_history(rt, ch.id, msg_last.content, message=msg_last)
+        assert len(rt.channel_history[ch.id]) == rt.history_max_len
+        await _ensure_thread_starter_history(rt, msg_last)
+        q = rt.channel_history[ch.id]
+        assert len(q) == rt.history_max_len
+        assert q[0]["message"] is starter_msg and q[0]["msg_id"] == 1001
+        assert q[-1]["message"] is msg_last
+
+        starter_msg.content = ""
+        starter_msg.attachments = []
+        starter_msg.message_snapshots = [SimpleNamespace(
+            content="转发的报错", embeds=[], attachments=[att_starter],
+        )]
+        rt.channel_history[ch.id] = []
+        _push_history(rt, ch.id, msg_last.content, message=msg_last)
+        await _ensure_thread_starter_history(rt, msg_last)
+        assert "[转发] 转发的报错 [含1张图片]" in rt.channel_history[ch.id][0]["text"]
+        forwarded = await _collect_attachments(
+            rt, msg_last, "discord:1001",
+            extra_messages=_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_last.id),
+        )
+        assert len(forwarded) == 1 and forwarded[0]["type"] == "image"
+        assert (tmp_path / forwarded[0]["path"]).read_bytes() == image_bytes
+
+        async def fetch_missing(message_id):
+            raise discord.HTTPException(SimpleNamespace(status=404, reason="Not Found"), "missing")
+
+        ch.parent = SimpleNamespace(id=999)
+        ch.parent_id = 999
+        ch.fetch_message = fetch_missing
+        rt.channel_history[ch.id] = []
+        assert await _resolve_reference_message(rt, msg_reply) is None
+
+    asyncio.run(run())
