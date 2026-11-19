@@ -1200,3 +1200,97 @@ def test_discord_thread_starter_and_unresolved_reference_attachments(tmp_path, m
         assert await _resolve_reference_message(rt, msg_reply) is None
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure_transport", ["sse", "http"])
+def test_openai_responses_stateless_payload_and_item_conflict_recovery(failure_transport):
+    import json
+    from providers.openai_responses import OpenAIResponsesProvider
+
+    raw_output = [
+        {"type": "reasoning", "id": "rs_old", "status": "completed",
+         "summary": [{"type": "summary_text", "text": "do not replay"}],
+         "encrypted_content": "encrypted-thought"},
+        {"type": "reasoning", "id": "rs_empty", "summary": []},
+        {"type": "message", "id": "msg_old", "status": "completed", "role": "assistant",
+         "content": [{"type": "output_text", "text": "Checking"}]},
+        {"type": "function_call", "id": "fc_old", "status": "completed",
+         "call_id": "call_old", "name": "read_file", "arguments": "{}"},
+    ]
+    messages = [
+        {"role": "assistant", "content": "Checking", "_meta": {"metadata": {
+            "openai-responses": {"raw_output": raw_output},
+        }}},
+        {"role": "tool", "tool_call_id": "call_old", "content": "file contents"},
+    ]
+    requests = []
+    completed = {"output": raw_output, "usage": {"input_tokens": 10, "output_tokens": 2}}
+
+    def respond(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if not payload["stream"]:
+            return httpx.Response(200, json=completed)
+        if len(requests) == 1:
+            error = {
+                "type": "invalid_request_error", "code": "item_conflict",
+                "message": "An input item conflicts with an existing record.", "param": "input",
+            }
+            if failure_transport == "http":
+                response = httpx.Response(
+                    400, headers={"content-type": "application/json"},
+                    stream=httpx.ByteStream(json.dumps({"error": error}).encode()),
+                )
+                assert not response.is_stream_consumed
+                with pytest.raises(httpx.ResponseNotRead):
+                    response.json()
+                return response
+            events = [{"type": "error", "error": error}]
+        else:
+            events = [
+                {"type": "response.output_text.delta", "delta": "Recovered"},
+                {"type": "response.completed", "response": completed},
+            ]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"data: {json.dumps(event)}\n\n" for event in events))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            provider = OpenAIResponsesProvider(http=http, api_key="test", base_url=None, model="test")
+            instructions, input_items = provider._convert_messages(messages)
+            payload = provider._build_payload(
+                input_items=input_items, instructions=instructions, tools=None, stream=True,
+            )
+            assert payload["store"] is False
+            assert payload["include"] == ["reasoning.encrypted_content"]
+            assert all("id" not in item and "status" not in item for item in input_items)
+            reasoning = [item for item in input_items if item["type"] == "reasoning"]
+            assert reasoning == [{"type": "reasoning", "summary": [], "encrypted_content": "encrypted-thought"}]
+            assert input_items[-2] == {
+                "type": "function_call", "call_id": "call_old", "name": "read_file", "arguments": "{}",
+            }
+            assert input_items[-1] == {
+                "type": "function_call_output", "call_id": "call_old", "output": "file contents",
+            }
+            text = []
+
+            async def on_text(delta):
+                text.append(delta)
+
+            result = await provider.chat_stream(messages=messages, on_text=on_text)
+            assert result.ok and result.text == "Recovered"
+            assert text == ["Recovered"]
+            assert len(requests) == 2
+            assert requests[0]["input"] == input_items
+            assert requests[1]["input"] == [item for item in input_items if item["type"] != "reasoning"]
+            assert all(request["store"] is False for request in requests)
+            expected_raw = input_items[:-1]
+            assert result.provider_meta["raw_output"] == expected_raw
+            result = await provider.chat(messages=messages)
+            assert result.ok
+            assert result.provider_meta["raw_output"] == expected_raw
+            # Replaying persisted history must not mutate the stored records.
+            assert raw_output[0]["id"] == "rs_old"
+            assert raw_output[0]["summary"]
+
+    asyncio.run(run())
