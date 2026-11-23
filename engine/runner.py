@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -22,6 +23,8 @@ from clonoth_runtime import (
     load_runtime_config,
     load_yaml_dict,
     normalize_llm_secret,
+    resolve_system_model,
+    SYSTEM_NODE_MODEL_SLOTS,
 )
 from providers import registry as provider_registry
 from toolbox.context import ToolContext
@@ -120,6 +123,29 @@ def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> An
         if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
     }
     return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
+
+
+def _apply_system_model_slot(workspace_root: Path, node: Any) -> Any:
+    """Return the node with its system_models slot applied (system nodes only).
+
+    A configured slot (config.yaml system_models.<slot> or CLONOTH_<SLOT>_* env)
+    replaces the node's own channel and model: an empty provider follows the
+    global active channel, and empty model/base_url/api_key come from that
+    channel's config section.
+    """
+    slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
+    if not slot:
+        return node
+    sm = resolve_system_model(workspace_root, slot)
+    if not (sm.provider or sm.model or sm.base_url or sm.api_key):
+        return node
+    return dataclasses.replace(
+        node,
+        provider=sm.provider,
+        model=sm.model,
+        base_url=sm.base_url,
+        api_key=sm.api_key,
+    )
 
 
 def _create_provider_from_registry(
@@ -1205,9 +1231,10 @@ async def _run_node_task(
         # default provider for nodes that do not pin node.provider. Purpose: switching
         # ACTIVE to deepseek/openai-responses changes ordinary AI task routing.
         _active_provider = str((_config_data or {}).get("provider") or "openai").strip() if isinstance(_config_data, dict) else "openai"
+        _resolve_node = _apply_system_model_slot(ws_root, node)
         rp = resolve_provider(
             ws_root,
-            node,
+            _resolve_node,
             default_model,
             session_override=session_provider_override,
             provider_configs=_provider_configs,
