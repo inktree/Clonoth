@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -22,9 +23,11 @@ from clonoth_runtime import (
     load_runtime_config,
     load_yaml_dict,
     normalize_llm_secret,
+    resolve_system_model,
+    SYSTEM_NODE_MODEL_SLOTS,
 )
 from providers import registry as provider_registry
-from toolbox.context import ToolContext
+from toolbox.context import ToolContext, platform_user_id_from_task_context
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
@@ -120,6 +123,29 @@ def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> An
         if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
     }
     return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
+
+
+def _apply_system_model_slot(workspace_root: Path, node: Any) -> Any:
+    """Return the node with its system_models slot applied (system nodes only).
+
+    A configured slot (config.yaml system_models.<slot> or CLONOTH_<SLOT>_* env)
+    replaces the node's own channel and model: an empty provider follows the
+    global active channel, and empty model/base_url/api_key come from that
+    channel's config section.
+    """
+    slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
+    if not slot:
+        return node
+    sm = resolve_system_model(workspace_root, slot)
+    if not (sm.provider or sm.model or sm.base_url or sm.api_key):
+        return node
+    return dataclasses.replace(
+        node,
+        provider=sm.provider,
+        model=sm.model,
+        base_url=sm.base_url,
+        api_key=sm.api_key,
+    )
 
 
 def _create_provider_from_registry(
@@ -400,7 +426,30 @@ def _wrap_stored_inbound_callback(content: Any, *, message_type: str, meta: dict
     return content
 
 
-def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict[str, Any]:
+def _is_qq_task_context(task_context: dict[str, Any], runtime_cfg: dict[str, Any]) -> bool:
+    """Return True for QQ / OneBot conversations (including dispatched child tasks)."""
+    auth = task_context.get("platform_auth") if isinstance(task_context.get("platform_auth"), dict) else {}
+    hints = task_context.get("route_hints") if isinstance(task_context.get("route_hints"), dict) else {}
+    platform = str(auth.get("platform") or hints.get("platform") or "").strip().lower()
+    if platform in {"qq", "onebot"}:
+        return True
+    conv_key = str(
+        task_context.get("route_conversation_key")
+        or task_context.get("conversation_key")
+        or ""
+    ).strip()
+    from engine.builtin.knowledge_inject import isolated_conversation_key
+
+    isolated_key = isolated_conversation_key(conv_key, runtime_cfg)
+    return isolated_key.startswith("qq_") or conv_key.startswith("qq_")
+
+
+def _message_to_history_dict(
+    msg: Message,
+    *,
+    current_task_id: str = "",
+    strip_cross_task_images: bool = False,
+) -> dict[str, Any]:
     """将 ConversationStore 的 Message 转为 runner 期望的 history dict 格式。
 
     Child Session 隔离（Phase B）：从 child session JSONL 加载的 Message 对象
@@ -413,16 +462,19 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     d: dict[str, Any] = {"role": msg.role, "content": _wrap_stored_inbound_callback(msg.content, message_type=msg.message_type, meta=msg.meta)}
     if msg.id:
         d["id"] = msg.id
-    # [AutoC 2026-06-01] Why: stripping every historical image made later LLM
-    # steps in the same task lose the user's image input. How: keep multimodal
-    # list content when source_task_id matches the active task, but preserve the
-    # old all-strip behavior for callers that do not pass current_task_id. Purpose:
-    # task-local history keeps locked user input while cross-task history stays
-    # compact and safe against stale file:// attachment references.
-    # [2026-10-26] Disabled cross-task historical image stripping (_strip_images_from_content):
-    # stripping image_url parts from previous turns mutates the historical message prefix on the next turn
-    # and invalidates the entire Prefix KV Cache from that message onward.
     _meta = dict(msg.meta) if msg.meta else {}
+    # QQ / OneBot history uses path annotations across tasks, avoiding repeated
+    # safety-filter failures and unrelated image tokens. Other platforms retain
+    # the original image blocks and their stable prefix across turns.
+    if strip_cross_task_images and isinstance(d["content"], list) and msg.source_task_id != current_task_id:
+        _image_count = sum(
+            1 for p in d["content"] if isinstance(p, dict) and p.get("type") == "image_url"
+        )
+        if _image_count:
+            d["content"] = _strip_images_from_content(d["content"])
+            # Read by compact's prompt-token seed to discount images that were
+            # counted in that task's prompt_tokens but are no longer sent.
+            _meta["_stripped_images_count"] = _image_count
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
@@ -517,6 +569,7 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
     """
     text_parts: list[str] = []
     image_refs: list[str] = []
+    file_paths: list[str] = []
     for part in content:
         if not isinstance(part, dict):
             continue
@@ -534,7 +587,7 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
             # inline marker. Purpose: avoid re-sending image bytes but preserve a
             # read_file-compatible path when one exists.
             if url.startswith("file://"):
-                image_refs.append(f"[image: {url[7:]}]")
+                file_paths.append(url[7:])
             else:
                 image_refs.append("[image: <inline>]")
         elif part.get("type") == "text":
@@ -542,6 +595,9 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
             if t:
                 text_parts.append(t)
     text = "\n".join(text_parts)
+    # build_multimodal_content already annotates "[Attached images: path]";
+    # only add a reference for paths the text does not mention yet.
+    image_refs = [f"[image: {p}]" for p in file_paths if p not in text] + image_refs
     if image_refs:
         refs = "\n".join(image_refs)
         text = f"{text}\n{refs}" if text else refs
@@ -1078,6 +1134,7 @@ async def _run_node_task(
     # 加载 history，与 child session 同源；_persist_ctx 不写 snapshot。
     # flag 关闭时回退到旧 snapshot 机制（context_ref + load_context_snapshot）。
     _runtime_cfg_main = load_runtime_config(ws_root)
+    _strip_historical_images = _is_qq_task_context(rctx.task_context, _runtime_cfg_main)
     _main_conv_enabled = bool(
         _runtime_cfg_main.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
     )
@@ -1092,7 +1149,15 @@ async def _run_node_task(
 
         # Resume uses the child's own durable history, just like the main session.
         stored = _conv_store.load(child_session_id)
-        history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+        history = [
+            _message_to_history_dict(
+                m,
+                current_task_id=task_id,
+                strip_cross_task_images=_strip_historical_images,
+            )
+            for m in stored
+            if m.role != "system"
+        ]
         history = sanitize_control_tool_history(history)
         history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
@@ -1107,7 +1172,15 @@ async def _run_node_task(
         # 此时 context_ref 为空，ai_step 会走 assemble_initial_messages，需要 history 不为空。
         if use_context:
             stored = _conv_store.load(session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+            history = [
+                _message_to_history_dict(
+                    m,
+                    current_task_id=task_id,
+                    strip_cross_task_images=_strip_historical_images,
+                )
+                for m in stored
+                if m.role != "system"
+            ]
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
             # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
             # 原因：旧 _strip_trailing_pseudo_call 只能处理 fake-native 文本 marker。
@@ -1192,9 +1265,10 @@ async def _run_node_task(
         # default provider for nodes that do not pin node.provider. Purpose: switching
         # ACTIVE to deepseek/openai-responses changes ordinary AI task routing.
         _active_provider = str((_config_data or {}).get("provider") or "openai").strip() if isinstance(_config_data, dict) else "openai"
+        _resolve_node = _apply_system_model_slot(ws_root, node)
         rp = resolve_provider(
             ws_root,
-            node,
+            _resolve_node,
             default_model,
             session_override=session_provider_override,
             provider_configs=_provider_configs,
@@ -1539,6 +1613,7 @@ async def _run_tool_task(
         session_generation=session_generation,
         parent_session_id=parent_session_id,
         conversation_key=str(_task_ctx.get("conversation_key", "")).strip(),
+        platform_user_id=platform_user_id_from_task_context(_task_ctx),
         approval_poll_interval_sec=0.5,
         # [AutoC 2026-05-31] Why: direct standalone tool tasks can still trigger
         # policy approvals. How: use the task id as the best available tool_call_id

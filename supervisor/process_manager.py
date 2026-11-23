@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from clonoth_runtime import get_bool, get_float, get_int, get_str, load_runtime_config
 
@@ -56,6 +57,11 @@ class ProcessManager:
         self._stopped = False
         self._restart_pending = False
         self._restarting_engine = False  # restart engine 期间抑制信号退出
+        # Set by supervisor.main to ask the HTTP server to exit gracefully. Raising
+        # SystemExit from the signal handler would abort the event loop before
+        # anyio's worker threads are told to stop, and the interpreter then waits
+        # on those non-daemon threads until systemd SIGKILLs the process.
+        self.request_shutdown: Callable[[], None] | None = None
 
         # 日志函数：写日志文件而不是终端。
         self._log = log_func or (lambda msg: print(msg))
@@ -96,13 +102,14 @@ class ProcessManager:
         self.spawn_napcat = get_bool(runtime_cfg, "supervisor.process_manager.spawn_napcat", False)
         self.onebot_host = get_str(runtime_cfg, "supervisor.process_manager.onebot_host", "127.0.0.1")
         self.onebot_port = get_int(runtime_cfg, "supervisor.process_manager.onebot_port", 18080, min_value=1, max_value=65535)
-        self.onebot_entry_node = get_str(runtime_cfg, "supervisor.process_manager.onebot_entry_node", "qq_assistant")
+        self.onebot_entry_node = get_str(runtime_cfg, "supervisor.process_manager.onebot_entry_node", "qq.orchestrator")
         self.napcat_quick_login = get_str(runtime_cfg, "supervisor.process_manager.napcat_quick_login", "")
+        # Legacy: CLONOTH_ADMIN_QQ_USERS in .env takes precedence (adapters/onebot/config.py).
         self.onebot_superusers = get_str(runtime_cfg, "supervisor.process_manager.onebot_superusers", "")
         self.onebot_owner_id = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_id", "")
         self.onebot_owner_name = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_name", "")
         self.onebot_voice_input = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_input", True)
-        self.onebot_voice_reply = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply", True)
+        self.onebot_voice_reply = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply", False)
         self.onebot_voice_reply_on_voice_input = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_on_voice_input", True)
         self.onebot_voice_reply_auto_on_text = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_auto_on_text", True)
         self.onebot_voice_reply_private = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_private", True)
@@ -132,6 +139,9 @@ class ProcessManager:
                 if self._restarting_engine:
                     return
                 self._cleanup()
+                if self.request_shutdown is not None:
+                    self.request_shutdown()
+                    return
                 # 调用原有的 handler
                 if callable(_prev) and _prev not in (signal.SIG_IGN, signal.SIG_DFL):
                     _prev(signum, frame)
@@ -262,7 +272,10 @@ class ProcessManager:
             return
         self.onebot_adapter = self._spawn(
             name="onebot-adapter",
-            module="adapters.onebot.app",
+            # Run app.py as a script: `-m adapters.onebot.app` imports the
+            # adapters.onebot package first, whose import calls get_driver()
+            # before nonebot.init() and crashes.
+            script_path=self.workspace_root / "adapters" / "onebot" / "app.py",
             capture_output=True,
             new_console=False,
             pass_supervisor_arg=False,
@@ -273,7 +286,7 @@ class ProcessManager:
                 "CLONOTH_URL": self.supervisor_url,
                 "CLONOTH_WORKSPACE": str(self.workspace_root),
                 "CLONOTH_ENTRY_NODE": self.onebot_entry_node,
-                "CLONOTH_QQ_SUPERUSERS": self.onebot_superusers,
+                "CLONOTH_QQ_SUPERUSERS": getattr(self, "onebot_superusers", ""),
                 "CLONOTH_QQ_OWNER_ID": self.onebot_owner_id,
                 "CLONOTH_QQ_OWNER_NAME": self.onebot_owner_name,
                 "CLONOTH_ONEBOT_VOICE_INPUT": str(self.onebot_voice_input).lower(),

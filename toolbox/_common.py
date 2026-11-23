@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,6 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_ENV_KEYS_UPPER = {
-    "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
@@ -65,16 +65,14 @@ _SENSITIVE_ENV_KEYS_UPPER = {
     "REDIS_CONN_STRING",
 }
 
-_SENSITIVE_ENV_SUFFIXES_UPPER = (
-    "_API_KEY",
-    "_SECRET",
-    "_TOKEN",
-    "_PASSWORD",
-    "_PASSWD",
-    "_PWD",
-    "_COOKIE",
-    "_PRIVATE_KEY",
-    "_DSN",
+# Credential-shaped variable names (API keys, admin / bridge / access tokens,
+# passwords, cookies, DSNs...). Command output can end up in chat replies, so
+# these never reach subprocesses; tools that need one read it from the workspace .env.
+# Superset of upstream's suffix list (_API_KEY/_SECRET/_TOKEN/_PASSWORD/_PASSWD/
+# _PWD/_COOKIE/_PRIVATE_KEY/_DSN); "_PWD$" keeps PWD/OLDPWD untouched.
+_SENSITIVE_ENV_NAME = re.compile(
+    r"API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|COOKIE|ACCESS_KEY"
+    r"|_PWD$|DSN|CONN_STRING"
 )
 
 
@@ -91,7 +89,7 @@ def safe_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     for k in list(env.keys()):
         ku = k.upper()
-        if ku in _SENSITIVE_ENV_KEYS_UPPER or ku.endswith(_SENSITIVE_ENV_SUFFIXES_UPPER):
+        if ku in _SENSITIVE_ENV_KEYS_UPPER or _SENSITIVE_ENV_NAME.search(ku):
             env.pop(k, None)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"

@@ -80,6 +80,13 @@ class InboundMessageIn(BaseModel):
     # creation, before the entry task is dispatched. Purpose: the model chosen on
     # the welcome page takes effect on the very first response, with no race.
     provider_override: dict[str, Any] | None = None
+    # Platform identity produced by trusted adapters (OneBot/Discord), never
+    # parsed from user text: {"platform": "qq", "user_id": ..., "is_admin": bool}.
+    # Carried into task_context; supervisor permission checks read it from there.
+    platform_auth: dict[str, Any] = Field(default_factory=dict)
+    # Adapter routing hints, e.g. {"platform", "channel", "has_image",
+    # "target_type"}. Used only for capability routing (vision entry node).
+    route_hints: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundMessageOut(BaseModel):
@@ -221,6 +228,11 @@ class Approval(BaseModel):
     tool_call_id: str | None = None
     node_id: str | None = None
     task_id: str | None = None
+    # Where the approval was triggered, so the reviewer knows which chat asked:
+    # {"conversation_key": user-facing route key (dispatch children resolve to
+    # the parent chat), "channel", "platform", "target_type": "group"|"private",
+    # "user_id": requester}. Adapters map the key to a display name.
+    origin: dict[str, Any] = Field(default_factory=dict)
 
 
 class OpRequestIn(BaseModel):
@@ -381,9 +393,33 @@ class ActiveProviderIn(BaseModel):
     provider: str
 
 
+class FallbackEntryIn(BaseModel):
+    """备用链编辑器的一项。api_key 留空保留 source_index 指向的原条目的 key。"""
+    provider: str
+    model: str
+    base_url: str = ""
+    api_key: str = ""
+    clear_api_key: bool = False
+    source_index: int | None = None
+
+
 class FallbacksUpdateIn(BaseModel):
     """更新 fallback 链"""
-    fallbacks: list[dict[str, Any]]
+    fallbacks: list[FallbackEntryIn]
+
+
+class ModelVisionIn(BaseModel):
+    """设置模型是否可识图（model_capabilities.<model>.vision）"""
+    model: str
+    vision: bool
+
+
+class SystemModelUpdateIn(BaseModel):
+    """更新 system_models.<slot>；None 保持不变，空字符串清除"""
+    provider: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
 
 
 class ConfigReloadOut(BaseModel):

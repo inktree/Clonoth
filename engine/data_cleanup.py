@@ -7,6 +7,8 @@ Crontab every 6h. Pure Python, no LLM calls.
 2. temp files: chat_dump/chunk/compact/messages, temp_summary (>24h)
 3. artifacts (>24h)
 4. attachments (>24h)
+5. QQ/NapCat internal media/cache files (>7d, conservative; NapCat/temp kept)
+6. OneBot adapter caches data/cache/onebot_* (>24h)
 """
 
 import logging
@@ -14,7 +16,10 @@ import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 # ── Paths ──────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -30,6 +35,36 @@ TEMP_MAX_AGE = 24 * 3600              # 24 h
 ARTIFACT_MAX_AGE = 24 * 3600          # 24 h
 ATTACH_MAX_AGE = 24 * 3600            # 24 h
 
+# QQ/NapCat internal cache. QQ may run in its own mount namespace (HOME=/app);
+# the host-side timer then reaches it through /proc/<qq-pid>/root/... .
+# Only media files or files under cache-like directories are removed, never
+# login state or account databases. CLONOTH_QQ_CACHE_ROOTS adds roots
+# (comma/newline separated); CLONOTH_QQ_CACHE_MAX_AGE_SECONDS<=0 disables.
+QQ_CACHE_MAX_AGE = float(os.getenv("CLONOTH_QQ_CACHE_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
+QQ_CACHE_ROOTS_RAW = os.getenv("CLONOTH_QQ_CACHE_ROOTS", "")
+QQ_CACHE_MEDIA_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+    ".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".m4v",
+}
+QQ_CACHE_DIR_KEYWORDS = {
+    "cache", "cache_data", "code cache", "gpucache", "blob_storage",
+    "tmp", "temp", "download", "downloads", "thumb", "thumbnail", "thumbnails",
+    # NTQQ account media caches: <qq>/Image and <qq>/Video.
+    "image", "images", "pic", "pics", "video", "videos", "emoji", "face", "record",
+}
+# Runtime working directories that must never be removed even when empty.
+# NapCat writes every outgoing image/emoji to NapCat/temp/<uuid> and empties it
+# afterwards; removing it makes image sends fail with ENOENT and, through
+# /proc/<pid>/root, can detach a bind mount in the container namespace.
+QQ_CACHE_PROTECTED_DIR_PARTS = (
+    ("napcat", "temp"),
+)
+
+# OneBot adapter caches in data/cache/ (e.g. onebot_reply_attachments.json, an
+# index of already-stored attachments). Same age as attachments.
+ONEBOT_CACHE_MAX_AGE = float(os.getenv("CLONOTH_ONEBOT_CACHE_MAX_AGE_SECONDS", str(24 * 3600)))
+ONEBOT_CACHE_GLOB = "onebot_*"
+
 TEMP_GLOBS = [
     "chat_dump_*", "chat_chunk_*", "chat_compact_*", "chat_messages_*",
 ]
@@ -41,6 +76,22 @@ CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
 # Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
 # 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
 NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
+
+# Persistent memory entry cleanup. Entries with constant=true are protected.
+# For ordinary entries, use last_hit_at first, then updated_at, then created_at,
+# so recently activated memories survive even if created long ago. Entries
+# without any timestamp are kept. 0 disables.
+MEMORY_ENTRY_MAX_AGE = float(os.getenv("CLONOTH_MEMORY_ENTRY_MAX_AGE_SECONDS", str(14 * 24 * 3600)))
+
+# TaskRecord transcripts data/transcripts/*.jsonl grow per session forever otherwise.
+TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
+
+# Process logs data/logs/*.log (restarts create many small files); keep cleanup.log.
+LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(3 * 24 * 3600)))  # 3 d
+LOG_KEEP_NAMES = {"cleanup.log"}
+
+# Debug-only LLM error snapshots.
+LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE_SECONDS", str(3 * 24 * 3600)))
 
 
 def _log_init():
@@ -229,6 +280,324 @@ def prune_stats_db():
     logging.info("[stats_db] pruned old statistics and vacuumed %s", db_path)
 
 
+# ── QQ/NapCat internal cache cleanup ───────────
+def _split_configured_roots(raw: str) -> list[Path]:
+    roots: list[Path] = []
+    for item in str(raw or "").replace("\n", ",").split(","):
+        value = item.strip()
+        if value:
+            roots.append(Path(value))
+    return roots
+
+
+def _read_proc_strings(path: Path) -> list[str]:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return []
+    return [x.decode("utf-8", "replace") for x in data.split(b"\0") if x]
+
+
+def _append_unique_path(paths: list[Path], path: Path) -> None:
+    key = str(path)
+    if not key or key == ".":
+        return
+    if all(str(x) != key for x in paths):
+        paths.append(path)
+
+
+def _discover_qq_cache_roots() -> list[Path]:
+    """Return conservative candidate roots for NTQQ/NapCat cache cleanup.
+
+    Typical NapCat/LinuxQQ layouts launch QQ from /opt/QQ/qq (the LinuxQQ package
+    default); the NapCat Docker image runs it with HOME=/app so Chromium child
+    processes use --user-data-dir=/app/.config/QQ.  When /app lives only in QQ's
+    mount namespace, a host-side timer can still access it through
+    /proc/<pid>/root/app/....  Extra roots can be supplied via QQ_CACHE_ROOTS_RAW.
+    """
+    roots: list[Path] = []
+    for p in _split_configured_roots(QQ_CACHE_ROOTS_RAW):
+        _append_unique_path(roots, p)
+
+    for p in (Path("/app/.config/QQ"), Path("/app/napcat"), Path("/root/.config/QQ")):
+        _append_unique_path(roots, p)
+
+    proc = Path("/proc")
+    if not proc.exists():
+        return roots
+
+    for pid_dir in proc.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        cmdline = _read_proc_strings(pid_dir / "cmdline")
+        environ = _read_proc_strings(pid_dir / "environ")
+        haystack = "\n".join(cmdline + environ)
+        if "/opt/QQ/qq" not in haystack and "--user-data-dir=" not in haystack and "napcat" not in haystack.lower():
+            continue
+
+        proc_root = pid_dir / "root"
+        for index, arg in enumerate(cmdline):
+            user_data_dir = ""
+            if arg.startswith("--user-data-dir="):
+                user_data_dir = arg.split("=", 1)[1]
+            elif arg == "--user-data-dir" and index + 1 < len(cmdline):
+                user_data_dir = cmdline[index + 1]
+            if user_data_dir.startswith("/"):
+                _append_unique_path(roots, proc_root / user_data_dir.lstrip("/"))
+
+        home = ""
+        for item in environ:
+            if item.startswith("HOME="):
+                home = item.split("=", 1)[1].strip()
+                break
+        if home.startswith("/"):
+            _append_unique_path(roots, proc_root / home.lstrip("/") / ".config" / "QQ")
+            _append_unique_path(roots, proc_root / home.lstrip("/") / "napcat")
+
+    return roots
+
+
+def _is_safe_qq_cache_root(root: Path) -> bool:
+    text = str(root)
+    if not text or text in {"/", "/app", "/root", "/proc"}:
+        return False
+    lowered = text.lower()
+    return "qq" in lowered or "napcat" in lowered
+
+
+def _is_cache_like_relative_path(rel: Path) -> bool:
+    for part in rel.parts[:-1]:
+        lowered = part.lower()
+        compact = lowered.replace(" ", "")
+        if any(keyword in lowered or keyword.replace(" ", "") in compact for keyword in QQ_CACHE_DIR_KEYWORDS):
+            return True
+    return False
+
+
+def _is_protected_qq_dir(rel: Path) -> bool:
+    """Return True if *rel* is (or is inside) a protected runtime directory."""
+    parts = [part.lower() for part in rel.parts]
+    for protected in QQ_CACHE_PROTECTED_DIR_PARTS:
+        width = len(protected)
+        for i in range(len(parts) - width + 1):
+            if tuple(parts[i:i + width]) == protected:
+                return True
+    return False
+
+
+def _remove_stale_empty_qq_dir(dp: Path, root: Path, cutoff: float) -> bool:
+    """Remove an empty cache-like directory only when it is safe and stale.
+
+    Empty directories are kept unless they have not been modified since
+    *cutoff*: QQ/NapCat create many working directories once and expect them to
+    keep existing even while empty.
+    """
+    if dp == root:
+        return False
+    try:
+        rel = dp.relative_to(root)
+        if not _is_cache_like_relative_path(rel / "placeholder"):
+            return False
+        if _is_protected_qq_dir(rel):
+            return False
+        if os.path.ismount(dp):
+            return False
+        if dp.stat().st_mtime >= cutoff:
+            return False
+        if any(dp.iterdir()):
+            return False
+        dp.rmdir()
+        return True
+    except Exception:
+        return False
+
+
+def purge_qq_internal_cache():
+    """Clean stale NTQQ/NapCat image/video/cache files.
+
+    This deliberately does not wipe whole QQ data directories. It only removes old
+    media files or files inside cache-like directories, including NTQQ account
+    media caches such as <qq号>/Image and <qq号>/Video. This avoids deleting login
+    state, account databases, and other durable QQ configuration.
+    """
+    if QQ_CACHE_MAX_AGE <= 0:
+        logging.info("[qq_cache] disabled")
+        return
+
+    cutoff = time.time() - QQ_CACHE_MAX_AGE
+    deleted = 0
+    deleted_bytes = 0
+    scanned_roots = 0
+    roots = _discover_qq_cache_roots()
+
+    for root in roots:
+        try:
+            if not _is_safe_qq_cache_root(root) or not root.exists() or not root.is_dir():
+                continue
+            scanned_roots += 1
+            for p in root.rglob("*"):
+                try:
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                    if st.st_mtime >= cutoff:
+                        continue
+                    rel = p.relative_to(root)
+                    is_media = p.suffix.lower() in QQ_CACHE_MEDIA_EXTENSIONS
+                    is_cache_file = _is_cache_like_relative_path(rel)
+                    if not (is_media or is_cache_file):
+                        continue
+                    size = st.st_size
+                    p.unlink()
+                    deleted += 1
+                    deleted_bytes += size
+                except Exception:
+                    continue
+
+            # Remove stale empty cache/media subdirectories, never the root itself
+            # and never protected runtime directories such as NapCat/temp.
+            for dirpath, _, _ in os.walk(str(root), topdown=False):
+                _remove_stale_empty_qq_dir(Path(dirpath), root, cutoff)
+        except Exception as exc:
+            logging.info("[qq_cache] skipped %s: %s", root, exc)
+
+    logging.info(
+        "[qq_cache] scanned_roots=%d deleted=%d freed=%dKB max_age_hours=%.1f",
+        scanned_roots,
+        deleted,
+        deleted_bytes // 1024,
+        QQ_CACHE_MAX_AGE / 3600,
+    )
+
+
+# ── OneBot caches ─────────────────
+def purge_onebot_cache():
+    """Delete stale data/cache/onebot_* files; other data/cache users are untouched."""
+    if ONEBOT_CACHE_MAX_AGE <= 0:
+        logging.info("[onebot_cache] disabled")
+        return
+    directory = DATA_DIR / "cache"
+    if not directory.is_dir():
+        return
+    cutoff = time.time() - ONEBOT_CACHE_MAX_AGE
+    deleted = 0
+    for p in directory.glob(ONEBOT_CACHE_GLOB):
+        try:
+            if p.is_file() and p.stat().st_mtime < cutoff:
+                p.unlink()
+                deleted += 1
+        except Exception:
+            pass
+    logging.info("[onebot_cache] deleted %d files", deleted)
+
+
+# ── persistent memory entry cleanup ───────────
+def _parse_iso_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _memory_entry_reference_ts(entry: dict) -> float | None:
+    for key in ("last_hit_at", "updated_at", "created_at"):
+        ts = _parse_iso_timestamp(entry.get(key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def purge_expired_memory_entries():
+    """Remove stale non-constant entries from data/memory/**/*.yaml ({book, entries})."""
+    if MEMORY_ENTRY_MAX_AGE <= 0:
+        logging.info("[memory] entry cleanup disabled")
+        return
+    mem_root = DATA_DIR / "memory"
+    if not mem_root.is_dir():
+        return
+    cutoff = time.time() - MEMORY_ENTRY_MAX_AGE
+    scanned_books = deleted_entries = removed_empty_books = 0
+    for book_path in sorted(mem_root.rglob("*.yaml")):
+        try:
+            raw = yaml.safe_load(book_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.info("[memory] skipped unreadable book %s: %s", book_path, exc)
+            continue
+        if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
+            continue
+        scanned_books += 1
+        kept: list = []
+        for entry in raw["entries"]:
+            if not isinstance(entry, dict) or bool(entry.get("constant", False)):
+                kept.append(entry)
+                continue
+            ref_ts = _memory_entry_reference_ts(entry)
+            if ref_ts is None or ref_ts >= cutoff:
+                kept.append(entry)
+                continue
+            deleted_entries += 1
+        if len(kept) == len(raw["entries"]):
+            continue
+        raw["entries"] = kept
+        try:
+            if kept:
+                book_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            else:
+                book_path.unlink()
+                removed_empty_books += 1
+        except Exception as exc:
+            logging.info("[memory] failed to update book %s: %s", book_path, exc)
+    for dirpath, _, _ in os.walk(str(mem_root), topdown=False):
+        dp = Path(dirpath)
+        if dp == mem_root:
+            continue
+        try:
+            if not any(dp.iterdir()):
+                dp.rmdir()
+        except Exception:
+            pass
+    logging.info(
+        "[memory] scanned_books=%d deleted_entries=%d removed_empty_books=%d max_age_hours=%.1f",
+        scanned_books, deleted_entries, removed_empty_books, MEMORY_ENTRY_MAX_AGE / 3600,
+    )
+
+
+def purge_expired_transcripts():
+    """Delete data/transcripts/ TaskRecord files not updated within TRANSCRIPTS_MAX_AGE."""
+    if TRANSCRIPTS_MAX_AGE <= 0:
+        logging.info("[transcripts] cleanup disabled")
+        return
+    purge_dir(DATA_DIR / "transcripts", TRANSCRIPTS_MAX_AGE, "transcripts")
+
+
+def purge_old_logs():
+    """Delete data/logs/ files older than LOG_MAX_AGE, keeping cleanup.log."""
+    if LOG_MAX_AGE <= 0:
+        logging.info("[logs] cleanup disabled")
+        return
+    log_dir = DATA_DIR / "logs"
+    if not log_dir.exists():
+        return
+    cutoff = time.time() - LOG_MAX_AGE
+    deleted = 0
+    for p in log_dir.iterdir():
+        try:
+            if p.is_file() and p.name not in LOG_KEEP_NAMES and p.stat().st_mtime < cutoff:
+                p.unlink()
+                deleted += 1
+        except Exception:
+            pass
+    logging.info("[logs] deleted %d files", deleted)
+
+
 # ── main ──────────────────────────────────────
 def main():
     _log_init()
@@ -253,6 +622,14 @@ def main():
                          max_age=ARTIFACT_MAX_AGE, label="artifacts")),
         (purge_dir, dict(directory=DATA_DIR / "attachments",
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
+        (purge_onebot_cache, {}),
+        (purge_qq_internal_cache, {}),
+        (purge_expired_memory_entries, {}),
+        (purge_expired_transcripts, {}),
+        (purge_old_logs, {}),
+        (purge_dir, dict(directory=DATA_DIR / "llm_error_snapshots",
+                         max_age=LLM_ERROR_SNAPSHOT_MAX_AGE, label="llm_error_snapshots",
+                         recursive=True)),
     ]
 
     for fn, kw in tasks:
