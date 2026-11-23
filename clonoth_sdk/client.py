@@ -128,15 +128,37 @@ class ClonothClient:
         text: str,
         message_id: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        use_context: bool = True,
         entry_node_id: str | None = None,
         use_branch: bool | None = None,
+        platform_auth: dict[str, Any] | None = None,
+        route_hints: dict[str, Any] | None = None,
     ) -> InboundResult:
-        """提交用户消息到 Supervisor（POST /v1/inbound）。"""
+        """提交用户消息到 Supervisor。
+
+        对应 POST /v1/inbound。
+        提取自 bot_adapter.py _submit_inbound() 中的 HTTP 调用逻辑。
+
+        Args:
+            channel: 频道类型标识，如 "discord_guild"、"discord_dm"、"cli"
+            conversation_key: 会话键，如 "discord:123456"
+            text: 用户消息文本（含历史上下文）
+            message_id: 平台消息 ID（可选）
+            attachments: 附件列表（可选），每项为 {"path": ..., "name": ...} 格式
+            use_context: 是否使用对话上下文，默认 True
+            entry_node_id: 入口节点 ID（可选，覆盖默认路由）
+
+        Returns:
+            InboundResult 包含 session_id 和 inbound_seq
+
+        Raises:
+            httpx.HTTPStatusError: HTTP 请求失败时抛出
+        """
         payload: dict[str, Any] = {
             "channel": channel,
             "conversation_key": conversation_key,
             "text": text,
-            "use_context": True,
+            "use_context": use_context,
         }
         if message_id is not None:
             payload["message_id"] = message_id
@@ -146,6 +168,10 @@ class ClonothClient:
             payload["entry_node_id"] = entry_node_id
         if use_branch is not None:
             payload["use_branch"] = use_branch
+        if platform_auth:
+            payload["platform_auth"] = dict(platform_auth)
+        if route_hints:
+            payload["route_hints"] = dict(route_hints)
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()
@@ -157,8 +183,38 @@ class ClonothClient:
         )
 
     # ================================================================
-    #  Events — 事件流消费
+    #  Events — 事件流轮询
     # ================================================================
+
+    async def poll_events(
+        self,
+        *,
+        after_seq: int = 0,
+        types: str | None = None,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """从全局事件流拉取新事件。
+
+        对应 GET /v1/events。
+        提取自 bot_adapter.py _outbound_poller() 中的事件轮询逻辑。
+
+        Args:
+            after_seq: 只返回 seq 大于此值的事件
+            types: 逗号分隔的事件类型过滤器（可选），如
+                "inbound_message,outbound_message,approval_requested"
+
+        Returns:
+            事件列表，按 seq 升序排列
+        """
+        params: dict[str, Any] = {"after_seq": after_seq}
+        if types:
+            params["types"] = types
+        if limit:
+            params["limit"] = limit
+
+        resp = await self._http().get(f"{self._base_url}/v1/events", params=params)
+        resp.raise_for_status()
+        return [Event.from_dict(e) for e in resp.json()]
 
     async def ws_connect(self, last_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
         """连接全局 WebSocket 事件流，逐条 yield 解析后的事件字典。
@@ -236,15 +292,29 @@ class ClonothClient:
             comment: 附加说明（可选）
 
         Returns:
-            True 表示提交成功（HTTP 状态码 < 400）
+            True 表示服务器确认了所请求的最终决策，而非仅 HTTP 请求成功。
         """
+        if decision not in {"allow", "deny"}:
+            raise ValueError("decision must be allow or deny")
         body: dict[str, Any] = {"decision": decision}
         if comment is not None:
             body["comment"] = comment
         resp = await self._http().post(
             f"{self._base_url}/v1/approvals/{approval_id}", json=body,
         )
-        return resp.status_code < 400
+        if not 200 <= resp.status_code < 300:
+            return False
+        try:
+            result = resp.json()
+        except ValueError:
+            return False
+        expected_status = "allowed" if decision == "allow" else "denied"
+        return (
+            isinstance(result, dict)
+            and result.get("approval_id") == approval_id
+            and result.get("status") == expected_status
+            and result.get("decision") == decision
+        )
 
     # ================================================================
     #  Cancel — 取消任务
@@ -406,6 +476,28 @@ class ClonothClient:
         resp = await self._http().post(
             f"{self._base_url}/v1/config/openai", json=kwargs,
         )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def reset_conversation(self, conversation_key: str) -> dict[str, Any]:
+        """清空会话上下文：下一条消息将开启新 session。
+
+        对应 POST /v1/conversations/reset（需要 admin token）。Supervisor 会取消
+        该会话树内的在途任务并发出 context_reset(reason=clear) 事件。
+
+        Returns:
+            Supervisor 返回的结果 dict；会话不存在（404）时返回
+            ``{"ok": True, "already_clean": True}``，视为已经是干净状态。
+
+        Raises:
+            httpx.HTTPStatusError: 除 404 外的请求失败
+        """
+        resp = await self._http().post(
+            f"{self._base_url}/v1/conversations/reset",
+            json={"conversation_key": conversation_key},
+        )
+        if resp.status_code == 404:
+            return {"ok": True, "already_clean": True}
         resp.raise_for_status()
         return resp.json()
 

@@ -313,6 +313,20 @@ class MemoryExtractHandler:
         # hook can redirect save_memory writes to the correct namespace.
         _entry_nid = get_entry_node_id(runtime_cfg)
         source_node_id = str(task.node_id or "").strip() or _entry_nid
+        # Isolated chats (QQ group / private) keep their memories in their own
+        # conv_<hash> namespace; extraction must write back there, not to the
+        # shared node namespace.
+        from engine.builtin.knowledge_inject import isolated_memory_namespace
+
+        _task_input = task.input
+        _tc = _task_input.get("task_context") if isinstance(_task_input, dict) else None
+        _tc = _tc if isinstance(_tc, dict) else {}
+        memory_ns = isolated_memory_namespace(
+            _tc.get("route_conversation_key") or _tc.get("conversation_key") or "",
+            runtime_cfg,
+        ) or source_node_id
+        # Upstream: vault_ workspaces are never extracted; private workspaces /
+        # DMs route writes into their own @workspace directory.
         source_ws = ""
         sessions_path = workspace_root / "data" / "sessions.json"
         if sessions_path.is_file():
@@ -341,6 +355,7 @@ class MemoryExtractHandler:
             "extractor_node": extractor_node,
             "kind": task.kind,
             "_source_node_id": source_node_id,
+            "_memory_ns": memory_ns,
             "_source_ws": source_ws,
         }
 
@@ -432,11 +447,17 @@ class MemoryExtractHandler:
             _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
+            _route_ns = str(pending_extract.get("_memory_ns") or _source_nid or "").strip()
+            from engine.builtin.knowledge_inject import is_isolated_memory_namespace
+
             mem_root = workspace_root / "data" / "memory" if workspace_root is not None else None
             book_stems: set[str] = set()
             if mem_root is not None and mem_root.exists():
-                ns_dir = (mem_root / _source_nid) if _source_nid else mem_root
-                for scan_dir in (ns_dir, mem_root):
+                scan_dirs = [mem_root / _route_ns] if _route_ns else []
+                # Isolated chats (conv_*) never see shared root books.
+                if not is_isolated_memory_namespace(_route_ns):
+                    scan_dirs.append(mem_root)
+                for scan_dir in scan_dirs:
                     if scan_dir.is_dir():
                         book_stems.update(p.stem for p in scan_dir.glob("*.yaml"))
             book_names = sorted(book_stems)
@@ -450,8 +471,8 @@ class MemoryExtractHandler:
             # [AutoC 2026-08-28] Pass _memory_route_ns so dream_router hook
             # redirects save_memory writes to the source node's directory.
             _extra_input: dict[str, Any] = {}
-            if _source_nid:
-                _extra_input["_memory_route_ns"] = _source_nid
+            if _route_ns:
+                _extra_input["_memory_route_ns"] = _route_ns
             source_ws = pending_extract.get("_source_ws", "")
             if source_ws:
                 _extra_input["_memory_route_ws"] = source_ws

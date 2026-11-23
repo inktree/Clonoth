@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -23,6 +26,27 @@ class PolicyDecision:
     safety_level: SafetyLevel
     reason: str
     trust_level: str = ""  # 'workspace' | 'trusted' | 'external' | '' (non-path ops)
+    # True when the decision came from an explicit sensitive source: a matched
+    # read/write path rule, an external path, a sensitive/approval command
+    # pattern, or restart. Platform admins skip approval only for non-sensitive
+    # decisions; deny is never relaxed.
+    sensitive: bool = False
+
+
+# Commands that stay under human approval even for platform admins:
+# downloads to disk, package installs, chmod +x, network listeners.
+_DEFAULT_SENSITIVE_COMMAND_PATTERNS = [
+    r"\bcurl\b[^|]*(?:\s-O\b|\s-o\b|--output\b|--remote-name\b)",
+    r"\bwget\b",
+    r"(?:curl|wget)\b[^|<>]*>\s*\S+",
+    r"\bpip[0-9.]*\s+install\b",
+    r"\bpipx\s+install\b",
+    r"\bnpm\s+(?:install|i|add)\b",
+    r"\b(?:pnpm|yarn)\s+add\b",
+    r"\b(?:apt|apt-get|yum|dnf|pacman|apk|brew|zypper)\s+(?:install|add|-S)\b",
+    r"\bchmod\b[^|]*\+x\b",
+    r"\b(?:nc|ncat|netcat|socat)\b[^|]*(?:\s-l\b|--listen\b)",
+]
 
 
 def _default_policy_dict() -> dict[str, Any]:
@@ -81,6 +105,10 @@ def _default_policy_dict() -> dict[str, Any]:
             "approval_patterns": [
                 _GIT_REMOTE_PUSH_PATTERN,
             ],
+            # sensitive_patterns: approval_required and marked sensitive, so
+            # platform admins (QQ) still approve them by hand. When a policy.yaml
+            # omits this key, the built-in list applies.
+            "sensitive_patterns": list(_DEFAULT_SENSITIVE_COMMAND_PATTERNS),
             "deny_patterns": [
                 r"\brm\s+-rf\s+/",
                 r"\brm\s+-rf\s+~",
@@ -139,6 +167,30 @@ def _default_policy_dict() -> dict[str, Any]:
     }
 
 
+def _is_public_http_url(raw: str) -> bool:
+    """True only for http(s) URLs whose host is not loopback/private/link-local/reserved."""
+    raw = (raw or "").strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host or host in ("localhost", "localhost.localdomain"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_global and not ip.is_multicast
+    except ValueError:
+        pass
+    if host.endswith((".localhost", ".local", ".internal")):
+        return False
+    return True
+
+
 def _to_safety_level(s: str) -> SafetyLevel:
     v = (s or "").strip()
     try:
@@ -177,6 +229,7 @@ class PolicyEngine:
         self._tool_rules: list[tuple[str, SafetyLevel, str]] = []
         self._approval_command_patterns: list[re.Pattern[str]] = [re.compile(_GIT_REMOTE_PUSH_PATTERN, re.IGNORECASE)]
         self._deny_command_patterns: list[re.Pattern[str]] = []
+        self._sensitive_command_patterns: list[re.Pattern[str]] = []
 
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
@@ -263,10 +316,16 @@ class PolicyEngine:
             self._command_default = _to_safety_level(str(cmd_sec.get("default", "approval_required")))
             approval_pats = cmd_sec.get("approval_patterns")
             deny_pats = cmd_sec.get("deny_patterns")
+            sensitive_pats = (
+                cmd_sec.get("sensitive_patterns")
+                if "sensitive_patterns" in cmd_sec
+                else _DEFAULT_SENSITIVE_COMMAND_PATTERNS
+            )
         else:
             self._command_default = SafetyLevel.approval_required
             approval_pats = None
             deny_pats = None
+            sensitive_pats = _DEFAULT_SENSITIVE_COMMAND_PATTERNS
 
         approval_sources = [_GIT_REMOTE_PUSH_PATTERN]
         approval_sources.extend(p for p in (approval_pats if isinstance(approval_pats, list) else []) if isinstance(p, str) and p.strip())
@@ -275,6 +334,11 @@ class PolicyEngine:
         self._deny_command_patterns = [
             re.compile(p, re.IGNORECASE)
             for p in (deny_pats if isinstance(deny_pats, list) else [])
+            if isinstance(p, str) and p.strip()
+        ]
+        self._sensitive_command_patterns = [
+            re.compile(p, re.IGNORECASE)
+            for p in (sensitive_pats if isinstance(sensitive_pats, list) else [])
             if isinstance(p, str) and p.strip()
         ]
 
@@ -307,7 +371,9 @@ class PolicyEngine:
     def _match_rules(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
         for pat, dec, reason in rules:
             if fnmatch.fnmatchcase(rel, pat):
-                return PolicyDecision(dec, reason or f"matched rule: {pat}")
+                # Explicit path rules (engine/**, config/nodes/**, data/config.yaml ...)
+                # are sensitive: platform admins do not skip their approval.
+                return PolicyDecision(dec, reason or f"matched rule: {pat}", sensitive=True)
         return PolicyDecision(default, "default policy")
 
     def evaluate_read_file(self, *, path: str, workspace: Path | None = None) -> PolicyDecision:
@@ -320,6 +386,8 @@ class PolicyEngine:
             default = SafetyLevel.approval_required
         decision = self._match_rules(rel, self._read_rules, default)
         decision.trust_level = trust_level
+        if trust_level == "external" and decision.safety_level == SafetyLevel.approval_required:
+            decision.sensitive = True
         return decision
 
     def evaluate_write_file(self, *, path: str, workspace: Path | None = None) -> PolicyDecision:
@@ -332,6 +400,8 @@ class PolicyEngine:
             default = SafetyLevel.approval_required
         decision = self._match_rules(rel, self._write_rules, default)
         decision.trust_level = trust_level
+        if trust_level == "external" and decision.safety_level == SafetyLevel.approval_required:
+            decision.sensitive = True
         return decision
 
     def evaluate_execute_command(self, *, command: str) -> PolicyDecision:
@@ -346,13 +416,69 @@ class PolicyEngine:
 
         for pat in self._approval_command_patterns:
             if pat.search(cmd):
-                return PolicyDecision(SafetyLevel.approval_required, "git push to remote requires approval")
+                return PolicyDecision(
+                    SafetyLevel.approval_required, "git push to remote requires approval", sensitive=True,
+                )
+
+        for pat in self._sensitive_command_patterns:
+            if pat.search(cmd):
+                return PolicyDecision(
+                    SafetyLevel.approval_required,
+                    f"sensitive command requires approval: {pat.pattern}",
+                    sensitive=True,
+                )
 
         if self._command_default == SafetyLevel.auto:
             return PolicyDecision(SafetyLevel.auto, "command auto-allowed by default")
         if self._command_default == SafetyLevel.deny:
             return PolicyDecision(SafetyLevel.deny, "command denied by default")
         return PolicyDecision(SafetyLevel.approval_required, "command requires approval")
+
+    def is_safe_public_curl(self, command: str) -> bool:
+        """True only for a single plain-GET curl of one public http(s) URL.
+
+        Lets QQ non-admin users have the bot read web pages without an approval
+        channel. Rejects command chaining/injection/redirection, any deny or
+        approval pattern hit, write/upload/output flags, multiple URLs, and
+        non-public hosts (SSRF). Anything uncertain returns False.
+        """
+        self._reload_if_needed()
+        cmd = (command or "").strip()
+        if not cmd:
+            return False
+        if any(ch in cmd for ch in (";", "|", "&", "`", ">", "<", "\n")):
+            return False
+        if "$(" in cmd or "${" in cmd:
+            return False
+        for pat in (*self._deny_command_patterns, *self._approval_command_patterns, *self._sensitive_command_patterns):
+            if pat.search(cmd):
+                return False
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return False
+        if not tokens or tokens[0].lower() != "curl":
+            return False
+        # Compared lowercased, so uppercase variants (-O, -T, -X, -F) are covered.
+        forbidden_flags = {
+            "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+            "-x", "--request", "-t", "--upload-file", "-f", "--form",
+            "-o", "--output", "--remote-name", "-k", "--config",
+        }
+        urls: list[str] = []
+        for tok in tokens[1:]:
+            low = tok.lower()
+            if low in forbidden_flags:
+                return False
+            if low.startswith(("--data", "--request", "--output")):
+                return False
+            if tok.startswith(("http://", "https://")):
+                urls.append(tok)
+            elif not tok.startswith("-") and ("://" in tok or "." in tok):
+                urls.append(tok)
+        if len(urls) != 1:
+            return False
+        return _is_public_http_url(urls[0])
 
     def evaluate_restart(self, *, target: str) -> PolicyDecision:
         self._reload_if_needed()
@@ -362,7 +488,7 @@ class PolicyEngine:
             return PolicyDecision(SafetyLevel.auto, f"restart {target} auto-allowed")
         if self._restart_default == SafetyLevel.deny:
             return PolicyDecision(SafetyLevel.deny, f"restart {target} denied")
-        return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval")
+        return PolicyDecision(SafetyLevel.approval_required, f"restart {target} requires approval", sensitive=True)
 
     def evaluate_tool(self, *, name: str) -> PolicyDecision:
         """工具级审批：按工具名匹配 tools 配置段规则。"""

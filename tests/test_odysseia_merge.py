@@ -1466,3 +1466,31 @@ def test_openai_responses_stateless_payload_and_item_conflict_recovery(failure_t
             assert raw_output[0]["summary"]
 
     asyncio.run(run())
+
+
+def test_cross_task_image_stripping_scoped_to_qq_only():
+    from engine.conversation_store import Message
+    from engine.runner import _is_qq_task_context, _message_to_history_dict
+
+    for conversation_key in ("discord:123", "agent:coder:discord:123", "web:main"):
+        assert not _is_qq_task_context({"conversation_key": conversation_key}, {})
+    for conversation_key in ("qq_group:100", "qq_private:200", "agent:coder:qq_group:100"):
+        assert _is_qq_task_context({"conversation_key": conversation_key}, {})
+    assert _is_qq_task_context({"platform_auth": {"platform": "onebot"}}, {})
+
+    content = [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "file://data/attachments/a.png"}},
+    ]
+    msg = Message(id="image-history", role="user", content=content, source_task_id="task-1")
+    preserved = _message_to_history_dict(msg, current_task_id="task-2")
+    assert preserved["content"] == content
+    assert "_stripped_images_count" not in preserved.get("_meta", {})
+    stripped = _message_to_history_dict(msg, current_task_id="task-2", strip_cross_task_images=True)
+    assert isinstance(stripped["content"], str)
+    assert "[image: data/attachments/a.png]" in stripped["content"]
+    assert stripped["_meta"]["_stripped_images_count"] == 1
+    msg.source_task_id = "task-2"
+    same_task = _message_to_history_dict(msg, current_task_id="task-2", strip_cross_task_images=True)
+    assert same_task["content"] == content
+    assert "_stripped_images_count" not in same_task.get("_meta", {})

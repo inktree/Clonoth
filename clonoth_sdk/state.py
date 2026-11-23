@@ -264,7 +264,7 @@ class SessionState:
         return None
 
     def resolve_trigger(
-        self, source_inbound_seq: int,
+        self, source_inbound_seq: int, session_id: str = "",
     ) -> tuple[int, TriggerInfo] | None:
         """只按 source_inbound_seq 精确查找 trigger。
 
@@ -277,7 +277,7 @@ class SessionState:
                 return source_inbound_seq, trigger
         return None
 
-    def cleanup_stale_triggers(self) -> list[TriggerInfo]:
+    def cleanup_stale_triggers(self, timeout: float = 600.0) -> list[TriggerInfo]:
         """清理超时的 trigger，返回被清理的列表。
 
         同时清理关联的 main_task_states。
@@ -287,7 +287,7 @@ class SessionState:
         now = time.time()
         stale_seqs = [
             seq for seq, trigger in self.triggers.items()
-            if now - trigger.created_at > 600.0
+            if now - trigger.created_at > timeout
         ]
         stale_triggers: list[TriggerInfo] = []
         for seq in stale_seqs:

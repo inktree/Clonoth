@@ -57,6 +57,8 @@ from .types import (
     ProviderUpdateIn,
     ActiveProviderIn,
     FallbacksUpdateIn,
+    ModelVisionIn,
+    SystemModelUpdateIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -516,7 +518,38 @@ def create_app(
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        return cs.update_fallbacks(body.fallbacks)
+        try:
+            return _with_registered(cs.update_fallbacks([e.model_dump() for e in body.fallbacks]))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.put("/v1/config/model-vision")
+    async def set_model_vision(body: ModelVisionIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        try:
+            return _with_registered(cs.set_model_vision(body.model, body.vision))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    def _check_system_model_slot(slot: str) -> None:
+        from clonoth_runtime import SYSTEM_MODEL_SLOT_NAMES
+        if slot not in SYSTEM_MODEL_SLOT_NAMES:
+            raise HTTPException(status_code=404, detail=f"Unknown system model slot '{slot}'")
+
+    @app.get("/v1/config/system-models/{slot}")
+    async def get_system_model(slot: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        _check_system_model_slot(slot)
+        return app.state.config_store.get_system_model_public(slot)
+
+    @app.put("/v1/config/system-models/{slot}")
+    async def update_system_model(slot: str, body: SystemModelUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        _check_system_model_slot(slot)
+        return app.state.config_store.update_system_model(
+            slot, provider=body.provider, model=body.model, base_url=body.base_url, api_key=body.api_key,
+        )
 
     def _mimo_config() -> dict[str, str]:
         """读取 Mimo 语音服务配置。"""
@@ -2233,7 +2266,15 @@ def create_app(
         # Purpose: ensure only authenticated admins can decide web approvals.
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
+        # A terminal approval (timed out / reset / already answered) must not be
+        # reported as a fresh success: 409 lets the SDK and adapters say "未生效".
+        try:
+            a = st.decide_approval(
+                approval_id=approval_id, decision=body.decision, comment=body.comment,
+                require_pending=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return a
@@ -2738,12 +2779,16 @@ def create_app(
     # 路由面的冲突检测才能以完整核心集合为基准，插件无法遮蔽核心端点。
     state.routes_face.attach(app, workspace_root=state.workspace_root)
 
-    # 启动时打印 token 并写入共享文件供 engine 读取
+    # 启动时把 token 写入共享文件供 engine/适配器读取。token 本身不进日志：
+    # stdout 会被 journald 等长期保存，能读日志的人不应顺带拿到管理权限。
     token = get_admin_token()
     _token_file = state.workspace_root / "data" / ".admin_token"
     _token_file.parent.mkdir(parents=True, exist_ok=True)
     _token_file.write_text(token, encoding="utf-8")
-    print(f"[admin] 管理 Token: {token}", flush=True)
-    print(f"[admin] Token 已写入: {_token_file}", flush=True)
+    try:
+        _token_file.chmod(0o600)
+    except OSError:
+        pass
+    print(f"[admin] 管理 Token 已写入: {_token_file}（不在日志中显示）", flush=True)
 
     return app

@@ -11,7 +11,7 @@ import pytest
 from adapters.discord import callbacks, context
 from adapters.discord.messaging import _record_bot_reply, _send_split_text
 from adapters.message_text import extract_tts_segments, split_long_text, split_message_text
-from clonoth_sdk import SessionState, TriggerInfo
+from clonoth_sdk import BotConfig, SessionState, TriggerInfo
 from clonoth_sdk.event_router import EventRouter
 from clonoth_sdk.state import MainTaskState
 from clonoth_sdk.types import Event
@@ -62,7 +62,7 @@ def test_dm_context_keeps_private_header(monkeypatch):
 
 
 @pytest.mark.parametrize("outcome", ["text", "attachment", "empty", "failure", "voice", "voice_failure"])
-def test_router_consumes_state_and_settles_status_only_after_reply(monkeypatch, outcome):
+def test_router_consumes_state_and_settles_status_only_after_reply(monkeypatch, tmp_path, outcome):
     rt = runtime()
     state = rt.session_state
     status_msg = SimpleNamespace(delete=AsyncMock())
@@ -98,7 +98,7 @@ def test_router_consumes_state_and_settles_status_only_after_reply(monkeypatch, 
         monkeypatch.setattr(callbacks, "_send_discord_tts_segments", AsyncMock(return_value=outcome != "voice_failure"))
     notice = AsyncMock()
     monkeypatch.setattr(cb, "send_response_notice", notice)
-    router = EventRouter(None, state, cb, SimpleNamespace(entry_node_id="main"))
+    router = EventRouter(None, state, cb, BotConfig(base_url="http://test", entry_node_id="main", workspace_root=tmp_path))
     event = Event(
         seq=1, event_id="reply", ts="", run_id="run", session_id="s",
         component="supervisor", type="outbound_message",
