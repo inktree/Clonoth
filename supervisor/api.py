@@ -2375,7 +2375,15 @@ def create_app(
         # Purpose: ensure only authenticated admins can decide web approvals.
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
+        # A terminal approval (timed out / reset / already answered) must not be
+        # reported as a fresh success: 409 lets the SDK and adapters say "未生效".
+        try:
+            a = st.decide_approval(
+                approval_id=approval_id, decision=body.decision, comment=body.comment,
+                require_pending=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return a
@@ -2884,12 +2892,16 @@ def create_app(
     if getattr(state, "routes_face", None) is not None:
         state.routes_face.attach(app, workspace_root=state.workspace_root)
 
-    # 启动时打印 token 并写入共享文件供 engine 读取
+    # 启动时把 token 写入共享文件供 engine/适配器读取。token 本身不进日志：
+    # stdout 会被 journald 等长期保存，能读日志的人不应顺带拿到管理权限。
     token = get_admin_token()
     _token_file = state.workspace_root / "data" / ".admin_token"
     _token_file.parent.mkdir(parents=True, exist_ok=True)
     _token_file.write_text(token, encoding="utf-8")
-    print(f"[admin] 管理 Token: {token}", flush=True)
-    print(f"[admin] Token 已写入: {_token_file}", flush=True)
+    try:
+        _token_file.chmod(0o600)
+    except OSError:
+        pass
+    print(f"[admin] 管理 Token 已写入: {_token_file}（不在日志中显示）", flush=True)
 
     return app
