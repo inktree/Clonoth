@@ -73,7 +73,7 @@ CLONOTH_ENTRY_NODE=qq.orchestrator
 CLONOTH_ALLOWED_GROUPS=<GROUP_ID_1>,<GROUP_ID_2>
 CLONOTH_ADMIN_QQ_USERS=<OWNER_QQ>
 CLONOTH_QQ_OWNER_ID=<OWNER_QQ>
-CLONOTH_QQ_OWNER_NAME=墨树（LB菌）
+CLONOTH_QQ_OWNER_NAME=<OWNER_NAME>
 ```
 `qq.orchestrator` 通过 `{{include:_persona.md}}` 引用机器人人设。首次部署时从模板复制一份（该文件已被 .gitignore 忽略），否则提示词中会原样保留 include 标记：
 
