@@ -75,6 +75,12 @@ CLONOTH_ADMIN_QQ_USERS=<OWNER_QQ>
 CLONOTH_QQ_OWNER_ID=<OWNER_QQ>
 CLONOTH_QQ_OWNER_NAME=墨树（LB菌）
 ```
+`qq.orchestrator` 通过 `{{include:_persona.md}}` 引用机器人人设。首次部署时从模板复制一份（该文件已被 .gitignore 忽略），否则提示词中会原样保留 include 标记：
+
+```bash
+cp config/nodes/_persona.example.md config/nodes/_persona.md
+```
+
 
 ### 4. 确保 Supervisor 已启动
 
