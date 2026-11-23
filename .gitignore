@@ -72,3 +72,9 @@ tools/
 
 /TEMP/
 *.local.yaml
+
+# QQ adapter: site-specific files that must stay local (templates: *.example.*)
+config/qq_user_profiles.yaml
+config/qq_custom_faces.txt
+config/qq_custom_faces.json
+config/nodes/_persona.md

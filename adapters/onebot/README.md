@@ -31,11 +31,13 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | 变量名 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `CLONOTH_BASE_URL` | 否 | `http://127.0.0.1:8765` | Supervisor API 地址 |
-| `CLONOTH_WORKSPACE` | 否 | `/www/wwwroot/Clonoth` | 工作区路径，用于 SDK 导入和附件存储 |
-| `CLONOTH_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
+| `CLONOTH_WORKSPACE` | 否 | `<项目根目录>` | 工作区路径，用于 SDK 导入和附件存储 |
+| `CLONOTH_ENTRY_NODE` | 否 | `qq.orchestrator` | 入口节点 ID |
 | `CLONOTH_BQBS_PATH` | 否 | 空 | QQ 自定义表情名称索引文件路径 |
-| `CLONOTH_ALLOWED_GROUPS` | 否 | 空 | 允许接入的 QQ 群号，逗号分隔。为空时允许全部群 |
-| `CLONOTH_QQ_SUPERUSERS` | 否 | 空 | QQ 最高权限用户，多个 QQ 号用逗号分隔 |
+| `CLONOTH_ALLOWED_GROUPS` | 否 | 空 | 允许接入的 QQ 群号，逗号分隔。为空时不接入任何群 |
+| `CLONOTH_ALLOWED_PRIVATE_USERS` | 否 | 空 | 允许私聊的 QQ 号，逗号分隔；为空或包含“好友”/`friend` 时允许好友私聊 |
+| `CLONOTH_ADMIN_QQ_USERS` | 否 | 空 | 管理员 QQ 号（可审批、可用管理命令），逗号分隔 |
+| `CLONOTH_QQ_SUPERUSERS` | 否 | 空 | 旧变量，仅在未设置 `CLONOTH_ADMIN_QQ_USERS` 时作为管理员列表使用 |
 | `CLONOTH_QQ_OWNER_ID` | 否 | 空 | 项目所有者 QQ 号 |
 | `CLONOTH_QQ_OWNER_NAME` | 否 | 空 | 项目所有者显示名称 |
 
@@ -67,10 +69,10 @@ nonebot.load_plugin("adapters.onebot")
 ```bash
 CLONOTH_BASE_URL=http://127.0.0.1:8765
 CLONOTH_WORKSPACE=/path/to/clonoth
-CLONOTH_ENTRY_NODE=main
-CLONOTH_ALLOWED_GROUPS=123456789,987654321
-CLONOTH_QQ_SUPERUSERS=2659937476
-CLONOTH_QQ_OWNER_ID=2659937476
+CLONOTH_ENTRY_NODE=qq.orchestrator
+CLONOTH_ALLOWED_GROUPS=<GROUP_ID_1>,<GROUP_ID_2>
+CLONOTH_ADMIN_QQ_USERS=<OWNER_QQ>
+CLONOTH_QQ_OWNER_ID=<OWNER_QQ>
 CLONOTH_QQ_OWNER_NAME=墨树（LB菌）
 ```
 
@@ -113,8 +115,8 @@ supervisor:
     spawn_napcat: true
     onebot_host: "127.0.0.1"
     onebot_port: 18080
-    onebot_entry_node: "qq_assistant"
-    napcat_quick_login: "3944289651"
+    onebot_entry_node: "qq.orchestrator"
+    napcat_quick_login: "<BOT_QQ>"
 ```
 
 项目内集成模式下，正常启动 `python main.py` 后会自动拉起 OneBot 适配层和 NapCat。
@@ -128,7 +130,7 @@ ws://127.0.0.1:18080/onebot/v11/ws
 如果 NapCat 登录成功但没有连接 OneBot，应检查账号专用配置：
 
 ```text
-data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_3944289651.json
+data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_<BOT_QQ>.json
 ```
 
 更多说明见：

@@ -104,6 +104,11 @@ skills:
 memory:
   max_budget_chars: 0       # 0 = no limit; max total chars of memory content to inject
 
+  # 严格隔离记忆的会话前缀：每个群 / 私聊各自一个 data/memory/conv_<hash>/，
+  # 不读根目录共享记忆，dream 也不汇总这些会话（只由 auto_extract 写回本会话）。
+  # dispatch 子任务（agent:...:qq_group:<id>）归属其父会话。节点显式 memory_book 优先。
+  isolate_conversation_prefixes: ["qq_group", "qq_private"]
+
   auto_extract:
     enabled: true             # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
     node_id: "system.memory_extractor"  # 记忆提取节点 id
@@ -192,21 +197,24 @@ supervisor:
     spawn_napcat: false
     onebot_host: "127.0.0.1"
     onebot_port: 18080
-    onebot_entry_node: "qq_assistant"
+    onebot_entry_node: "qq.orchestrator"
     # 首次扫码登录后，可填机器人 QQ 号用于 NapCat 快速登录。
     # 留空时，项目会优先启动 NapCat 安装器或登录界面。
     napcat_quick_login: ""
 
-    # QQ 最高权限用户。多个 QQ 号用逗号分隔。
+    # 群/私聊白名单与管理员 QQ 号推荐写在 .env（CLONOTH_ALLOWED_GROUPS、
+    # CLONOTH_ALLOWED_PRIVATE_USERS、CLONOTH_ADMIN_QQ_USERS）。
+    # 兼容旧配置：未设置 CLONOTH_ADMIN_QQ_USERS 时，这里的 QQ 号作为管理员。
     onebot_superusers: ""
     onebot_owner_id: ""
     onebot_owner_name: ""
 
     # QQ 语音输入与语音回复。
     # 用户发语音时自动转写，处理完成后删除临时音频。
-    # 用户发语音时默认用语音回复；文字输入时由模型判断是否需要额外语音回复。
+    # 语音回复默认关闭：未配置 TTS 后端时合成会失败，模型却仍会声称已发送。
+    # 关闭时不向模型注入 <tts> 提示。配好 TTS（如云端接口）后再打开 onebot_voice_reply。
     onebot_voice_input: true
-    onebot_voice_reply: true
+    onebot_voice_reply: false
     onebot_voice_reply_on_voice_input: true
     onebot_voice_reply_auto_on_text: true
     onebot_voice_reply_private: true
